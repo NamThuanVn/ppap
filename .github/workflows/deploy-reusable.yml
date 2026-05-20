@@ -1,4 +1,4 @@
-name: Deploy · Reusable (workflow_call)
+name: Deploy · Reusable
 
 # Reusable workflow shared by deploy-staging.yml and deploy-production.yml.
 # Those wrappers handle the trigger surface (event types, concurrency,
@@ -66,12 +66,34 @@ env:
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
+  # 0. CI gate. Runs biome / typecheck / lint / vitest in parallel against
+  #    the deploy ref BEFORE any infra touches Cloudflare or HCP. Lives in
+  #    ppap (not the private repo) so deploys cost zero billed minutes —
+  #    same reusable workflow PR-CI uses, just with a different ref.
+  #
+  #    `release.yml` is workflow_dispatch only and `deploy-staging-dispatch`
+  #    can be re-fired manually; without this gate, a broken `main` (or a
+  #    bad merge commit) would still reach terraform-apply. Branch
+  #    protection requires the PR-CI `CI` check green on the source PR, but
+  #    this gate re-validates on the actual deploy ref to catch admin
+  #    bypasses + post-merge drift.
+  # ───────────────────────────────────────────────────────────────────────────
+  ci-gate:
+    name: CI Gate
+    uses: ./.github/workflows/ci-checks.yml
+    with:
+      checkout_ref: ${{ inputs.checkout_ref }}
+    secrets:
+      PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+  # ───────────────────────────────────────────────────────────────────────────
   # 1. Provision Cloudflare resources (KV, D1, Queues, Pages, Vectorize
   #    placeholders). Must run before worker deploy — workers bind to these
   #    IDs.
   # ───────────────────────────────────────────────────────────────────────────
   terraform-apply:
     name: Terraform Apply
+    needs: [ci-gate]
     runs-on: ubuntu-latest
     concurrency:
       group: tf-${{ inputs.environment }}
@@ -352,7 +374,12 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   report-deployment:
     name: Report Deployment
-    needs: [deploy-worker-gateway, deploy-dashboard]
+    # ci-gate is in `needs:` so a CI failure (which skips terraform-apply +
+    # everything downstream) still surfaces as a `failure` state to the
+    # Deployment-status pingback — otherwise the `contains(needs.*.result,
+    # 'failure')` check below would only see `skipped` and incorrectly
+    # report success.
+    needs: [ci-gate, deploy-worker-gateway, deploy-dashboard]
     if: always()
     runs-on: ubuntu-latest
     steps:

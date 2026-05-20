@@ -1,0 +1,100 @@
+name: CI · Checks · Reusable
+
+# Reusable CI graph: biome / typecheck / lint / test in parallel against an
+# arbitrary erp-namthuan ref. Called by both PR-CI (ppap:ci-pr.yml) and the
+# deploy gate (ppap:deploy-reusable.yml). Outputs each job's `result` so
+# callers can build a per-job summary.
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: 'erp-namthuan ref to check out (refs/pull/<N>/merge for PR CI, sha for staging deploy, refs/tags/<tag> for production).'
+        type: string
+        required: true
+    outputs:
+      biome:
+        description: 'Result of the biome job'
+        value: ${{ jobs.biome.result }}
+      typecheck:
+        description: 'Result of the typecheck job'
+        value: ${{ jobs.typecheck.result }}
+      lint:
+        description: 'Result of the lint job'
+        value: ${{ jobs.lint.result }}
+      test:
+        description: 'Result of the test job'
+        value: ${{ jobs.test.result }}
+    secrets:
+      PAT_TOKEN:
+        required: true
+
+permissions: read-all
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+
+jobs:
+  biome:
+    name: Biome (format + lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      - run: pnpm biome ci .
+
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      - run: pnpm typecheck
+
+  lint:
+    name: ESLint (workspaces)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      - run: pnpm lint:workspaces
+
+  test:
+    name: Vitest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      - run: pnpm test:run

@@ -1,4 +1,4 @@
-name: Deploy Production
+name: Deploy · Production
 
 # Triggered cross-repo from NamThuanVn/erp-namthuan when `release.yml` cuts a
 # new release. `workflow_dispatch` requires typing PRODUCTION into the confirm

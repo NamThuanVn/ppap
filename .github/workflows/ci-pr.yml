@@ -1,0 +1,102 @@
+name: CI · PR · Lint · Typecheck · Test
+
+# PR CI entrypoint. Triggered cross-repo by erp-namthuan/.github/workflows/
+# ci-pr-dispatch.yml via repository_dispatch[ci]; workflow_dispatch is the
+# manual re-run escape hatch. The actual 4-job graph lives in ci-checks.yml
+# (reusable workflow_call) — this file just wires that graph to the PR-CI
+# trigger surface and pings the Check Run back on completion.
+#
+# Uses PAT_TOKEN (same token as deploy/sync, ppap-side copy). It must have
+# Checks:R/W on erp-namthuan so the `report` job can PATCH the Check Run.
+# Note: this collapses the fork-safety boundary that a separate CI_PAT
+# would have provided — see the trade-off note in .claude/ppap.md § PAT_TOKEN.
+
+run-name: "${{ github.event.client_payload.title || format('CI — PR #{0}', inputs.pr_number) }}"
+
+on:
+  repository_dispatch:
+    types: [ci]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number on NamThuanVn/erp-namthuan to (re)run CI for'
+        required: true
+        type: string
+
+permissions: read-all
+
+concurrency:
+  group: ci-${{ github.event.client_payload.pr_number || inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+
+jobs:
+  # Run the 4-job CI graph. ci-checks.yml lives in the same repo and exposes
+  # each job's `result` as a workflow_call output, so the report job below
+  # can build a per-job summary without re-querying the API.
+  #
+  # refs/pull/<N>/merge resolves to the merge commit GitHub computes between
+  # the PR head and the base. Mirrors what `pull_request` would test. If the
+  # PR has merge conflicts this ref is absent and the checkout step fails —
+  # which surfaces as a Check Run failure with a clear "resolve conflict"
+  # hint in the report summary.
+  checks:
+    uses: ./.github/workflows/ci-checks.yml
+    with:
+      checkout_ref: refs/pull/${{ github.event.client_payload.pr_number || inputs.pr_number }}/merge
+    secrets:
+      PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+  # Posts the final commit-status update on the PR's head SHA, replacing the
+  # `pending` status that ci-pr-dispatch.yml created. `if: always()` so
+  # failures still get a final pingback; the shell step itself no-ops if
+  # `head_sha` is empty (manual workflow_dispatch).
+  #
+  # Statuses (not Check Runs) because the Checks API update endpoint
+  # requires a GitHub App installation token; PAT_TOKEN is a fine-grained
+  # PAT, which the Statuses API accepts with Statuses:R/W.
+  report:
+    name: Report CI
+    needs: [checks]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update CI commit status on erp-namthuan
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          R_BIOME: ${{ needs.checks.outputs.biome }}
+          R_TYPE: ${{ needs.checks.outputs.typecheck }}
+          R_LINT: ${{ needs.checks.outputs.lint }}
+          R_TEST: ${{ needs.checks.outputs.test }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HEAD_SHA:-}" ]; then
+            echo "No head_sha in payload (manual workflow_dispatch?) — skipping pingback."
+            exit 0
+          fi
+          tag() {
+            case "$1" in
+              success) echo "✓" ;;
+              *)       echo "✗" ;;
+            esac
+          }
+          if [ "$R_BIOME" = "success" ] && [ "$R_TYPE" = "success" ] && [ "$R_LINT" = "success" ] && [ "$R_TEST" = "success" ]; then
+            STATE="success"
+          else
+            STATE="failure"
+          fi
+          # Statuses description max 140 chars. Compact per-job summary fits
+          # easily and gives reviewers an at-a-glance view of which job(s)
+          # broke without clicking through to ppap.
+          DESC=$(printf 'biome %s · typecheck %s · lint %s · vitest %s' \
+            "$(tag "$R_BIOME")" "$(tag "$R_TYPE")" "$(tag "$R_LINT")" "$(tag "$R_TEST")")
+          gh api repos/${{ env.PRIVATE_REPO }}/statuses/"$HEAD_SHA" \
+            -f state="$STATE" \
+            -f context=CI \
+            -f description="$DESC" \
+            -f target_url="$RUN_URL"
+          echo "✓ Updated CI status on $HEAD_SHA — $STATE ($DESC)"
