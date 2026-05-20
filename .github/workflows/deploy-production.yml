@@ -1,0 +1,69 @@
+name: Deploy — Production
+
+# Triggered cross-repo from NamThuanVn/erp-namthuan when `release.yml` cuts a
+# new release. `workflow_dispatch` requires typing PRODUCTION into the confirm
+# input as a tripwire against fat-fingered clicks. All deploy logic lives in
+# deploy.yml (reusable workflow_call). See .claude/ppap.md for the architecture.
+run-name: "Deploy Production — triggered by @${{ github.event.client_payload.triggered_by || inputs.triggered_by || github.actor }} (${{ github.event.client_payload.tag || inputs.tag }})"
+
+on:
+  repository_dispatch:
+    types: [deploy-production]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to deploy (e.g. v1.2.3). Required.'
+        required: true
+      confirm:
+        description: 'Type PRODUCTION to confirm.'
+        required: true
+        default: ''
+      triggered_by:
+        description: 'Manual override actor handle (for run-name)'
+        required: false
+        default: ''
+
+permissions: read-all
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # Tripwire: workflow_dispatch must type PRODUCTION exactly. Skipped for
+  # repository_dispatch where confirmation is implicit (release.yml fired it).
+  confirm:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard — confirm tripwire
+        run: |
+          if [ "${{ inputs.confirm }}" != "PRODUCTION" ]; then
+            echo "Confirmation input must be exactly 'PRODUCTION' (got '${{ inputs.confirm }}')."
+            exit 1
+          fi
+          if [ -z "${{ inputs.tag }}" ]; then
+            echo "Tag input is required for manual production deploys."
+            exit 1
+          fi
+
+  deploy:
+    needs: [confirm]
+    if: |
+      always() &&
+      (needs.confirm.result == 'success' || needs.confirm.result == 'skipped')
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: production
+      tf_workspace: namthuanvn-production
+      domain: namthuan.co
+      api_url: https://namthuan.co/api
+      checkout_ref: refs/tags/${{ github.event.client_payload.tag || inputs.tag }}
+      deploy_script_suffix: ':production'
+      release_tag: ${{ github.event.client_payload.tag || inputs.tag }}
+      deployment_id: ${{ github.event.client_payload.deployment_id }}
+      commit_sha: ${{ github.event.client_payload.sha }}
+      status_context: deploy-production
+    secrets:
+      TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+      PAT_TOKEN: ${{ secrets.PAT_TOKEN }}

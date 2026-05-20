@@ -1,0 +1,400 @@
+name: Deploy (reusable)
+
+# Reusable workflow shared by deploy-staging.yml and deploy-production.yml.
+# Those wrappers handle the trigger surface (event types, concurrency,
+# environment-specific run-name) and pass per-env inputs in here. This file
+# owns the actual deploy graph: terraform apply → monitor → leaves matrix →
+# tier-1.5 matrix → gateway → dashboard → status pingback. See
+# .claude/ppap.md in the private repo for the full architecture.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'staging | production — drives wrangler env, NODE_ENV, Vectorize index name.'
+        type: string
+        required: true
+      tf_workspace:
+        description: 'HCP Terraform workspace name (namthuanvn-staging | namthuanvn-production).'
+        type: string
+        required: true
+      domain:
+        description: 'Public host (namthuan.org | namthuan.co). Powers NEXT_PUBLIC_DASHBOARD_URL + environment_url on the pingback.'
+        type: string
+        required: true
+      api_url:
+        description: 'Public API URL passed as NEXT_PUBLIC_API_URL on the dashboard build.'
+        type: string
+        required: true
+      checkout_ref:
+        description: 'Private-repo ref to deploy (sha for staging, refs/tags/<tag> for production).'
+        type: string
+        required: true
+      deploy_script_suffix:
+        description: 'Suffix applied to `deploy` pnpm scripts for gateway + dashboard (":staging" | ":production").'
+        type: string
+        required: true
+      release_tag:
+        description: 'Release tag (production only). Used in pingback descriptions.'
+        type: string
+        required: false
+        default: ''
+      deployment_id:
+        description: 'Pre-created GitHub Deployment id in erp-namthuan; pinged at the end. Empty on manual workflow_dispatch.'
+        type: string
+        required: false
+        default: ''
+      commit_sha:
+        description: 'Commit sha to attach a commit status to in erp-namthuan. Empty on manual workflow_dispatch.'
+        type: string
+        required: false
+        default: ''
+      status_context:
+        description: 'Commit-status context name (deploy-staging | deploy-production).'
+        type: string
+        required: true
+    secrets:
+      TF_API_TOKEN:
+        required: true
+      PAT_TOKEN:
+        required: true
+
+permissions: read-all
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # 1. Provision Cloudflare resources (KV, D1, Queues, Pages, Vectorize
+  #    placeholders). Must run before worker deploy — workers bind to these
+  #    IDs.
+  # ───────────────────────────────────────────────────────────────────────────
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    concurrency:
+      group: tf-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+      TF_WORKSPACE: ${{ inputs.tf_workspace }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: '1.9.0'
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve -no-color
+
+      - name: Export Terraform outputs
+        working-directory: terraform
+        run: terraform output -json > tf-outputs.json
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tf-outputs
+          path: terraform/tf-outputs.json
+          retention-days: 1
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 2. Deploy monitor-service (Tail Worker) FIRST. Every other worker
+  #    declares `tail_consumers: [{ service: "monitor-service" }]` —
+  #    Cloudflare rejects a deploy whose tail consumer doesn't exist on the
+  #    account, so this job must finish before the leaf matrix or gateway.
+  # ───────────────────────────────────────────────────────────────────────────
+  deploy-worker-monitor:
+    name: Deploy monitor-service
+    needs: terraform-apply
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tf-outputs
+          path: /tmp
+
+      - name: Resolve wrangler bindings
+        run: .github/scripts/resolve-wrangler-bindings.sh monitor ${{ inputs.environment }}
+        env:
+          TF_OUTPUTS_JSON: /tmp/tf-outputs.json
+
+      - name: Deploy Worker
+        run: pnpm --filter @namthuanvn/monitor run deploy
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 3. Leaves in parallel (Cloudflare service-binding tier 1).
+  # ───────────────────────────────────────────────────────────────────────────
+  deploy-workers-leaves:
+    name: Deploy ${{ matrix.service }} (leaf)
+    needs: [terraform-apply, deploy-worker-monitor]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [hris, finance, expense, utilities, notifications, auth, assistant, files]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tf-outputs
+          path: /tmp
+
+      - name: Resolve wrangler bindings
+        run: .github/scripts/resolve-wrangler-bindings.sh ${{ matrix.service }} ${{ inputs.environment }}
+        env:
+          TF_OUTPUTS_JSON: /tmp/tf-outputs.json
+
+      # Vectorize index — Cloudflare TF provider v4 doesn't support
+      # `cloudflare_vectorize_index` (added in v5). Idempotent: first deploy
+      # creates the index + metadata indexes, subsequent deploys are no-ops.
+      # See `.claude/infrastructure.md` § Vectorize bootstrap.
+      - name: Bootstrap Vectorize index (idempotent)
+        if: matrix.service == 'assistant'
+        run: |
+          set -euo pipefail
+          INDEX="${{ inputs.environment }}-assistant-vectors"
+          if npx wrangler vectorize list 2>/dev/null | grep -q "\\b${INDEX}\\b"; then
+            echo "✓ Vectorize index '${INDEX}' already exists — skipping create."
+          else
+            echo "Creating Vectorize index '${INDEX}'..."
+            npx wrangler vectorize create "${INDEX}" --dimensions=1024 --metric=cosine
+            npx wrangler vectorize create-metadata-index "${INDEX}" --property-name=requiredPermission --type=string
+            npx wrangler vectorize create-metadata-index "${INDEX}" --property-name=entityType --type=string
+            echo "✓ Vectorize index '${INDEX}' created with metadata indexes."
+          fi
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
+
+      - name: Apply D1 migrations
+        run: pnpm --filter @namthuanvn/${{ matrix.service }} --if-present db:migrate:remote
+
+      - name: Deploy Worker
+        run: pnpm --filter @namthuanvn/${{ matrix.service }} run deploy
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 4. Tier 1.5 — workers with sibling `services` bindings (orchestrator,
+  #    aggregator). Must run AFTER leaves so the bindings target existing
+  #    workers (Cloudflare error 10143).
+  # ───────────────────────────────────────────────────────────────────────────
+  deploy-workers-tier-1-5:
+    name: Deploy ${{ matrix.service }} (tier 1.5)
+    needs: deploy-workers-leaves
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [orchestrator, aggregator]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tf-outputs
+          path: /tmp
+
+      - name: Resolve wrangler bindings
+        run: .github/scripts/resolve-wrangler-bindings.sh ${{ matrix.service }} ${{ inputs.environment }}
+        env:
+          TF_OUTPUTS_JSON: /tmp/tf-outputs.json
+
+      - name: Apply D1 migrations
+        run: pnpm --filter @namthuanvn/${{ matrix.service }} --if-present db:migrate:remote
+
+      - name: Deploy Worker
+        run: pnpm --filter @namthuanvn/${{ matrix.service }} run deploy
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 5. gateway-service — service-binds to every other worker.
+  # ───────────────────────────────────────────────────────────────────────────
+  deploy-worker-gateway:
+    name: Deploy gateway-service
+    needs: deploy-workers-tier-1-5
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tf-outputs
+          path: /tmp
+
+      - name: Resolve wrangler bindings
+        run: .github/scripts/resolve-wrangler-bindings.sh gateway ${{ inputs.environment }}
+        env:
+          TF_OUTPUTS_JSON: /tmp/tf-outputs.json
+
+      - name: Deploy Worker
+        run: pnpm --filter @namthuanvn/gateway run deploy${{ inputs.deploy_script_suffix }}
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 6. Next.js dashboard via OpenNext → Cloudflare Worker. Runs in parallel
+  #    with the worker chain.
+  # ───────────────────────────────────────────────────────────────────────────
+  deploy-dashboard:
+    name: Deploy Dashboard
+    needs: terraform-apply
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tf-outputs
+          path: /tmp
+
+      - name: Load Cloudflare credentials
+        run: .github/scripts/resolve-wrangler-bindings.sh dashboard ${{ inputs.environment }}
+        env:
+          TF_OUTPUTS_JSON: /tmp/tf-outputs.json
+
+      # Firebase web-app config: every value lives in HCP, never in GitHub.
+      - name: Load Firebase web config from tf-outputs
+        id: fb
+        run: |
+          jq -er .firebase_web_api_key.value             /tmp/tf-outputs.json | xargs -I {} echo "api_key={}"             >> "$GITHUB_OUTPUT"
+          jq -er .firebase_web_auth_domain.value         /tmp/tf-outputs.json | xargs -I {} echo "auth_domain={}"         >> "$GITHUB_OUTPUT"
+          jq -er .firebase_web_project_id.value          /tmp/tf-outputs.json | xargs -I {} echo "project_id={}"          >> "$GITHUB_OUTPUT"
+          jq -er .firebase_web_messaging_sender_id.value /tmp/tf-outputs.json | xargs -I {} echo "messaging_sender_id={}" >> "$GITHUB_OUTPUT"
+          jq -er .firebase_web_app_id.value              /tmp/tf-outputs.json | xargs -I {} echo "app_id={}"              >> "$GITHUB_OUTPUT"
+          jq -er .firebase_web_vapid_key.value           /tmp/tf-outputs.json | xargs -I {} echo "vapid_key={}"           >> "$GITHUB_OUTPUT"
+
+      # Sentry config — all four optional. Empty values skip the echo so the
+      # SDK initializes with `enabled: false`. See `docs/engineering/sentry.md`.
+      - name: Load Sentry config from tf-outputs
+        id: sentry
+        run: |
+          jq -r .sentry_dsn_dashboard.value     /tmp/tf-outputs.json | xargs -I {} echo "dsn={}"          >> "$GITHUB_OUTPUT"
+          jq -r .sentry_auth_token.value        /tmp/tf-outputs.json | xargs -I {} echo "auth_token={}"  >> "$GITHUB_OUTPUT"
+          jq -r .sentry_org.value               /tmp/tf-outputs.json | xargs -I {} echo "org={}"         >> "$GITHUB_OUTPUT"
+          jq -r .sentry_project_dashboard.value /tmp/tf-outputs.json | xargs -I {} echo "project={}"     >> "$GITHUB_OUTPUT"
+
+      - name: Build (OpenNext — Cloudflare Workers)
+        run: pnpm --filter @namthuanvn/dashboard run pages:build
+        env:
+          NEXT_PUBLIC_APP_ENV: ${{ inputs.environment }}
+          NEXT_PUBLIC_API_URL: ${{ inputs.api_url }}
+          NEXT_PUBLIC_DASHBOARD_URL: https://${{ inputs.domain }}
+          NEXT_PUBLIC_FIREBASE_API_KEY: ${{ steps.fb.outputs.api_key }}
+          NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: ${{ steps.fb.outputs.auth_domain }}
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: ${{ steps.fb.outputs.project_id }}
+          NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: ${{ steps.fb.outputs.messaging_sender_id }}
+          NEXT_PUBLIC_FIREBASE_APP_ID: ${{ steps.fb.outputs.app_id }}
+          NEXT_PUBLIC_FIREBASE_VAPID_KEY: ${{ steps.fb.outputs.vapid_key }}
+          NEXT_PUBLIC_SENTRY_DSN: ${{ steps.sentry.outputs.dsn }}
+          SENTRY_AUTH_TOKEN: ${{ steps.sentry.outputs.auth_token }}
+          SENTRY_ORG: ${{ steps.sentry.outputs.org }}
+          SENTRY_PROJECT: ${{ steps.sentry.outputs.project }}
+
+      - name: Deploy Worker
+        run: pnpm --filter @namthuanvn/dashboard run deploy${{ inputs.deploy_script_suffix }}
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 7. Pingback. The dispatcher in the private repo created a *pending*
+  #    GitHub Deployment; we close it out here with success/failure so
+  #    erp-namthuan's Environments tab + commit status reflect the real
+  #    outcome. Both steps no-op when the run was a manual workflow_dispatch
+  #    (no deployment_id / sha in the event payload).
+  # ───────────────────────────────────────────────────────────────────────────
+  report-deployment:
+    name: Report Deployment
+    needs: [deploy-worker-gateway, deploy-dashboard]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute outcome
+        id: outcome
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "state=failure" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=success" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ping Deployment status on private repo
+        if: inputs.deployment_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          STATE: ${{ steps.outcome.outputs.state }}
+          TAG_SUFFIX: ${{ inputs.release_tag && format(' ({0})', inputs.release_tag) || '' }}
+        run: |
+          gh api repos/${{ env.PRIVATE_REPO }}/deployments/${{ inputs.deployment_id }}/statuses \
+            -f state="$STATE" \
+            -f environment_url="https://${{ inputs.domain }}" \
+            -f log_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="ppap run #${{ github.run_id }}${TAG_SUFFIX}"
+
+      - name: Ping commit status on private repo
+        if: inputs.commit_sha != ''
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          STATE: ${{ steps.outcome.outputs.state }}
+          TAG_SUFFIX: ${{ inputs.release_tag && format(' ({0})', inputs.release_tag) || '' }}
+        run: |
+          gh api repos/${{ env.PRIVATE_REPO }}/statuses/${{ inputs.commit_sha }} \
+            -f state="$STATE" \
+            -f context=${{ inputs.status_context }} \
+            -f target_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="ppap deploy $STATE${TAG_SUFFIX}"
+
+      - name: Summary
+        run: |
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Outcome: ${{ steps.outcome.outputs.state }}"
+          echo "Tag: ${{ inputs.release_tag }}"
+          echo "Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "URL: https://${{ inputs.domain }}"

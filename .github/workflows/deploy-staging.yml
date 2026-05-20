@@ -1,0 +1,44 @@
+name: Deploy — Staging
+
+# Triggered cross-repo from NamThuanVn/erp-namthuan after CI passes on main.
+# `workflow_dispatch` is the manual escape hatch (smoke tests, hand re-runs).
+# All deploy logic lives in deploy.yml (reusable workflow_call); this file is
+# just the trigger + per-env inputs. See .claude/ppap.md for the architecture.
+run-name: "Deploy Staging — triggered by @${{ github.event.client_payload.triggered_by || inputs.triggered_by || github.actor }}"
+
+on:
+  repository_dispatch:
+    types: [deploy-staging]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private-repo ref to deploy (sha or branch). Default: main'
+        required: false
+        default: 'main'
+      triggered_by:
+        description: 'Manual override actor handle (for run-name)'
+        required: false
+        default: ''
+
+permissions: read-all
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: staging
+      tf_workspace: namthuanvn-staging
+      domain: namthuan.org
+      api_url: https://namthuan.org/api
+      checkout_ref: ${{ github.event.client_payload.sha || inputs.ref || 'main' }}
+      deploy_script_suffix: ':staging'
+      deployment_id: ${{ github.event.client_payload.deployment_id }}
+      commit_sha: ${{ github.event.client_payload.sha }}
+      status_context: deploy-staging
+    secrets:
+      TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+      PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
