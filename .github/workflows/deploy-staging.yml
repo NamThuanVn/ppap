@@ -4,7 +4,7 @@ name: Deploy — Staging
 # `workflow_dispatch` is the manual escape hatch (smoke tests, hand re-runs).
 # All deploy logic lives in deploy.yml (reusable workflow_call); this file is
 # just the trigger + per-env inputs. See .claude/ppap.md for the architecture.
-run-name: "Deploy Staging — triggered by @${{ github.event.client_payload.triggered_by || inputs.triggered_by || github.actor }}"
+run-name: "${{ github.event.client_payload.title || format('Deploy Staging — triggered by @{0}', inputs.triggered_by || github.actor) }}"
 
 on:
   repository_dispatch:

@@ -4,7 +4,7 @@ name: Deploy — Production
 # new release. `workflow_dispatch` requires typing PRODUCTION into the confirm
 # input as a tripwire against fat-fingered clicks. All deploy logic lives in
 # deploy.yml (reusable workflow_call). See .claude/ppap.md for the architecture.
-run-name: "Deploy Production — triggered by @${{ github.event.client_payload.triggered_by || inputs.triggered_by || github.actor }} (${{ github.event.client_payload.tag || inputs.tag }})"
+run-name: "${{ github.event.client_payload.title || format('Deploy Production — triggered by @{0} ({1})', inputs.triggered_by || github.actor, inputs.tag) }}"
 
 on:
   repository_dispatch:
