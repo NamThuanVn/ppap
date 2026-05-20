@@ -1,4 +1,4 @@
-name: Deploy — Staging
+name: Deploy Staging
 
 # Triggered cross-repo from NamThuanVn/erp-namthuan after CI passes on main.
 # `workflow_dispatch` is the manual escape hatch (smoke tests, hand re-runs).
@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   deploy:
-    uses: ./.github/workflows/deploy.yml
+    uses: ./.github/workflows/deploy-reusable.yml
     with:
       environment: staging
       tf_workspace: namthuanvn-staging

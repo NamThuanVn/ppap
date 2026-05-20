@@ -1,4 +1,4 @@
-name: Deploy (reusable)
+name: Deploy · Reusable (workflow_call)
 
 # Reusable workflow shared by deploy-staging.yml and deploy-production.yml.
 # Those wrappers handle the trigger surface (event types, concurrency,

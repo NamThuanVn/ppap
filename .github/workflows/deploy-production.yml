@@ -1,4 +1,4 @@
-name: Deploy — Production
+name: Deploy Production
 
 # Triggered cross-repo from NamThuanVn/erp-namthuan when `release.yml` cuts a
 # new release. `workflow_dispatch` requires typing PRODUCTION into the confirm
@@ -52,7 +52,7 @@ jobs:
     if: |
       always() &&
       (needs.confirm.result == 'success' || needs.confirm.result == 'skipped')
-    uses: ./.github/workflows/deploy.yml
+    uses: ./.github/workflows/deploy-reusable.yml
     with:
       environment: production
       tf_workspace: namthuanvn-production
