@@ -81,7 +81,7 @@ jobs:
 
       - uses: ./.github/actions/install
 
-      - run: pnpm lint:workspaces
+      - run: pnpm lint:js:packages
 
   test:
     name: Vitest
@@ -97,4 +97,4 @@ jobs:
 
       - uses: ./.github/actions/install
 
-      - run: pnpm test:run
+      - run: pnpm test:ci
