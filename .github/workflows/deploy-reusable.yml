@@ -346,7 +346,7 @@ jobs:
           jq -r .sentry_project_dashboard.value /tmp/tf-outputs.json | xargs -I {} echo "project={}"     >> "$GITHUB_OUTPUT"
 
       - name: Build (OpenNext — Cloudflare Workers)
-        run: pnpm --filter @namthuanvn/dashboard run build
+        run: pnpm --filter @namthuanvn/dashboard run build:pages
         env:
           NEXT_PUBLIC_APP_ENV: ${{ inputs.environment }}
           NEXT_PUBLIC_API_URL: ${{ inputs.api_url }}
