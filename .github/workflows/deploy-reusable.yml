@@ -151,6 +151,10 @@ jobs:
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
+      - name: Capture deploy SHA
+        id: sha
+        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/install
 
       - uses: actions/download-artifact@v8
@@ -164,7 +168,7 @@ jobs:
           TF_OUTPUTS_JSON: /tmp/tf-outputs.json
 
       - name: Deploy Worker
-        run: pnpm --filter @namthuanvn/monitor run deploy
+        run: pnpm --filter @namthuanvn/monitor run deploy -- --var SENTRY_RELEASE:${{ steps.sha.outputs.value }}
 
   # ───────────────────────────────────────────────────────────────────────────
   # 3. Leaves in parallel (Cloudflare service-binding tier 1).
@@ -184,6 +188,10 @@ jobs:
           token: ${{ secrets.PAT_TOKEN }}
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
+
+      - name: Capture deploy SHA
+        id: sha
+        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/install
 
@@ -223,7 +231,7 @@ jobs:
         run: pnpm --filter @namthuanvn/${{ matrix.service }} --if-present db:migrate:remote
 
       - name: Deploy Worker
-        run: pnpm --filter @namthuanvn/${{ matrix.service }} run deploy
+        run: pnpm --filter @namthuanvn/${{ matrix.service }} run deploy -- --var SENTRY_RELEASE:${{ steps.sha.outputs.value }}
 
   # ───────────────────────────────────────────────────────────────────────────
   # 4. Tier 1.5 — workers with sibling `services` bindings (orchestrator,
@@ -246,6 +254,10 @@ jobs:
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
+      - name: Capture deploy SHA
+        id: sha
+        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/install
 
       - uses: actions/download-artifact@v8
@@ -262,7 +274,7 @@ jobs:
         run: pnpm --filter @namthuanvn/${{ matrix.service }} --if-present db:migrate:remote
 
       - name: Deploy Worker
-        run: pnpm --filter @namthuanvn/${{ matrix.service }} run deploy
+        run: pnpm --filter @namthuanvn/${{ matrix.service }} run deploy -- --var SENTRY_RELEASE:${{ steps.sha.outputs.value }}
 
   # ───────────────────────────────────────────────────────────────────────────
   # 5. gateway-service — service-binds to every other worker.
@@ -280,6 +292,10 @@ jobs:
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
+      - name: Capture deploy SHA
+        id: sha
+        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/install
 
       - uses: actions/download-artifact@v8
@@ -293,7 +309,7 @@ jobs:
           TF_OUTPUTS_JSON: /tmp/tf-outputs.json
 
       - name: Deploy Worker
-        run: pnpm --filter @namthuanvn/gateway run deploy${{ inputs.deploy_script_suffix }}
+        run: pnpm --filter @namthuanvn/gateway run deploy${{ inputs.deploy_script_suffix }} -- --var SENTRY_RELEASE:${{ steps.sha.outputs.value }}
 
   # ───────────────────────────────────────────────────────────────────────────
   # 6. Next.js dashboard via OpenNext → Cloudflare Worker. Runs in parallel
@@ -311,6 +327,10 @@ jobs:
           token: ${{ secrets.PAT_TOKEN }}
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
+
+      - name: Capture deploy SHA
+        id: sha
+        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/install
 
@@ -349,6 +369,7 @@ jobs:
         run: pnpm --filter @namthuanvn/dashboard run build:pages
         env:
           NEXT_PUBLIC_APP_ENV: ${{ inputs.environment }}
+          NEXT_PUBLIC_APP_RELEASE: ${{ steps.sha.outputs.value }}
           NEXT_PUBLIC_API_URL: ${{ inputs.api_url }}
           NEXT_PUBLIC_DASHBOARD_URL: https://${{ inputs.domain }}
           NEXT_PUBLIC_FIREBASE_API_KEY: ${{ steps.fb.outputs.api_key }}
