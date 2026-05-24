@@ -131,6 +131,16 @@ jobs:
         shell: bash
         run: pnpm mcp:code-review-graph
 
+      # Git needs a user identity to make commits. Without this step, the
+      # commit phase of Step 6 fails with "Author identity unknown" (seen on
+      # ppap run 26357015231). Use a bot-flavored identity that's clearly
+      # not a human contributor.
+      - name: Configure git identity
+        shell: bash
+        run: |
+          git config --global user.name  "Claude Bot"
+          git config --global user.email "claude-bot@namthuan.vn"
+
       - name: Assemble agent prompt
         id: assemble
         env:
@@ -184,7 +194,11 @@ jobs:
           direct_prompt: ${{ steps.assemble.outputs.prompt }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.PAT_TOKEN }}
-          timeout_minutes: 15
+          # 45 min budget. Real bot tasks (read context + plan + apply +
+          # pre-commit gates + lefthook test:ci + push + open PR) routinely
+          # take 8–20 minutes; the previous 15-min cap was too tight and
+          # truncated runs mid-execution.
+          timeout_minutes: 45
           # CRITICAL: the action's default allowed_tools is
           # "Edit,MultiEdit,Glob,Grep,LS,Read,Write" with Bash EXCLUDED. Our
           # protocol relies on `gh issue comment` / `gh api .../comments/N -X
@@ -194,4 +208,12 @@ jobs:
           # to completion, and never posts a single comment. (Symptom seen on
           # ppap run 26354917125 for issue #132: 52 turns, $0.43 burned, no
           # comment.)
-          allowed_tools: "Bash,Edit,MultiEdit,Glob,Grep,LS,Read,Write"
+          #
+          # mcp__code-review-graph__* wildcard grants Claude access to the
+          # graph's MCP tools (impact analysis, callers, dependents, etc.).
+          # Without this, Claude requests them and gets a permission denial
+          # mid-turn (symptom from ppap run 26357015231 on issue #137:
+          # "Claude requested permissions to use
+          # mcp__code-review-graph__build_or_update_graph_tool, but you
+          # haven't granted it yet").
+          allowed_tools: "Bash,Edit,MultiEdit,Glob,Grep,LS,Read,Write,mcp__code-review-graph__*"
