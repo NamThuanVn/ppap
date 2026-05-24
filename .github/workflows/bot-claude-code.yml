@@ -61,7 +61,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Resolve checkout ref
+      - name: Resolve checkout ref + run metadata
         id: ref
         run: |
           set -euo pipefail
@@ -78,6 +78,12 @@ jobs:
               echo "gh_cmd=issue"
             } >> "$GITHUB_OUTPUT"
           fi
+          # Datestamp for the execution branch name + run URL for the
+          # sticky-comment header. UTC so it's stable across the team.
+          {
+            echo "datestamp=$(date -u +%Y%m%d-%H%M)"
+            echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Checkout erp-namthuan
         uses: actions/checkout@v4
@@ -96,6 +102,8 @@ jobs:
           EVENT: ${{ inputs.event_name }}
           AUTHOR: ${{ inputs.author }}
           BODY: ${{ inputs.body }}
+          RUN_URL: ${{ steps.ref.outputs.run_url }}
+          DATESTAMP: ${{ steps.ref.outputs.datestamp }}
         run: |
           set -euo pipefail
           if [ ! -f .github/claude-agent-protocol.md ]; then
@@ -107,19 +115,23 @@ jobs:
           # shell re-evaluation or regex metacharacters can leak through.
           PROMPT=$(jq -nr \
             --rawfile template .github/claude-agent-protocol.md \
-            --arg kind   "$KIND" \
-            --arg gh_cmd "$GH_CMD" \
-            --arg number "$NUMBER" \
-            --arg event  "$EVENT" \
-            --arg author "$AUTHOR" \
-            --arg body   "$BODY" \
+            --arg kind      "$KIND" \
+            --arg gh_cmd    "$GH_CMD" \
+            --arg number    "$NUMBER" \
+            --arg event     "$EVENT" \
+            --arg author    "$AUTHOR" \
+            --arg body      "$BODY" \
+            --arg run_url   "$RUN_URL" \
+            --arg datestamp "$DATESTAMP" \
             '$template
-              | gsub("\\{\\{KIND\\}\\}";   $kind)
-              | gsub("\\{\\{GH_CMD\\}\\}"; $gh_cmd)
-              | gsub("\\{\\{NUMBER\\}\\}"; $number)
-              | gsub("\\{\\{EVENT\\}\\}";  $event)
-              | gsub("\\{\\{AUTHOR\\}\\}"; $author)
-              | gsub("\\{\\{BODY\\}\\}";   $body)')
+              | gsub("\\{\\{KIND\\}\\}";      $kind)
+              | gsub("\\{\\{GH_CMD\\}\\}";    $gh_cmd)
+              | gsub("\\{\\{NUMBER\\}\\}";    $number)
+              | gsub("\\{\\{EVENT\\}\\}";     $event)
+              | gsub("\\{\\{AUTHOR\\}\\}";    $author)
+              | gsub("\\{\\{BODY\\}\\}";      $body)
+              | gsub("\\{\\{RUN_URL\\}\\}";   $run_url)
+              | gsub("\\{\\{DATESTAMP\\}\\}"; $datestamp)')
           {
             echo "prompt<<__EOF__"
             echo "$PROMPT"
@@ -135,3 +147,13 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.PAT_TOKEN }}
           timeout_minutes: 15
+          # CRITICAL: the action's default allowed_tools is
+          # "Edit,MultiEdit,Glob,Grep,LS,Read,Write" with Bash EXCLUDED. Our
+          # protocol relies on `gh issue comment` / `gh api .../comments/N -X
+          # PATCH` to post and update the sticky comment, plus `git` for the
+          # execution branch — all of which are Bash invocations. Without
+          # this opt-in the action silently denies the gh/git commands, runs
+          # to completion, and never posts a single comment. (Symptom seen on
+          # ppap run 26354917125 for issue #132: 52 turns, $0.43 burned, no
+          # comment.)
+          allowed_tools: "Bash,Edit,MultiEdit,Glob,Grep,LS,Read,Write"
