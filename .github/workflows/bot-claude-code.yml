@@ -1,31 +1,45 @@
 name: Bot · Claude Code
 
 # Triggered cross-repo by erp-namthuan/.github/workflows/bot-claude-code-dispatch.yml
-# via repository_dispatch[claude]. The dispatcher forwards the original
-# event_name + full event_payload, which we replay below by writing the
-# payload to a file and pointing GITHUB_EVENT_PATH at it. The action reads
-# the event from GITHUB_EVENT_PATH internally, so this gives it the same
-# context it would have if triggered locally on erp-namthuan.
+# via workflow_dispatch. The dispatcher pre-computes a structured agent prompt
+# (because anthropics/claude-code-action@beta now rejects repository_dispatch
+# in its prepare step) and passes it as an input here.
 #
 # Uses PAT_TOKEN (same token as deploy/sync/CI, ppap-side copy). It must have
 # Contents R/W + Issues R/W + Pull requests R/W on erp-namthuan so the action
-# can comment, push commits to PR branches, and update issues.
-# See .claude/ppap.md § PAT_TOKEN for the trade-off note.
+# can clone the private repo and post comments / open PRs as part of agent
+# mode tool use. See .claude/ppap.md § PAT_TOKEN.
 #
 # Authenticates the Anthropic side via CLAUDE_CODE_OAUTH_TOKEN, which binds
 # bot runs to a Claude Code subscription's weekly quota (Pro / Max) rather
-# than per-token Anthropic Console billing. Generated locally via
-# `claude setup-token` and stored as a repo secret on ppap.
-# See .claude/ppap.md § Secrets & PATs.
+# than per-token Anthropic Console billing. See .claude/ppap.md § Secrets & PATs.
 
 on:
-  repository_dispatch:
-    types: [claude]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue or PR number on NamThuanVn/erp-namthuan'
+        required: true
+        type: string
+      is_pr:
+        description: 'true when the target is a PR (use refs/pull/N/head); false for plain issues (use main)'
+        required: true
+        type: string
+      title:
+        description: 'Issue / PR title (becomes the run-name)'
+        required: true
+        type: string
+      prompt:
+        description: 'Agent-mode prompt built by the dispatcher'
+        required: true
+        type: string
+
+run-name: ${{ inputs.title }}
 
 permissions: read-all
 
 concurrency:
-  group: bot-claude-${{ github.event.client_payload.event_name }}-${{ github.run_id }}
+  group: bot-claude-${{ inputs.issue_number }}
   cancel-in-progress: false
 
 env:
@@ -38,59 +52,29 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Replay original event into runner env
-        id: replay
-        env:
-          EVENT_NAME: ${{ github.event.client_payload.event_name }}
-          EVENT_PAYLOAD: ${{ toJson(github.event.client_payload.event_payload) }}
+      - name: Resolve checkout ref
+        id: ref
         run: |
           set -euo pipefail
-          # toJson re-serializes the forwarded event object back into a JSON
-          # string for writing to disk. The action's TS reads GITHUB_EVENT_PATH
-          # via process.env, so overriding it here makes the action see the
-          # original issue_comment/pull_request_review*/issues event instead
-          # of the repository_dispatch one that actually fired this workflow.
-          printf '%s' "$EVENT_PAYLOAD" > "$RUNNER_TEMP/event.json"
-          {
-            echo "GITHUB_EVENT_PATH=$RUNNER_TEMP/event.json"
-            echo "GITHUB_EVENT_NAME=$EVENT_NAME"
-            echo "GITHUB_REPOSITORY=${{ env.PRIVATE_REPO }}"
-          } >> "$GITHUB_ENV"
-          # Resolve the checkout ref. issue_comment on a PR has issue.pull_request
-          # set (it's a URL ending in /pulls/<N>); pull_request_review[_comment]
-          # has pull_request.number directly; issue/issue_comment on a plain
-          # issue has neither → fall back to main.
-          PR_NUM=$(jq -r '.issue.pull_request.url // empty | capture("/pulls/(?<n>[0-9]+)$").n // empty' "$RUNNER_TEMP/event.json")
-          if [ -z "$PR_NUM" ]; then
-            PR_NUM=$(jq -r '.pull_request.number // empty' "$RUNNER_TEMP/event.json")
-          fi
-          if [ -n "$PR_NUM" ]; then
-            REF="refs/pull/$PR_NUM/head"
+          if [ "${{ inputs.is_pr }}" = "true" ]; then
+            echo "checkout_ref=refs/pull/${{ inputs.issue_number }}/head" >> "$GITHUB_OUTPUT"
           else
-            REF="main"
+            echo "checkout_ref=main" >> "$GITHUB_OUTPUT"
           fi
-          echo "checkout_ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "✓ Replayed $EVENT_NAME event; checkout ref = $REF"
 
       - name: Checkout erp-namthuan
         uses: actions/checkout@v4
         with:
           repository: ${{ env.PRIVATE_REPO }}
-          ref: ${{ steps.replay.outputs.checkout_ref }}
+          ref: ${{ steps.ref.outputs.checkout_ref }}
           token: ${{ secrets.PAT_TOKEN }}
           fetch-depth: 1
 
       - name: Run Claude Code
         uses: anthropics/claude-code-action@beta
         with:
+          mode: agent
+          direct_prompt: ${{ inputs.prompt }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.PAT_TOKEN }}
-          trigger_phrase: "@claude"
-          # The action's post-step `Post buffered inline comments` uses
-          # ${{ github.event.* }} from the trigger event (the repository_dispatch,
-          # NOT our replayed event) — those interpolations are pre-rendered
-          # by GH Actions and can't be overridden from a prior step. Disabling
-          # the classification step skips that broken post-step. We lose
-          # probe-vs-real-review heuristics on inline comments; the main
-          # review UX is unchanged.
-          classify_inline_comments: "false"
+          timeout_minutes: 15
