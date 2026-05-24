@@ -93,6 +93,44 @@ jobs:
           token: ${{ secrets.PAT_TOKEN }}
           fetch-depth: 1
 
+      # Install the project's full dev toolchain so the repo's own quality
+      # gates can fire from inside the bot run:
+      #   - Stop hook (.claude/hooks/stop-checks.sh) needs pnpm to run audit:code
+      #   - Claude's pre-commit recipe (pnpm format:fix + typecheck + lint:biome) needs pnpm
+      #   - lefthook's pre-commit gate (pnpm test:ci) needs both pnpm AND the
+      #     prepare script to have run (lefthook install)
+      # The composite is the same one ppap CI + deploys already use, so the
+      # cache is shared across runs.
+      - name: Install dev toolchain (pnpm + node + cached modules)
+        uses: ./.github/actions/install
+
+      # pnpm prepare runs `lefthook install` (per package.json). Needed as a
+      # separate step because the composite's `pnpm install` is skipped on
+      # cache hit, and actions/checkout above recreates .git/hooks/ fresh
+      # every run — so without this, lefthook only activates on the rare
+      # cache-miss runs.
+      - name: Activate lefthook
+        shell: bash
+        run: pnpm prepare
+
+      # uv is required by mcp:code-review-graph (next step). The repo's
+      # .claude/settings.json invokes `code-review-graph status` on
+      # SessionStart and `code-review-graph update --skip-flows` on every
+      # Edit/Write via PostToolUse — without the binary, every Claude turn
+      # logs a "command not found" error. Install the binary here so the
+      # hooks succeed.
+      - name: Install uv (Python tool installer)
+        uses: astral-sh/setup-uv@v3
+
+      # We only run the code-review-graph subset of `pnpm mcp:setup` —
+      # mcp:sentry needs an interactive OAuth flow (impossible in CI) and
+      # mcp:playwright relies on the `claude` CLI binary registering user-
+      # scope state. Both fail in CI; code-review-graph is the one that
+      # actually works and unblocks the per-turn hooks.
+      - name: Install code-review-graph MCP server
+        shell: bash
+        run: pnpm mcp:code-review-graph
+
       - name: Assemble agent prompt
         id: assemble
         env:
