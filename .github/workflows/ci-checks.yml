@@ -36,7 +36,7 @@ env:
 
 jobs:
   biome:
-    name: Biome (format + lint)
+    name: 1 · CI · Biome (format + lint)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -52,7 +52,7 @@ jobs:
       - run: pnpm biome ci .
 
   typecheck:
-    name: Typecheck
+    name: 1 · CI · Typecheck
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -68,7 +68,7 @@ jobs:
       - run: pnpm typecheck
 
   lint:
-    name: ESLint (workspaces)
+    name: 1 · CI · Lint workspaces (ESLint)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -84,7 +84,7 @@ jobs:
       - run: pnpm lint:js:packages
 
   test:
-    name: Vitest
+    name: 1 · CI · Unit tests (Vitest)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

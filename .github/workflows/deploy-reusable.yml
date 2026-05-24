@@ -79,7 +79,7 @@ jobs:
   #    bypasses + post-merge drift.
   # ───────────────────────────────────────────────────────────────────────────
   ci-gate:
-    name: CI Gate
+    name: 1 · CI gate
     uses: ./.github/workflows/ci-checks.yml
     with:
       checkout_ref: ${{ inputs.checkout_ref }}
@@ -92,7 +92,7 @@ jobs:
   #    IDs.
   # ───────────────────────────────────────────────────────────────────────────
   terraform-apply:
-    name: Terraform Apply
+    name: 2 · Infra · Terraform apply
     needs: [ci-gate]
     runs-on: ubuntu-latest
     concurrency:
@@ -139,7 +139,7 @@ jobs:
   #    account, so this job must finish before the leaf matrix or gateway.
   # ───────────────────────────────────────────────────────────────────────────
   deploy-worker-monitor:
-    name: Deploy monitor-service
+    name: 3 · Worker · monitor (tail logs)
     needs: terraform-apply
     runs-on: ubuntu-latest
 
@@ -174,12 +174,12 @@ jobs:
   # 3. Leaves in parallel (Cloudflare service-binding tier 1).
   # ───────────────────────────────────────────────────────────────────────────
   deploy-workers-leaves:
-    name: Deploy ${{ matrix.service }} (leaf)
+    name: 4 · Worker · ${{ matrix.service }} (leaf API)
     needs: [terraform-apply, deploy-worker-monitor]
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        service: [hris, finance, expense, utilities, notifications, auth, assistant, files]
+        service: [hris, expense, utilities, notifications, auth, assistant, files]
 
     steps:
       - uses: actions/checkout@v6
@@ -239,7 +239,7 @@ jobs:
   #    workers (Cloudflare error 10143).
   # ───────────────────────────────────────────────────────────────────────────
   deploy-workers-tier-1-5:
-    name: Deploy ${{ matrix.service }} (tier 1.5)
+    name: 5 · Worker · ${{ matrix.service }} (composer)
     needs: deploy-workers-leaves
     runs-on: ubuntu-latest
     strategy:
@@ -280,7 +280,7 @@ jobs:
   # 5. gateway-service — service-binds to every other worker.
   # ───────────────────────────────────────────────────────────────────────────
   deploy-worker-gateway:
-    name: Deploy gateway-service
+    name: 6 · Worker · gateway (router)
     needs: deploy-workers-tier-1-5
     runs-on: ubuntu-latest
 
@@ -316,7 +316,7 @@ jobs:
   #    with the worker chain.
   # ───────────────────────────────────────────────────────────────────────────
   deploy-dashboard:
-    name: Deploy Dashboard
+    name: 4 · App · dashboard (Next.js)
     needs: terraform-apply
     runs-on: ubuntu-latest
 
@@ -394,7 +394,7 @@ jobs:
   #    (no deployment_id / sha in the event payload).
   # ───────────────────────────────────────────────────────────────────────────
   report-deployment:
-    name: Report Deployment
+    name: 7 · Report · deployment status
     # ci-gate is in `needs:` so a CI failure (which skips terraform-apply +
     # everything downstream) still surfaces as a `failure` state to the
     # Deployment-status pingback — otherwise the `contains(needs.*.result,
