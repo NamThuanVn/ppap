@@ -11,6 +11,12 @@ name: Bot · Claude Code
 # Contents R/W + Issues R/W + Pull requests R/W on erp-namthuan so the action
 # can comment, push commits to PR branches, and update issues.
 # See .claude/ppap.md § PAT_TOKEN for the trade-off note.
+#
+# Authenticates the Anthropic side via CLAUDE_CODE_OAUTH_TOKEN, which binds
+# bot runs to a Claude Code subscription's weekly quota (Pro / Max) rather
+# than per-token Anthropic Console billing. Generated locally via
+# `claude setup-token` and stored as a repo secret on ppap.
+# See .claude/ppap.md § Secrets & PATs.
 
 on:
   repository_dispatch:
@@ -77,7 +83,7 @@ jobs:
       - name: Run Claude Code
         uses: anthropics/claude-code-action@beta
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.PAT_TOKEN }}
           trigger_phrase: "@claude"
           # The action's post-step `Post buffered inline comments` uses
