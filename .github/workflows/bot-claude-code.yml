@@ -1,9 +1,10 @@
 name: Bot · Claude Code
 
 # Triggered cross-repo by erp-namthuan/.github/workflows/bot-claude-code-dispatch.yml
-# via workflow_dispatch. The dispatcher pre-computes a structured agent prompt
-# (because anthropics/claude-code-action@beta now rejects repository_dispatch
-# in its prepare step) and passes it as an input here.
+# via workflow_dispatch. The dispatcher forwards raw event fields (issue number,
+# author, body, etc.); the agent prompt itself is assembled here after checkout
+# from .github/claude-agent-protocol.md, which lives in erp-namthuan as the
+# canonical, reviewable source for the bot's conversational protocol.
 #
 # Uses PAT_TOKEN (same token as deploy/sync/CI, ppap-side copy). It must have
 # Contents R/W + Issues R/W + Pull requests R/W on erp-namthuan so the action
@@ -29,8 +30,16 @@ on:
         description: 'Issue / PR title (becomes the run-name)'
         required: true
         type: string
-      prompt:
-        description: 'Agent-mode prompt built by the dispatcher'
+      event_name:
+        description: 'Original triggering event name (issue_comment / issues / pull_request_review / pull_request_review_comment)'
+        required: true
+        type: string
+      author:
+        description: 'Login of the user who mentioned @claude'
+        required: true
+        type: string
+      body:
+        description: 'Body / comment text that contained @claude (truncated to ~3 KB by the dispatcher)'
         required: true
         type: string
 
@@ -57,9 +66,17 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ inputs.is_pr }}" = "true" ]; then
-            echo "checkout_ref=refs/pull/${{ inputs.issue_number }}/head" >> "$GITHUB_OUTPUT"
+            {
+              echo "checkout_ref=refs/pull/${{ inputs.issue_number }}/head"
+              echo "kind=PR"
+              echo "gh_cmd=pr"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "checkout_ref=main" >> "$GITHUB_OUTPUT"
+            {
+              echo "checkout_ref=main"
+              echo "kind=issue"
+              echo "gh_cmd=issue"
+            } >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout erp-namthuan
@@ -70,11 +87,51 @@ jobs:
           token: ${{ secrets.PAT_TOKEN }}
           fetch-depth: 1
 
+      - name: Assemble agent prompt
+        id: assemble
+        env:
+          KIND: ${{ steps.ref.outputs.kind }}
+          GH_CMD: ${{ steps.ref.outputs.gh_cmd }}
+          NUMBER: ${{ inputs.issue_number }}
+          EVENT: ${{ inputs.event_name }}
+          AUTHOR: ${{ inputs.author }}
+          BODY: ${{ inputs.body }}
+        run: |
+          set -euo pipefail
+          if [ ! -f .github/claude-agent-protocol.md ]; then
+            echo "::error::Missing .github/claude-agent-protocol.md in erp-namthuan@${{ steps.ref.outputs.checkout_ref }}. Bot cannot proceed."
+            exit 1
+          fi
+          # Substitute {{VAR}} placeholders via jq so untrusted BODY content
+          # (from a fork-PR comment) is treated as a literal string — no
+          # shell re-evaluation or regex metacharacters can leak through.
+          PROMPT=$(jq -nr \
+            --rawfile template .github/claude-agent-protocol.md \
+            --arg kind   "$KIND" \
+            --arg gh_cmd "$GH_CMD" \
+            --arg number "$NUMBER" \
+            --arg event  "$EVENT" \
+            --arg author "$AUTHOR" \
+            --arg body   "$BODY" \
+            '$template
+              | gsub("\\{\\{KIND\\}\\}";   $kind)
+              | gsub("\\{\\{GH_CMD\\}\\}"; $gh_cmd)
+              | gsub("\\{\\{NUMBER\\}\\}"; $number)
+              | gsub("\\{\\{EVENT\\}\\}";  $event)
+              | gsub("\\{\\{AUTHOR\\}\\}"; $author)
+              | gsub("\\{\\{BODY\\}\\}";   $body)')
+          {
+            echo "prompt<<__EOF__"
+            echo "$PROMPT"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+          echo "✓ Assembled agent prompt for $KIND #$NUMBER (event=$EVENT, author=@$AUTHOR)"
+
       - name: Run Claude Code
         uses: anthropics/claude-code-action@beta
         with:
           mode: agent
-          direct_prompt: ${{ inputs.prompt }}
+          direct_prompt: ${{ steps.assemble.outputs.prompt }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.PAT_TOKEN }}
           timeout_minutes: 15
