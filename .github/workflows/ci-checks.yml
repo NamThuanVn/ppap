@@ -16,6 +16,10 @@ on:
         description: 'Number of parallel Playwright shards. Tune up/down here; both PR CI and the deploy gate inherit it.'
         type: number
         default: 4
+      run_e2e:
+        description: 'Whether to run the e2e matrix. PR CI keeps the default (true); the deploy gate passes false so staging/production builds are not blocked on dashboard e2e.'
+        type: boolean
+        default: true
     outputs:
       biome:
         description: 'Result of the biome job'
@@ -112,6 +116,7 @@ jobs:
   # and the total so the playwright --shard=N/TOTAL flag stays in sync.
   e2e-setup:
     name: 1 · CI · E2E (plan shards)
+    if: ${{ inputs.run_e2e }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:
@@ -136,6 +141,7 @@ jobs:
   e2e:
     name: 1 · CI · E2E (shard ${{ matrix.shard }})
     needs: e2e-setup
+    if: ${{ inputs.run_e2e }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
