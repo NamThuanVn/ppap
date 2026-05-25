@@ -12,6 +12,10 @@ on:
         description: 'erp-namthuan ref to check out (refs/pull/<N>/merge for PR CI, sha for staging deploy, refs/tags/<tag> for production).'
         type: string
         required: true
+      e2e_shards:
+        description: 'Number of parallel Playwright shards. Tune up/down here; both PR CI and the deploy gate inherit it.'
+        type: number
+        default: 4
     outputs:
       biome:
         description: 'Result of the biome job'
@@ -25,6 +29,9 @@ on:
       test:
         description: 'Result of the test job'
         value: ${{ jobs.test.result }}
+      e2e:
+        description: 'Aggregated result of the e2e matrix (success only when all shards pass)'
+        value: ${{ jobs.e2e.result }}
     secrets:
       PAT_TOKEN:
         required: true
@@ -98,3 +105,150 @@ jobs:
       - uses: ./.github/actions/install
 
       - run: pnpm test:ci
+
+  # Fans the integer `e2e_shards` input into a JSON array (`[1,2,...,N]`) so
+  # the e2e matrix below can consume it via fromJSON. GitHub Actions has no
+  # native "shard 1..N from a number" matrix syntax. Outputs both the array
+  # and the total so the playwright --shard=N/TOTAL flag stays in sync.
+  e2e-setup:
+    name: 1 · CI · E2E (plan shards)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      shards: ${{ steps.gen.outputs.shards }}
+      total: ${{ steps.gen.outputs.total }}
+    steps:
+      - id: gen
+        env:
+          TOTAL: ${{ inputs.e2e_shards }}
+        run: |
+          set -euo pipefail
+          SHARDS=$(seq 1 "$TOTAL" | jq -R 'tonumber' | jq -cs '.')
+          echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
+          echo "total=$TOTAL"  >> "$GITHUB_OUTPUT"
+
+  # Playwright e2e. Each shard boots the full local stack (`pnpm dev` →
+  # proxy + Next.js + 7 wrangler workers in miniflare local mode) and runs
+  # its slice of specs against it via PLAYWRIGHT_NO_WEB_SERVER=1 so
+  # Playwright doesn't try to spawn `pnpm dev` itself. `fail-fast: false`
+  # so one flaky shard doesn't mask failures elsewhere — the aggregated
+  # `jobs.e2e.result` still flips to `failure` if any shard fails.
+  e2e:
+    name: 1 · CI · E2E (shard ${{ matrix.shard }})
+    needs: e2e-setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.e2e-setup.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      # /etc/hosts entry — the proxy serves `https://namthuan.local` and the
+      # dashboard's auth cookies are scoped to that domain.
+      - name: Map namthuan.local → 127.0.0.1
+        run: echo "127.0.0.1 namthuan.local" | sudo tee -a /etc/hosts
+
+      # Self-signed cert for the proxy. Playwright has ignoreHTTPSErrors,
+      # so we don't need mkcert / OS trust store integration.
+      - name: Generate proxy TLS cert
+        run: |
+          mkdir -p scripts/proxy/certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+            -keyout scripts/proxy/certs/server.key \
+            -out scripts/proxy/certs/server.crt \
+            -subj "/CN=namthuan.local" \
+            -addext "subjectAltName=DNS:namthuan.local,DNS:localhost,IP:127.0.0.1"
+
+      # Cache the Chromium download keyed on @playwright/test's resolved
+      # version from the lockfile. Saves ~1 min/shard on cache hit.
+      - name: Resolve Playwright version
+        id: pw
+        run: |
+          set -euo pipefail
+          VER=$(node -e "console.log(require('./node_modules/@playwright/test/package.json').version)")
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: pw-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Seed DB
+        run: pnpm db:reset
+
+      # Boot the dev stack in its own process group so cleanup can take the
+      # whole tree (concurrently + proxy + next + 7 wranglers) down with one
+      # signal. `set -m` ensures $! is also the PGID.
+      - name: Boot pnpm dev
+        id: dev
+        run: |
+          set -uo pipefail
+          set -m
+          nohup pnpm dev >dev.log 2>&1 &
+          DEV_PID=$!
+          set +m
+          echo "dev_pid=$DEV_PID" >> "$GITHUB_OUTPUT"
+          # Proxy auto-falls back from 443 → 3443 on EACCES (CI runner can't
+          # bind privileged ports). Poll /api/health on 3443.
+          deadline=$((SECONDS + 180))
+          while (( SECONDS < deadline )); do
+            if ! kill -0 "$DEV_PID" 2>/dev/null; then
+              echo "::error::pnpm dev exited before becoming ready"
+              tail -n 80 dev.log
+              exit 1
+            fi
+            if curl -skf https://namthuan.local:3443/api/health >/dev/null 2>&1; then
+              echo "✓ dev stack ready (PID $DEV_PID)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Timed out after 180s waiting for https://namthuan.local:3443/api/health"
+          tail -n 80 dev.log
+          kill -KILL -- -"$DEV_PID" 2>/dev/null || true
+          exit 1
+
+      - name: Run Playwright shard ${{ matrix.shard }}/${{ needs.e2e-setup.outputs.total }}
+        env:
+          PLAYWRIGHT_BASE_URL: https://namthuan.local:3443
+          PLAYWRIGHT_NO_WEB_SERVER: '1'
+        run: |
+          pnpm exec playwright test --reporter=line \
+            --shard=${{ matrix.shard }}/${{ needs.e2e-setup.outputs.total }}
+
+      - name: Tear down pnpm dev
+        if: always()
+        env:
+          DEV_PID: ${{ steps.dev.outputs.dev_pid }}
+        run: |
+          if [ -n "${DEV_PID:-}" ]; then
+            kill -TERM -- -"$DEV_PID" 2>/dev/null || true
+            sleep 2
+            kill -KILL -- -"$DEV_PID" 2>/dev/null || true
+          fi
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-shard-${{ matrix.shard }}
+          path: |
+            playwright-report/
+            test-results/
+            dev.log
+          retention-days: 7
+          if-no-files-found: ignore

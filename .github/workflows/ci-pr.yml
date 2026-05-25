@@ -2,9 +2,10 @@ name: CI · PR · Lint · Typecheck · Test
 
 # PR CI entrypoint. Triggered cross-repo by erp-namthuan/.github/workflows/
 # ci-pr-dispatch.yml via repository_dispatch[ci]; workflow_dispatch is the
-# manual re-run escape hatch. The actual 4-job graph lives in ci-checks.yml
-# (reusable workflow_call) — this file just wires that graph to the PR-CI
-# trigger surface and pings the Check Run back on completion.
+# manual re-run escape hatch. The actual job graph (biome / typecheck /
+# lint / test / e2e-shards) lives in ci-checks.yml (reusable workflow_call)
+# — this file just wires that graph to the PR-CI trigger surface and pings
+# the Check Run back on completion.
 #
 # Uses PAT_TOKEN (same token as deploy/sync, ppap-side copy). It must have
 # Checks:R/W on erp-namthuan so the `report` job can PATCH the Check Run.
@@ -22,6 +23,10 @@ on:
         description: 'PR number on NamThuanVn/erp-namthuan to (re)run CI for'
         required: true
         type: string
+      e2e_shards:
+        description: 'Override default Playwright shard count for a manual re-run (leave empty to use ci-checks.yml default).'
+        required: false
+        type: number
 
 permissions: read-all
 
@@ -46,6 +51,7 @@ jobs:
     uses: ./.github/workflows/ci-checks.yml
     with:
       checkout_ref: refs/pull/${{ github.event.client_payload.pr_number || inputs.pr_number }}/merge
+      e2e_shards: ${{ fromJSON(inputs.e2e_shards || '4') }}
     secrets:
       PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
 
@@ -71,6 +77,7 @@ jobs:
           R_TYPE: ${{ needs.checks.outputs.typecheck }}
           R_LINT: ${{ needs.checks.outputs.lint }}
           R_TEST: ${{ needs.checks.outputs.test }}
+          R_E2E: ${{ needs.checks.outputs.e2e }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -84,7 +91,7 @@ jobs:
               *)       echo "✗" ;;
             esac
           }
-          if [ "$R_BIOME" = "success" ] && [ "$R_TYPE" = "success" ] && [ "$R_LINT" = "success" ] && [ "$R_TEST" = "success" ]; then
+          if [ "$R_BIOME" = "success" ] && [ "$R_TYPE" = "success" ] && [ "$R_LINT" = "success" ] && [ "$R_TEST" = "success" ] && [ "$R_E2E" = "success" ]; then
             STATE="success"
           else
             STATE="failure"
@@ -92,8 +99,8 @@ jobs:
           # Statuses description max 140 chars. Compact per-job summary fits
           # easily and gives reviewers an at-a-glance view of which job(s)
           # broke without clicking through to ppap.
-          DESC=$(printf 'biome %s · typecheck %s · lint %s · vitest %s' \
-            "$(tag "$R_BIOME")" "$(tag "$R_TYPE")" "$(tag "$R_LINT")" "$(tag "$R_TEST")")
+          DESC=$(printf 'biome %s · typecheck %s · lint %s · vitest %s · e2e %s' \
+            "$(tag "$R_BIOME")" "$(tag "$R_TYPE")" "$(tag "$R_LINT")" "$(tag "$R_TEST")" "$(tag "$R_E2E")")
           gh api repos/${{ env.PRIVATE_REPO }}/statuses/"$HEAD_SHA" \
             -f state="$STATE" \
             -f context=CI \
