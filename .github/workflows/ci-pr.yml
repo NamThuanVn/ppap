@@ -1,4 +1,4 @@
-name: CI · PR · Lint · Typecheck · Test
+name: CI · PR · Lint · Typecheck · Test · E2E
 
 # PR CI entrypoint. Triggered cross-repo by erp-namthuan/.github/workflows/
 # ci-pr-dispatch.yml via repository_dispatch[ci]; workflow_dispatch is the
