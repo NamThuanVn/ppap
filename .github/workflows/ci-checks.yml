@@ -201,6 +201,16 @@ jobs:
       # signal. `set -m` ensures $! is also the PGID.
       - name: Boot pnpm dev
         id: dev
+        env:
+          # The committed apps/dashboard/.env.local bakes
+          # NEXT_PUBLIC_API_URL=https://namthuan.local/api (port 443), which is
+          # correct locally where the proxy binds 443. In CI the proxy can't
+          # bind privileged ports and falls back to :3443, so the dashboard's
+          # client- AND server-side fetches (api-client.ts `API_BASE_URL`) must
+          # be re-pointed at :3443 — otherwise every data fetch hits a dead
+          # port, no content renders, and specs fail with content timeouts.
+          # A process env var takes precedence over .env.local in `next dev`.
+          NEXT_PUBLIC_API_URL: https://namthuan.local:3443/api
         run: |
           set -uo pipefail
           set -m
