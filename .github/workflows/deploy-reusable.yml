@@ -350,16 +350,11 @@ jobs:
         env:
           TF_OUTPUTS_JSON: /tmp/tf-outputs.json
 
-      # Firebase web-app config: every value lives in HCP, never in GitHub.
-      - name: Load Firebase web config from tf-outputs
-        id: fb
+      # VAPID public key (Web Push) — lives in HCP, surfaced via tf-outputs.
+      - name: Load VAPID public key from tf-outputs
+        id: vapid
         run: |
-          jq -er .firebase_web_api_key.value             /tmp/tf-outputs.json | xargs -I {} echo "api_key={}"             >> "$GITHUB_OUTPUT"
-          jq -er .firebase_web_auth_domain.value         /tmp/tf-outputs.json | xargs -I {} echo "auth_domain={}"         >> "$GITHUB_OUTPUT"
-          jq -er .firebase_web_project_id.value          /tmp/tf-outputs.json | xargs -I {} echo "project_id={}"          >> "$GITHUB_OUTPUT"
-          jq -er .firebase_web_messaging_sender_id.value /tmp/tf-outputs.json | xargs -I {} echo "messaging_sender_id={}" >> "$GITHUB_OUTPUT"
-          jq -er .firebase_web_app_id.value              /tmp/tf-outputs.json | xargs -I {} echo "app_id={}"              >> "$GITHUB_OUTPUT"
-          jq -er .firebase_web_vapid_key.value           /tmp/tf-outputs.json | xargs -I {} echo "vapid_key={}"           >> "$GITHUB_OUTPUT"
+          jq -er .vapid_public_key.value /tmp/tf-outputs.json | xargs -I {} echo "public_key={}" >> "$GITHUB_OUTPUT"
 
       # Sentry config — all four optional. Empty values skip the echo so the
       # SDK initializes with `enabled: false`. See `docs/engineering/sentry.md`.
@@ -378,12 +373,7 @@ jobs:
           NEXT_PUBLIC_APP_RELEASE: ${{ steps.sha.outputs.value }}
           NEXT_PUBLIC_API_URL: ${{ inputs.api_url }}
           NEXT_PUBLIC_DASHBOARD_URL: https://${{ inputs.domain }}
-          NEXT_PUBLIC_FIREBASE_API_KEY: ${{ steps.fb.outputs.api_key }}
-          NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: ${{ steps.fb.outputs.auth_domain }}
-          NEXT_PUBLIC_FIREBASE_PROJECT_ID: ${{ steps.fb.outputs.project_id }}
-          NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: ${{ steps.fb.outputs.messaging_sender_id }}
-          NEXT_PUBLIC_FIREBASE_APP_ID: ${{ steps.fb.outputs.app_id }}
-          NEXT_PUBLIC_FIREBASE_VAPID_KEY: ${{ steps.fb.outputs.vapid_key }}
+          NEXT_PUBLIC_VAPID_PUBLIC_KEY: ${{ steps.vapid.outputs.public_key }}
           NEXT_PUBLIC_SENTRY_DSN: ${{ steps.sentry.outputs.dsn }}
           SENTRY_AUTH_TOKEN: ${{ steps.sentry.outputs.auth_token }}
           SENTRY_ORG: ${{ steps.sentry.outputs.org }}
