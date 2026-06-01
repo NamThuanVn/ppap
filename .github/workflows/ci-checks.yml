@@ -132,12 +132,12 @@ jobs:
           echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
           echo "total=$TOTAL"  >> "$GITHUB_OUTPUT"
 
-  # Playwright e2e. Each shard boots the full local stack (`pnpm dev` builds
-  # the dashboard via OpenNext, then runs the proxy + one wrangler session —
-  # dashboard worker primary, gateway & leaves as portless auxiliaries — plus
-  # the assistant) and runs its slice of specs against it via
-  # PLAYWRIGHT_NO_WEB_SERVER=1 so Playwright doesn't try to spawn `pnpm dev`
-  # itself. `fail-fast: false`
+  # Playwright e2e. Each shard boots a dedicated e2e stack via `pnpm e2e:serve`
+  # (builds the dashboard via OpenNext, seeds an isolated DB, then runs ONE
+  # wrangler session — dashboard worker primary, gateway & leaves as portless
+  # auxiliaries — on a free port, with NO proxy and NO assistant) and runs its
+  # slice of specs against http://localhost:<port> via PLAYWRIGHT_NO_WEB_SERVER=1
+  # so Playwright doesn't spawn its own server. `fail-fast: false`
   # so one flaky shard doesn't mask failures elsewhere — the aggregated
   # `jobs.e2e.result` still flips to `failure` if any shard fails.
   e2e:
@@ -160,21 +160,8 @@ jobs:
 
       - uses: ./.github/actions/install
 
-      # /etc/hosts entry — the proxy serves `https://namthuan.local` and the
-      # dashboard's auth cookies are scoped to that domain.
-      - name: Map namthuan.local → 127.0.0.1
-        run: echo "127.0.0.1 namthuan.local" | sudo tee -a /etc/hosts
-
-      # Self-signed cert for the proxy. Playwright has ignoreHTTPSErrors,
-      # so we don't need mkcert / OS trust store integration.
-      - name: Generate proxy TLS cert
-        run: |
-          mkdir -p scripts/proxy/certs
-          openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
-            -keyout scripts/proxy/certs/server.key \
-            -out scripts/proxy/certs/server.crt \
-            -subj "/CN=namthuan.local" \
-            -addext "subjectAltName=DNS:namthuan.local,DNS:localhost,IP:127.0.0.1"
+      # No /etc/hosts or TLS cert: e2e hits the dashboard worker directly on a
+      # free port over plain http://localhost (no proxy, no namthuan.local).
 
       # Cache the Chromium download keyed on @playwright/test's resolved
       # version from the lockfile. Saves ~1 min/shard on cache hit.
@@ -195,70 +182,67 @@ jobs:
       - name: Install Playwright Chromium
         run: pnpm exec playwright install --with-deps chromium
 
-      - name: Seed DB
-        run: pnpm db:reset
-
-      # Boot the dev stack in its own process group so cleanup can take the
-      # whole tree (concurrently + proxy + the wrangler session + assistant)
-      # down with one signal. `set -m` ensures $! is also the PGID.
-      - name: Boot pnpm dev
-        id: dev
-        env:
-          # The committed apps/dashboard/.env.local bakes
-          # NEXT_PUBLIC_API_URL=https://namthuan.local/api (port 443), which is
-          # correct locally where the proxy binds 443. In CI the proxy can't
-          # bind privileged ports and falls back to :3443, so the dashboard's
-          # client- AND server-side fetches (api-client.ts `API_BASE_URL`) must
-          # be re-pointed at :3443 — otherwise every data fetch hits a dead
-          # port, no content renders, and specs fail with content timeouts.
-          # `pnpm dev` builds the dashboard (OpenNext) first, so this process
-          # env var is inlined into the bundle at build time, overriding the
-          # baked .env.local value.
-          NEXT_PUBLIC_API_URL: https://namthuan.local:3443/api
+      # Boot a dedicated e2e stack on a free port (dashboard worker + gateway +
+      # leaves as bindings — NO proxy, NO assistant) in its own process group so
+      # teardown can signal the whole tree. `e2e:serve` builds the dashboard
+      # (generic relative `/api` build — no host/port baked), seeds an isolated
+      # `.wrangler/state-e2e`, writes the chosen port to `.wrangler/e2e-port`,
+      # then runs the wrangler session in the foreground. Playwright then hits
+      # http://localhost:<port> directly. `set -m` makes $! the PGID.
+      - name: Boot e2e stack
+        id: e2e
         run: |
           set -uo pipefail
           set -m
-          nohup pnpm dev >dev.log 2>&1 &
-          DEV_PID=$!
+          nohup pnpm e2e:serve >e2e-serve.log 2>&1 &
+          SERVE_PID=$!
           set +m
-          echo "dev_pid=$DEV_PID" >> "$GITHUB_OUTPUT"
-          # Proxy auto-falls back from 443 → 3443 on EACCES (CI runner can't
-          # bind privileged ports). Poll /api/health on 3443.
-          deadline=$((SECONDS + 180))
+          echo "serve_pid=$SERVE_PID" >> "$GITHUB_OUTPUT"
+          # Port file is written before the build, so it appears quickly.
+          for _ in $(seq 1 60); do
+            [ -s .wrangler/e2e-port ] && break
+            kill -0 "$SERVE_PID" 2>/dev/null || { echo "::error::e2e:serve exited early"; tail -n 80 e2e-serve.log; exit 1; }
+            sleep 1
+          done
+          PORT="$(cat .wrangler/e2e-port 2>/dev/null || true)"
+          if [ -z "$PORT" ]; then echo "::error::e2e:serve never reported a port"; tail -n 80 e2e-serve.log; exit 1; fi
+          echo "base=http://localhost:$PORT" >> "$GITHUB_OUTPUT"
+          # build (OpenNext) + seed + worker warmup → allow up to 5 min.
+          deadline=$((SECONDS + 300))
           while (( SECONDS < deadline )); do
-            if ! kill -0 "$DEV_PID" 2>/dev/null; then
-              echo "::error::pnpm dev exited before becoming ready"
-              tail -n 80 dev.log
+            if ! kill -0 "$SERVE_PID" 2>/dev/null; then
+              echo "::error::e2e stack exited before becoming ready"
+              tail -n 80 e2e-serve.log
               exit 1
             fi
-            if curl -skf https://namthuan.local:3443/api/health >/dev/null 2>&1; then
-              echo "✓ dev stack ready (PID $DEV_PID)"
+            if curl -sf "http://localhost:$PORT/api/health" >/dev/null 2>&1; then
+              echo "✓ e2e stack ready on :$PORT (PID $SERVE_PID)"
               exit 0
             fi
             sleep 2
           done
-          echo "::error::Timed out after 180s waiting for https://namthuan.local:3443/api/health"
-          tail -n 80 dev.log
-          kill -KILL -- -"$DEV_PID" 2>/dev/null || true
+          echo "::error::Timed out after 300s waiting for http://localhost:$PORT/api/health"
+          tail -n 80 e2e-serve.log
+          kill -KILL -- -"$SERVE_PID" 2>/dev/null || true
           exit 1
 
       - name: Run Playwright shard ${{ matrix.shard }}/${{ needs.e2e-setup.outputs.total }}
         env:
-          PLAYWRIGHT_BASE_URL: https://namthuan.local:3443
+          PLAYWRIGHT_BASE_URL: ${{ steps.e2e.outputs.base }}
           PLAYWRIGHT_NO_WEB_SERVER: '1'
         run: |
           pnpm exec playwright test --reporter=line \
             --shard=${{ matrix.shard }}/${{ needs.e2e-setup.outputs.total }}
 
-      - name: Tear down pnpm dev
+      - name: Tear down e2e stack
         if: always()
         env:
-          DEV_PID: ${{ steps.dev.outputs.dev_pid }}
+          SERVE_PID: ${{ steps.e2e.outputs.serve_pid }}
         run: |
-          if [ -n "${DEV_PID:-}" ]; then
-            kill -TERM -- -"$DEV_PID" 2>/dev/null || true
+          if [ -n "${SERVE_PID:-}" ]; then
+            kill -TERM -- -"$SERVE_PID" 2>/dev/null || true
             sleep 2
-            kill -KILL -- -"$DEV_PID" 2>/dev/null || true
+            kill -KILL -- -"$SERVE_PID" 2>/dev/null || true
           fi
 
       - name: Upload Playwright report
@@ -269,6 +253,6 @@ jobs:
           path: |
             playwright-report/
             test-results/
-            dev.log
+            e2e-serve.log
           retention-days: 7
           if-no-files-found: ignore
