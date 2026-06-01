@@ -318,12 +318,13 @@ jobs:
         run: pnpm --filter @namthuanvn/gateway run deploy${{ inputs.deploy_script_suffix }} -- --var SENTRY_RELEASE:${{ steps.sha.outputs.value }}
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 6. Next.js dashboard via OpenNext → Cloudflare Worker. Runs in parallel
-  #    with the worker chain.
+  # 6. Next.js dashboard via OpenNext → Cloudflare Worker. It is the public
+  #    ingress and service-binds to gateway-service (forwards `/api/*`), so it
+  #    deploys AFTER the gateway — which transitively waits for every leaf.
   # ───────────────────────────────────────────────────────────────────────────
   deploy-dashboard:
     name: 4 · App · dashboard (Next.js)
-    needs: terraform-apply
+    needs: [terraform-apply, deploy-worker-gateway]
     runs-on: ubuntu-latest
 
     steps:

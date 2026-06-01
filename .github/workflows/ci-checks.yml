@@ -132,10 +132,12 @@ jobs:
           echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
           echo "total=$TOTAL"  >> "$GITHUB_OUTPUT"
 
-  # Playwright e2e. Each shard boots the full local stack (`pnpm dev` →
-  # proxy + Next.js + 7 wrangler workers in miniflare local mode) and runs
-  # its slice of specs against it via PLAYWRIGHT_NO_WEB_SERVER=1 so
-  # Playwright doesn't try to spawn `pnpm dev` itself. `fail-fast: false`
+  # Playwright e2e. Each shard boots the full local stack (`pnpm dev` builds
+  # the dashboard via OpenNext, then runs the proxy + one wrangler session —
+  # dashboard worker primary, gateway & leaves as portless auxiliaries — plus
+  # the assistant) and runs its slice of specs against it via
+  # PLAYWRIGHT_NO_WEB_SERVER=1 so Playwright doesn't try to spawn `pnpm dev`
+  # itself. `fail-fast: false`
   # so one flaky shard doesn't mask failures elsewhere — the aggregated
   # `jobs.e2e.result` still flips to `failure` if any shard fails.
   e2e:
@@ -197,8 +199,8 @@ jobs:
         run: pnpm db:reset
 
       # Boot the dev stack in its own process group so cleanup can take the
-      # whole tree (concurrently + proxy + next + 7 wranglers) down with one
-      # signal. `set -m` ensures $! is also the PGID.
+      # whole tree (concurrently + proxy + the wrangler session + assistant)
+      # down with one signal. `set -m` ensures $! is also the PGID.
       - name: Boot pnpm dev
         id: dev
         env:
@@ -209,7 +211,9 @@ jobs:
           # client- AND server-side fetches (api-client.ts `API_BASE_URL`) must
           # be re-pointed at :3443 — otherwise every data fetch hits a dead
           # port, no content renders, and specs fail with content timeouts.
-          # A process env var takes precedence over .env.local in `next dev`.
+          # `pnpm dev` builds the dashboard (OpenNext) first, so this process
+          # env var is inlined into the bundle at build time, overriding the
+          # baked .env.local value.
           NEXT_PUBLIC_API_URL: https://namthuan.local:3443/api
         run: |
           set -uo pipefail
