@@ -113,23 +113,19 @@ jobs:
         shell: bash
         run: pnpm prepare
 
-      # uv is required by mcp:code-review-graph (next step). The repo's
-      # .claude/settings.json invokes `code-review-graph status` on
-      # SessionStart and `code-review-graph update --skip-flows` on every
-      # Edit/Write via PostToolUse — without the binary, every Claude turn
-      # logs a "command not found" error. Install the binary here so the
-      # hooks succeed.
-      - name: Install uv (Python tool installer)
-        uses: astral-sh/setup-uv@v3
-
-      # We only run the code-review-graph subset of `pnpm mcp:setup` —
-      # mcp:sentry needs an interactive OAuth flow (impossible in CI) and
-      # mcp:playwright relies on the `claude` CLI binary registering user-
-      # scope state. Both fail in CI; code-review-graph is the one that
-      # actually works and unblocks the per-turn hooks.
-      - name: Install code-review-graph MCP server
+      # codegraph is the only MCP server from `pnpm mcp:setup` that works in
+      # CI — mcp:sentry needs an interactive OAuth flow (impossible in CI) and
+      # mcp:playwright relies on the `claude` CLI binary registering user-scope
+      # state; both fail here. codegraph ships on npm and runs via npx, so no
+      # extra toolchain (uv) is needed. Pre-build the index now: the MCP
+      # server's native file watcher is the source of truth for incremental
+      # updates locally (no PostToolUse hook), but that watcher is disabled in
+      # sandboxed CI, so we build the graph up front before Claude runs. The
+      # SessionStart hook also runs `codegraph status`, which needs the index
+      # to exist.
+      - name: Build codegraph index
         shell: bash
-        run: pnpm mcp:code-review-graph
+        run: pnpm mcp:codegraph
 
       # Git needs a user identity to make commits. Without this step, the
       # commit phase of Step 6 fails with "Author identity unknown" (seen on
@@ -209,11 +205,10 @@ jobs:
           # ppap run 26354917125 for issue #132: 52 turns, $0.43 burned, no
           # comment.)
           #
-          # mcp__code-review-graph__* wildcard grants Claude access to the
-          # graph's MCP tools (impact analysis, callers, dependents, etc.).
-          # Without this, Claude requests them and gets a permission denial
-          # mid-turn (symptom from ppap run 26357015231 on issue #137:
-          # "Claude requested permissions to use
-          # mcp__code-review-graph__build_or_update_graph_tool, but you
+          # mcp__codegraph__* wildcard grants Claude access to the graph's MCP
+          # tools (impact analysis, callers, callees, context, etc.). Without
+          # this, Claude requests them and gets a permission denial mid-turn
+          # (symptom from ppap run 26357015231 on issue #137: "Claude requested
+          # permissions to use mcp__codegraph__codegraph_impact, but you
           # haven't granted it yet").
-          allowed_tools: "Bash,Edit,MultiEdit,Glob,Grep,LS,Read,Write,mcp__code-review-graph__*"
+          allowed_tools: "Bash,Edit,MultiEdit,Glob,Grep,LS,Read,Write,mcp__codegraph__*"
