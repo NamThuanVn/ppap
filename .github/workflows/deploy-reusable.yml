@@ -83,12 +83,13 @@ jobs:
     uses: ./.github/workflows/ci-checks.yml
     with:
       checkout_ref: ${{ inputs.checkout_ref }}
-      # Skip the Playwright matrix on the deploy path. PR CI already runs
-      # the full e2e suite before merge; re-running it here would gate every
-      # staging/production deploy on ~10–15 min of dashboard tests that
-      # don't validate anything terraform-apply or the worker fleet cares
-      # about. biome/typecheck/lint/vitest still gate as before.
-      run_e2e: false
+      # Require the full Playwright e2e suite before any staging/production
+      # deploy — not just biome/typecheck/lint/vitest. PR CI runs e2e on the
+      # source PR, but this re-validates on the actual deploy ref (sha for
+      # staging, refs/tags/<tag> for production) to catch admin-bypassed
+      # merges + post-merge drift before infra touches Cloudflare. A failing
+      # shard fails ci-gate, which blocks terraform-apply (needs: [ci-gate]).
+      run_e2e: true
     secrets:
       PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
 

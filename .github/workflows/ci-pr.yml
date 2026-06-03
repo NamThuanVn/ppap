@@ -12,7 +12,7 @@ name: CI · PR · Lint · Typecheck · Test · E2E
 # Note: this collapses the fork-safety boundary that a separate CI_PAT
 # would have provided — see the trade-off note in .claude/ppap.md § PAT_TOKEN.
 
-run-name: "${{ github.event.client_payload.title || format('CI — PR #{0}', inputs.pr_number) }}"
+run-name: "CI · PR #${{ github.event.client_payload.pr_number || inputs.pr_number }} · ${{ github.event.client_payload.title || 'manual rerun' }}"
 
 on:
   repository_dispatch:
@@ -38,6 +38,32 @@ env:
   PRIVATE_REPO: NamThuanVn/erp-namthuan
 
 jobs:
+  # Echo the source pull request on erp-namthuan (this run has no PR context of
+  # its own — it's fired cross-repo via repository_dispatch). Prints to the log
+  # and the run's Summary so reviewers can jump straight to the PR being tested.
+  source-pr:
+    name: Source PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print source PR
+        env:
+          PR: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
+          TITLE: ${{ github.event.client_payload.title }}
+          SHA: ${{ github.event.client_payload.head_sha }}
+          ACTOR: ${{ github.event.client_payload.triggered_by }}
+        run: |
+          URL="https://github.com/${{ env.PRIVATE_REPO }}/pull/${PR}"
+          echo "Source PR: #${PR} — ${TITLE:-<no title>}"
+          echo "  ${URL}"
+          echo "  head_sha: ${SHA:-n/a} · triggered_by: ${ACTOR:-n/a}"
+          {
+            echo "### Source pull request"
+            echo ""
+            echo "- **PR:** [#${PR}](${URL}) — ${TITLE:-_no title_}"
+            echo "- **Head SHA:** \`${SHA:-n/a}\`"
+            echo "- **Triggered by:** ${ACTOR:-n/a}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # Run the 4-job CI graph. ci-checks.yml lives in the same repo and exposes
   # each job's `result` as a workflow_call output, so the report job below
   # can build a per-job summary without re-querying the API.
