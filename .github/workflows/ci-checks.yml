@@ -132,17 +132,77 @@ jobs:
           echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
           echo "total=$TOTAL"  >> "$GITHUB_OUTPUT"
 
-  # Playwright e2e. Each shard boots a dedicated e2e stack via `pnpm e2e:serve`
-  # (builds the dashboard via OpenNext, seeds an isolated DB, then runs ONE
-  # wrangler session — dashboard worker primary, gateway & leaves as portless
+  # Build the dashboard (OpenNext) + seed the isolated e2e DB ONCE, then publish
+  # both as a single tarball artifact the shards download. This is the dominant
+  # cold-boot cost (a no-cache Next build is ~60–120s on a 2-core runner); doing
+  # it here once instead of per-shard removes 3 of 4 builds + reseeds outright.
+  # Each shard is a separate runner, so its untarred copy of the state dir is its
+  # own mutable DB — shard isolation is preserved without snapshotting.
+  e2e-build:
+    name: 1 · CI · E2E (build + seed)
+    if: ${{ inputs.run_e2e }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      # Warm the Next compiler cache across runs. build:pages still runs (so it
+      # always re-evaluates source — no stale-build risk) but reuses prior
+      # compilation work, cutting a cold ~60–120s build to ~20–40s on unchanged
+      # source. Invalidates on lockfile + dashboard/packages source changes.
+      - name: Cache Next build
+        uses: actions/cache@v5
+        with:
+          path: apps/dashboard/.next/cache
+          key: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/dashboard/**', 'packages/**') }}
+          restore-keys: |
+            next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+            next-${{ runner.os }}-
+
+      # Generic relative `/api` build — no host/port baked, so the same bundle
+      # boots on every shard's free port.
+      - name: Build dashboard (once)
+        run: pnpm --filter @namthuanvn/dashboard build:pages
+
+      # Isolated-state branch of db-reset.sh: per-service `wrangler d1 migrations
+      # apply --persist-to .wrangler/state-e2e`, no ExMS demo seed — exactly the
+      # DB each shard would have produced itself.
+      - name: Seed e2e database (once)
+        run: STATE_DIR=.wrangler/state-e2e bash scripts/db-reset.sh
+
+      # tar (not a raw many-small-files upload) so the .open-next file count
+      # doesn't make upload/download slow. Content is mostly-incompressible
+      # sqlite + an already-minified bundle, so skip artifact gzip.
+      - name: Package build + seed bundle
+        run: tar -cf e2e-bundle.tar apps/dashboard/.open-next .wrangler/state-e2e
+
+      - name: Upload e2e bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-bundle
+          path: e2e-bundle.tar
+          retention-days: 1
+          compression-level: 0
+
+  # Playwright e2e. Each shard restores the prebuilt dashboard + seeded DB from
+  # the e2e-build artifact, then boots ONE wrangler session via `pnpm e2e:serve`
+  # with BUILD=0 RESEED=0 (dashboard worker primary, gateway & leaves as portless
   # auxiliaries — on a free port, with NO proxy and NO assistant) and runs its
   # slice of specs against http://localhost:<port> via PLAYWRIGHT_NO_WEB_SERVER=1
-  # so Playwright doesn't spawn its own server. `fail-fast: false`
-  # so one flaky shard doesn't mask failures elsewhere — the aggregated
-  # `jobs.e2e.result` still flips to `failure` if any shard fails.
+  # so Playwright doesn't spawn its own server. Because build + seed already ran
+  # once in e2e-build, the per-shard boot is just the wrangler cold start.
+  # `fail-fast: false` so one flaky shard doesn't mask failures elsewhere — the
+  # aggregated `jobs.e2e.result` still flips to `failure` if any shard fails.
   e2e:
     name: 1 · CI · E2E (shard ${{ matrix.shard }})
-    needs: e2e-setup
+    needs: [e2e-setup, e2e-build]
     if: ${{ inputs.run_e2e }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -159,6 +219,17 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/install
+
+      # Restore the dashboard build (.open-next) + seeded DB (.wrangler/state-e2e)
+      # produced once by e2e-build. Untarred here, this is this shard's own
+      # mutable copy — tests can write freely without affecting other shards.
+      - name: Restore e2e bundle (build + seed)
+        uses: actions/download-artifact@v7
+        with:
+          name: e2e-bundle
+
+      - name: Unpack e2e bundle
+        run: tar -xf e2e-bundle.tar
 
       # No /etc/hosts or TLS cert: e2e hits the dashboard worker directly on a
       # free port over plain http://localhost (no proxy, no namthuan.local).
@@ -184,17 +255,17 @@ jobs:
 
       # Boot a dedicated e2e stack on a free port (dashboard worker + gateway +
       # leaves as bindings — NO proxy, NO assistant) in its own process group so
-      # teardown can signal the whole tree. `e2e:serve` builds the dashboard
-      # (generic relative `/api` build — no host/port baked), seeds an isolated
-      # `.wrangler/state-e2e`, writes the chosen port to `.wrangler/e2e-port`,
-      # then runs the wrangler session in the foreground. Playwright then hits
-      # http://localhost:<port> directly. `set -m` makes $! the PGID.
+      # teardown can signal the whole tree. BUILD=0 RESEED=0: the dashboard build
+      # and DB seed already came from the e2e-build artifact, so `e2e:serve` only
+      # picks a free port, writes it to `.wrangler/e2e-port`, and runs the wrangler
+      # session in the foreground. Playwright then hits http://localhost:<port>
+      # directly. `set -m` makes $! the PGID.
       - name: Boot e2e stack
         id: e2e
         run: |
           set -uo pipefail
           set -m
-          nohup pnpm e2e:serve >e2e-serve.log 2>&1 &
+          nohup env BUILD=0 RESEED=0 pnpm e2e:serve >e2e-serve.log 2>&1 &
           SERVE_PID=$!
           set +m
           echo "serve_pid=$SERVE_PID" >> "$GITHUB_OUTPUT"
@@ -207,8 +278,9 @@ jobs:
           PORT="$(cat .wrangler/e2e-port 2>/dev/null || true)"
           if [ -z "$PORT" ]; then echo "::error::e2e:serve never reported a port"; tail -n 80 e2e-serve.log; exit 1; fi
           echo "base=http://localhost:$PORT" >> "$GITHUB_OUTPUT"
-          # build (OpenNext) + seed + worker warmup → allow up to 5 min.
-          deadline=$((SECONDS + 300))
+          # Build + seed are prebuilt now, so only the wrangler cold start remains
+          # → allow up to 2 min (was 5 when the build ran here too).
+          deadline=$((SECONDS + 120))
           while (( SECONDS < deadline )); do
             if ! kill -0 "$SERVE_PID" 2>/dev/null; then
               echo "::error::e2e stack exited before becoming ready"
@@ -219,9 +291,9 @@ jobs:
               echo "✓ e2e stack ready on :$PORT (PID $SERVE_PID)"
               exit 0
             fi
-            sleep 2
+            sleep 1
           done
-          echo "::error::Timed out after 300s waiting for http://localhost:$PORT/api/health"
+          echo "::error::Timed out after 120s waiting for http://localhost:$PORT/api/health"
           tail -n 80 e2e-serve.log
           kill -KILL -- -"$SERVE_PID" 2>/dev/null || true
           exit 1
