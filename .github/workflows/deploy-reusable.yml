@@ -58,6 +58,14 @@ on:
         required: true
       PAT_TOKEN:
         required: true
+      # Telegram failure alerts — all optional so a partially-configured or
+      # manual run degrades to "skip notify" instead of failing the report job.
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+      TELEGRAM_BUILD_THREAD_ID:
+        required: false
 
 permissions: read-all
 
@@ -395,9 +403,10 @@ jobs:
     name: 7 · Report · deployment status
     # ci-gate is in `needs:` so a CI failure (which skips terraform-apply +
     # everything downstream) still surfaces as a `failure` state to the
-    # Deployment-status pingback — otherwise the `contains(needs.*.result,
-    # 'failure')` check below would only see `skipped` and incorrectly
-    # report success.
+    # Deployment-status pingback. Outcome is strict all-success: a mid-graph
+    # failure (terraform-apply, monitor, leaves, tier-1.5) leaves gateway +
+    # dashboard as `skipped` — not `failure` — so checking only for
+    # `failure`/`cancelled` would incorrectly report success.
     needs: [ci-gate, deploy-worker-gateway, deploy-dashboard]
     if: always()
     runs-on: ubuntu-latest
@@ -405,10 +414,12 @@ jobs:
       - name: Compute outcome
         id: outcome
         run: |
-          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
-            echo "state=failure" >> "$GITHUB_OUTPUT"
-          else
+          if [ "${{ needs.ci-gate.result }}" = "success" ] && \
+             [ "${{ needs.deploy-worker-gateway.result }}" = "success" ] && \
+             [ "${{ needs.deploy-dashboard.result }}" = "success" ]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=failure" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Ping Deployment status on private repo
@@ -444,3 +455,45 @@ jobs:
           echo "Tag: ${{ inputs.release_tag }}"
           echo "Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "URL: https://${{ inputs.domain }}"
+
+      # Failure-only Telegram alert to the build topic of the team supergroup
+      # (same bot as the runtime error alerts; secrets live in this repo's
+      # Actions secrets). Last step + non-fatal so a Telegram outage can never
+      # disturb the Deployment/commit-status pingbacks above.
+      - name: Notify Telegram on failure
+        if: steps.outcome.outputs.state == 'failure'
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          R_CI: ${{ needs.ci-gate.result }}
+          R_GATEWAY: ${{ needs.deploy-worker-gateway.result }}
+          R_DASHBOARD: ${{ needs.deploy-dashboard.result }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID empty) — skipping notify."
+            exit 0
+          fi
+          TAG_SUFFIX=""
+          if [ -n "${RELEASE_TAG:-}" ]; then TAG_SUFFIX=" (${RELEASE_TAG})"; fi
+          ENV_UPPER=$(printf '%s' "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
+          TEXT=$(printf '🚨 <b>Deploy failed</b> — <b>%s</b>%s\nRef: <code>%s</code>\nJobs: ci-gate %s · gateway %s · dashboard %s\n<a href="%s">View run</a>' \
+            "$ENV_UPPER" "$TAG_SUFFIX" "$CHECKOUT_REF" \
+            "$R_CI" "$R_GATEWAY" "$R_DASHBOARD" "$RUN_URL")
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" \
+            -d parse_mode=HTML \
+            -d disable_web_page_preview=true; then
+            echo "✓ Telegram failure alert sent."
+          else
+            echo "::warning::Telegram notify failed (deploy failure alert not delivered)."
+          fi
