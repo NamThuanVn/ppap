@@ -62,6 +62,11 @@ jobs:
 
       - run: pnpm biome ci .
 
+      # Repo-wide suppression/skip gate: no biome-ignore / eslint-disable /
+      # @ts-ignore and no test skip in ANY form may exist in the codebase
+      # (.claude/rules.md § "Never skip checks, never suppress").
+      - run: bash scripts/check-no-suppressions.sh
+
   typecheck:
     name: 1 · CI · Typecheck
     runs-on: ubuntu-latest
