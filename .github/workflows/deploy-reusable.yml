@@ -417,8 +417,13 @@ jobs:
     # failure (terraform-apply, monitor, leaves, tier-1.5) leaves gateway +
     # dashboard as `skipped` — not `failure` — so checking only for
     # `failure`/`cancelled` would incorrectly report success.
+    #
+    # `!cancelled()` (not `always()`): a run cancelled by concurrency
+    # (superseded staging deploy — expected, not an error) skips reporting
+    # entirely — no Telegram alert, and its pending GitHub Deployment is
+    # auto-marked inactive when the superseding deploy posts `success`.
     needs: [ci-gate, deploy-worker-gateway, deploy-dashboard]
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Compute outcome

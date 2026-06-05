@@ -100,9 +100,12 @@ jobs:
       PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
 
   # Posts the final commit-status update on the PR's head SHA, replacing the
-  # `pending` status that ci-pr-dispatch.yml created. `if: always()` so
-  # failures still get a final pingback; the shell step itself no-ops if
-  # `head_sha` is empty (manual workflow_dispatch).
+  # `pending` status that ci-pr-dispatch.yml created. `if: !cancelled()` so
+  # failures still get a final pingback, but runs cancelled by concurrency
+  # (superseded by a newer push — expected, not an error) stay silent: the
+  # superseding run re-posts a fresh pending status and delivers the real
+  # final state. The shell step itself no-ops if `head_sha` is empty
+  # (manual workflow_dispatch).
   #
   # Statuses (not Check Runs) because the Checks API update endpoint
   # requires a GitHub App installation token; PAT_TOKEN is a fine-grained
@@ -110,7 +113,7 @@ jobs:
   report:
     name: Report CI
     needs: [checks]
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Update CI commit status on erp-namthuan
@@ -161,8 +164,10 @@ jobs:
       # (same bot as the runtime error alerts; secrets live in this repo's
       # Actions secrets). Non-fatal: a Telegram outage must not flip the CI
       # report job red after the commit status was already posted.
+      # `!cancelled()` (not `always()`) so a cancel arriving mid-job never
+      # fires the alert.
       - name: Notify Telegram on failure
-        if: always() && steps.status.outputs.state == 'failure'
+        if: ${{ !cancelled() && steps.status.outputs.state == 'failure' }}
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
