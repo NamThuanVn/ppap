@@ -53,6 +53,16 @@ on:
         description: 'Commit-status context name (deploy-staging | deploy-production).'
         type: string
         required: true
+      triggered_by:
+        description: 'Actor handle that initiated the deploy (forwarded from the dispatcher). Used in the Telegram failure alert.'
+        type: string
+        required: false
+        default: ''
+      run_title:
+        description: 'Human title for the deploy (merge-commit subject for staging, release title for production). Used in the Telegram failure alert.'
+        type: string
+        required: false
+        default: ''
     secrets:
       TF_API_TOKEN:
         required: true
@@ -469,6 +479,9 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           CHECKOUT_REF: ${{ inputs.checkout_ref }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+          TRIGGERED_BY: ${{ inputs.triggered_by }}
+          RUN_TITLE: ${{ inputs.run_title }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
           R_CI: ${{ needs.ci-gate.result }}
           R_GATEWAY: ${{ needs.deploy-worker-gateway.result }}
           R_DASHBOARD: ${{ needs.deploy-dashboard.result }}
@@ -482,9 +495,21 @@ jobs:
           TAG_SUFFIX=""
           if [ -n "${RELEASE_TAG:-}" ]; then TAG_SUFFIX=" (${RELEASE_TAG})"; fi
           ENV_UPPER=$(printf '%s' "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
-          TEXT=$(printf '🚨 <b>Deploy failed</b> — <b>%s</b>%s\nRef: <code>%s</code>\nJobs: ci-gate %s · gateway %s · dashboard %s\n<a href="%s">View run</a>' \
-            "$ENV_UPPER" "$TAG_SUFFIX" "$CHECKOUT_REF" \
-            "$R_CI" "$R_GATEWAY" "$R_DASHBOARD" "$RUN_URL")
+          # Commit subjects are user-controlled text inside parse_mode=HTML — escape.
+          SAFE_TITLE=$(printf '%s' "${RUN_TITLE:-}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+          # Context line: actor · commit. Both optional (empty on a manual
+          # workflow_dispatch) so the line collapses gracefully.
+          META=""
+          if [ -n "${TRIGGERED_BY:-}" ]; then META="by @${TRIGGERED_BY}"; fi
+          if [ -n "${COMMIT_SHA:-}" ]; then
+            META="${META:+$META · }commit <a href=\"https://github.com/${{ env.PRIVATE_REPO }}/commit/${COMMIT_SHA}\">${COMMIT_SHA:0:7}</a>"
+          fi
+          TEXT="🚨 <b>Deploy failed</b> — <b>${ENV_UPPER}</b>${TAG_SUFFIX}"
+          if [ -n "$SAFE_TITLE" ]; then TEXT="${TEXT}: ${SAFE_TITLE}"; fi
+          if [ -n "$META" ]; then TEXT="${TEXT}"$'\n'"${META}"; fi
+          TEXT="${TEXT}"$'\n'"Ref: <code>${CHECKOUT_REF}</code>"
+          TEXT="${TEXT}"$'\n'"Jobs: ci-gate ${R_CI} · gateway ${R_GATEWAY} · dashboard ${R_DASHBOARD}"
+          TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
           THREAD_ARGS=()
           if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
           if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \

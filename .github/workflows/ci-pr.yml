@@ -151,6 +151,10 @@ jobs:
           THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
           PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
           PR_TITLE: ${{ github.event.client_payload.title }}
+          ACTOR: ${{ github.event.client_payload.triggered_by }}
+          BRANCH: ${{ github.event.client_payload.head_ref }}
+          IS_FORK: ${{ github.event.client_payload.is_fork }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
           DESC: ${{ steps.status.outputs.desc }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -159,11 +163,28 @@ jobs:
             echo "Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID empty) — skipping notify."
             exit 0
           fi
-          # PR titles are user-controlled text inside parse_mode=HTML — escape.
-          SAFE_TITLE=$(printf '%s' "${PR_TITLE:-}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+          # PR titles + branch names are user-controlled text inside
+          # parse_mode=HTML — escape both.
+          esc() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+          SAFE_TITLE=$(esc "${PR_TITLE:-}")
+          SAFE_BRANCH=$(esc "${BRANCH:-}")
           PR_URL="https://github.com/${{ env.PRIVATE_REPO }}/pull/${PR_NUMBER}"
-          TEXT=$(printf '❌ <b>PR CI failed</b> — <a href="%s">PR #%s</a>%s\n%s\n<a href="%s">View run</a>' \
-            "$PR_URL" "$PR_NUMBER" "${SAFE_TITLE:+: $SAFE_TITLE}" "$DESC" "$RUN_URL")
+          # Context line: actor · branch · commit. Every field is optional —
+          # manual workflow_dispatch re-runs carry no client_payload, so the
+          # line collapses gracefully (or disappears entirely).
+          META=""
+          if [ -n "${ACTOR:-}" ]; then META="by @${ACTOR}"; fi
+          if [ -n "$SAFE_BRANCH" ]; then
+            FORK_TAG=""
+            if [ "${IS_FORK:-false}" = "true" ]; then FORK_TAG=" (fork)"; fi
+            META="${META:+$META · }branch <code>${SAFE_BRANCH}</code>${FORK_TAG}"
+          fi
+          if [ -n "${HEAD_SHA:-}" ]; then
+            META="${META:+$META · }commit <a href=\"https://github.com/${{ env.PRIVATE_REPO }}/commit/${HEAD_SHA}\">${HEAD_SHA:0:7}</a>"
+          fi
+          TEXT="❌ <b>PR CI failed</b> — <a href=\"${PR_URL}\">PR #${PR_NUMBER}</a>${SAFE_TITLE:+: ${SAFE_TITLE}}"
+          if [ -n "$META" ]; then TEXT="${TEXT}"$'\n'"${META}"; fi
+          TEXT="${TEXT}"$'\n'"${DESC}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
           THREAD_ARGS=()
           if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
           if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
