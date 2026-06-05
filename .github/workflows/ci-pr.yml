@@ -64,6 +64,24 @@ jobs:
             echo "- **Triggered by:** ${ACTOR:-n/a}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Re-post the pending CI status so its Details link points at THIS run
+      # instead of the generic /actions list the dispatcher had to use
+      # (repository_dispatch is fire-and-forget — only the run knows its id).
+      - name: Point CI status at this run
+        if: github.event.client_payload.head_sha
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api repos/${{ env.PRIVATE_REPO }}/statuses/"$HEAD_SHA" \
+            -f state=pending \
+            -f context=CI \
+            -f description="Running on ppap" \
+            -f target_url="$RUN_URL"
+          echo "✓ Pending CI status now targets $RUN_URL"
+
   # Run the 4-job CI graph. ci-checks.yml lives in the same repo and exposes
   # each job's `result` as a workflow_call output, so the report job below
   # can build a per-job summary without re-querying the API.
