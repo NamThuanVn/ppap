@@ -143,6 +143,48 @@ jobs:
         working-directory: terraform
         run: terraform init
 
+      # `cloudflare_workers_secret` can only attach to a Worker script that
+      # already exists on the account, but new workers deploy via wrangler
+      # AFTER terraform in this graph — so the first deploy of a brand-new
+      # secret-bearing service dies with Cloudflare error 10007 ("This Worker
+      # does not exist on your account"; first hit: exms, PR #261). Upload a
+      # trivial placeholder for any missing script_name referenced by the
+      # terraform modules; the real wrangler deploy overwrites it later in
+      # this same run. Idempotent — a no-op GET per worker once they exist.
+      # Credentials come from the PREVIOUS state's outputs (readable after
+      # init, before apply); on a completely fresh workspace there are none,
+      # so the step skips and the documented two-pass HCP bootstrap applies
+      # (see .claude/infrastructure.md § Production cold-start bootstrap).
+      - name: Bootstrap missing Workers (secrets cold-start)
+        working-directory: terraform
+        run: |
+          terraform output -json > /tmp/pre-outputs.json 2>/dev/null || echo '{}' > /tmp/pre-outputs.json
+          ACC="$(jq -r '.cloudflare_account_id.value // empty' /tmp/pre-outputs.json)"
+          TOKEN="$(jq -r '.cloudflare_api_token.value // empty' /tmp/pre-outputs.json)"
+          rm -f /tmp/pre-outputs.json
+          if [[ -z "$ACC" || -z "$TOKEN" ]]; then
+            echo "no prior terraform outputs (fresh workspace) — skipping bootstrap"
+            exit 0
+          fi
+          echo "::add-mask::$ACC"
+          echo "::add-mask::$TOKEN"
+          printf 'export default { fetch() { return new Response("bootstrapping", { status: 503 }); } };\n' > /tmp/placeholder.mjs
+          for name in $(grep -rho 'script_name *= *"[^"]*"' apis/ | sed 's/.*"\(.*\)"/\1/' | sort -u); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/services/$name")"
+            if [[ "$code" == "404" ]]; then
+              echo "worker '$name' missing — uploading placeholder so its secret can attach"
+              curl -sf -X PUT \
+                -H "Authorization: Bearer $TOKEN" \
+                -F 'metadata={"main_module":"placeholder.mjs","compatibility_date":"2024-11-01"};type=application/json' \
+                -F 'placeholder.mjs=@/tmp/placeholder.mjs;type=application/javascript+module' \
+                "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/scripts/$name" > /dev/null
+            else
+              echo "worker '$name' exists (HTTP $code)"
+            fi
+          done
+
       - name: Terraform Apply
         working-directory: terraform
         run: terraform apply -auto-approve -no-color
@@ -204,7 +246,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        service: [hris, expense, utilities, notifications, auth, assistant, files]
+        service: [hris, expense, utilities, exms, notifications, auth, assistant, files]
 
     steps:
       - uses: actions/checkout@v6
