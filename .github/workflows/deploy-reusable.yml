@@ -442,7 +442,11 @@ jobs:
           SENTRY_PROJECT: ${{ steps.sentry.outputs.project }}
 
       - name: Deploy Worker
-        run: pnpm --filter @namthuanvn/dashboard run deploy${{ inputs.deploy_script_suffix }}
+        # Pass the dashboard Sentry DSN as a runtime wrangler var so the worker's
+        # `@sentry/cloudflare` wrap (apps/dashboard/worker.ts) can report
+        # server-side errors. Same value baked into the client build above as
+        # NEXT_PUBLIC_SENTRY_DSN; empty in envs without a DSN → Sentry disabled.
+        run: pnpm --filter @namthuanvn/dashboard run deploy${{ inputs.deploy_script_suffix }} -- --var "SENTRY_DSN:${{ steps.sentry.outputs.dsn }}"
 
   # ───────────────────────────────────────────────────────────────────────────
   # 7. Pingback. The dispatcher in the private repo created a *pending*
