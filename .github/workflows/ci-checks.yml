@@ -174,12 +174,12 @@ jobs:
             next-${{ runner.os }}-
 
       # Generic relative `/api` build — no host/port baked, so the same bundle
-      # boots on every shard's free port. Builds EVERY dashboard zone that has a
-      # `build:pages` script — the shell (`@namthuanvn/dashboard`) plus each
-      # Multi-Zone worker (`-expense`/`-exms`/`-hris`/`-utilities`); the e2e stack
-      # boots all of them, so all must be prebuilt. `--if-present` skips
-      # `@namthuanvn/dashboard-shell` (a library, no build:pages); the glob
-      # degrades to just the shell on branches that predate the Multi-Zone split.
+      # boots on every shard's free port. Builds EVERY FE app that has a
+      # `build:pages` script — the shell + the four Multi-Zone zones (expense /
+      # exms / hris / utilities); the e2e stack boots all of them, so all must be
+      # prebuilt. `--filter './apps/*'` selects by PATH (the packages no longer
+      # share a `dashboard*` name prefix); `--if-present` skips the dispatcher (a
+      # plain Worker with no build:pages) and any other non-buildable app.
       - name: Build dashboard zones (once)
         run: pnpm --filter './apps/*' --if-present run build:pages
 

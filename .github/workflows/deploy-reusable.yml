@@ -398,11 +398,11 @@ jobs:
       fail-fast: false
       matrix:
         zone:
-          - { name: shell, pkg: '@namthuanvn/dashboard' }
-          - { name: expense, pkg: '@namthuanvn/dashboard-expense' }
-          - { name: exms, pkg: '@namthuanvn/dashboard-exms' }
-          - { name: hris, pkg: '@namthuanvn/dashboard-hris' }
-          - { name: utilities, pkg: '@namthuanvn/dashboard-utilities' }
+          - { name: shell, pkg: '@namthuanvn/shell' }
+          - { name: expense, pkg: '@namthuanvn/zone-expense' }
+          - { name: exms, pkg: '@namthuanvn/zone-exms' }
+          - { name: hris, pkg: '@namthuanvn/zone-hris' }
+          - { name: utilities, pkg: '@namthuanvn/zone-utilities' }
 
     steps:
       - uses: actions/checkout@v6
@@ -512,7 +512,7 @@ jobs:
 
       - name: Deploy Worker
         # No Next.js build — the dispatcher is a plain Worker. SENTRY_DSN is its
-        # only runtime var (its worker wraps `withSentry` with a dashboard-router
+        # only runtime var (its worker wraps `withSentry` with a dispatcher
         # service tag); empty in envs without a DSN → Sentry disabled.
         run: pnpm --filter @namthuanvn/dispatcher run deploy${{ inputs.deploy_script_suffix }} -- --var "SENTRY_DSN:${{ steps.sentry.outputs.dsn }}" --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
 
