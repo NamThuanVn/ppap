@@ -379,13 +379,106 @@ jobs:
         run: pnpm --filter @namthuanvn/gateway run deploy${{ inputs.deploy_script_suffix }} -- --var SENTRY_RELEASE:${{ steps.sha.outputs.value }}
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 6. Next.js dashboard via OpenNext → Cloudflare Worker. It is the public
-  #    ingress and service-binds to gateway-service (forwards `/api/*`), so it
-  #    deploys AFTER the gateway — which transitively waits for every leaf.
+  # 6. Next.js dashboard zones via OpenNext → Cloudflare Workers (Multi-Zone).
+  #    The shell + each carved service zone (cost, exms, hris, utilities) is its
+  #    own standalone OpenNext worker; the dispatcher (next job) fronts the apex
+  #    and routes to them over service bindings. All zones build with the same
+  #    NEXT_PUBLIC_* env (the client always calls same-origin /api/*) and each
+  #    service-binds to gateway-service for SSR prefetch, so the matrix deploys
+  #    AFTER the gateway — which transitively waits for every leaf. Adding a
+  #    future zone = one matrix entry here + one binding in apps/dispatcher.
   # ───────────────────────────────────────────────────────────────────────────
-  deploy-dashboard:
-    name: 4 · App · dashboard (Next.js)
+  deploy-zones:
+    name: 7 · App · ${{ matrix.zone.name }} (Next.js zone)
     needs: [terraform-apply, deploy-worker-gateway]
+    runs-on: ubuntu-latest
+    strategy:
+      # One zone failing must not cancel the others — the dispatcher (next job)
+      # gates on the whole matrix, so a partial failure already blocks the apex.
+      fail-fast: false
+      matrix:
+        zone:
+          - { name: shell, pkg: '@namthuanvn/dashboard' }
+          - { name: expense, pkg: '@namthuanvn/dashboard-expense' }
+          - { name: exms, pkg: '@namthuanvn/dashboard-exms' }
+          - { name: hris, pkg: '@namthuanvn/dashboard-hris' }
+          - { name: utilities, pkg: '@namthuanvn/dashboard-utilities' }
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Capture deploy SHA
+        id: sha
+        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/install
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tf-outputs
+          path: /tmp
+
+      # Every zone worker (apps/<zone>/wrangler.jsonc) carries no Terraform-owned
+      # resources — only an ASSETS binding + the GATEWAY_SERVICE service binding —
+      # so this just loads the Cloudflare credentials (the `dashboard` case is a
+      # credentials-only no-op on the wrangler config).
+      - name: Load Cloudflare credentials
+        run: .github/scripts/resolve-wrangler-bindings.sh dashboard ${{ inputs.environment }}
+        env:
+          TF_OUTPUTS_JSON: /tmp/tf-outputs.json
+
+      # VAPID public key (Web Push) — lives in HCP, surfaced via tf-outputs.
+      - name: Load VAPID public key from tf-outputs
+        id: vapid
+        run: |
+          jq -er .vapid_public_key.value /tmp/tf-outputs.json | xargs -I {} echo "public_key={}" >> "$GITHUB_OUTPUT"
+
+      # Sentry config — all four optional. Empty values skip the echo so the
+      # SDK initializes with `enabled: false`. See `docs/engineering/sentry.md`.
+      # Every zone shares the one dashboard Sentry project (they are one product).
+      - name: Load Sentry config from tf-outputs
+        id: sentry
+        run: |
+          jq -r .sentry_dsn_dashboard.value     /tmp/tf-outputs.json | xargs -I {} echo "dsn={}"          >> "$GITHUB_OUTPUT"
+          jq -r .sentry_auth_token.value        /tmp/tf-outputs.json | xargs -I {} echo "auth_token={}"  >> "$GITHUB_OUTPUT"
+          jq -r .sentry_org.value               /tmp/tf-outputs.json | xargs -I {} echo "org={}"         >> "$GITHUB_OUTPUT"
+          jq -r .sentry_project_dashboard.value /tmp/tf-outputs.json | xargs -I {} echo "project={}"     >> "$GITHUB_OUTPUT"
+
+      - name: Build (OpenNext — Cloudflare Workers)
+        run: pnpm --filter ${{ matrix.zone.pkg }} run build:pages
+        env:
+          NEXT_PUBLIC_APP_ENV: ${{ inputs.environment }}
+          NEXT_PUBLIC_APP_RELEASE: ${{ steps.sha.outputs.value }}
+          NEXT_PUBLIC_API_URL: ${{ inputs.api_url }}
+          NEXT_PUBLIC_DASHBOARD_URL: https://${{ inputs.domain }}
+          NEXT_PUBLIC_VAPID_PUBLIC_KEY: ${{ steps.vapid.outputs.public_key }}
+          NEXT_PUBLIC_SENTRY_DSN: ${{ steps.sentry.outputs.dsn }}
+          SENTRY_AUTH_TOKEN: ${{ steps.sentry.outputs.auth_token }}
+          SENTRY_ORG: ${{ steps.sentry.outputs.org }}
+          SENTRY_PROJECT: ${{ steps.sentry.outputs.project }}
+
+      - name: Deploy Worker
+        # Pass the dashboard Sentry DSN as a runtime wrangler var so the zone's
+        # `@sentry/cloudflare` wrap (apps/<zone>/worker.ts) can report server-side
+        # errors. Same value baked into the client build above as
+        # NEXT_PUBLIC_SENTRY_DSN; empty in envs without a DSN → Sentry disabled.
+        run: pnpm --filter ${{ matrix.zone.pkg }} run deploy${{ inputs.deploy_script_suffix }} -- --var "SENTRY_DSN:${{ steps.sentry.outputs.dsn }}"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 7. Apex dispatcher (apps/dispatcher) — a tiny plain Worker that owns the
+  #    public custom_domain and routes `/api/*` → gateway and every page/asset
+  #    prefix → the owning zone over a service binding. It deploys LAST: its
+  #    `services` bindings target the gateway + all five zone workers, which must
+  #    already exist (Cloudflare error 10143 otherwise).
+  # ───────────────────────────────────────────────────────────────────────────
+  deploy-dispatch:
+    name: 8 · App · dispatcher (apex ingress)
+    needs: [terraform-apply, deploy-worker-gateway, deploy-zones]
     runs-on: ubuntu-latest
 
     steps:
@@ -412,41 +505,16 @@ jobs:
         env:
           TF_OUTPUTS_JSON: /tmp/tf-outputs.json
 
-      # VAPID public key (Web Push) — lives in HCP, surfaced via tf-outputs.
-      - name: Load VAPID public key from tf-outputs
-        id: vapid
-        run: |
-          jq -er .vapid_public_key.value /tmp/tf-outputs.json | xargs -I {} echo "public_key={}" >> "$GITHUB_OUTPUT"
-
-      # Sentry config — all four optional. Empty values skip the echo so the
-      # SDK initializes with `enabled: false`. See `docs/engineering/sentry.md`.
-      - name: Load Sentry config from tf-outputs
+      - name: Load Sentry DSN from tf-outputs
         id: sentry
         run: |
-          jq -r .sentry_dsn_dashboard.value     /tmp/tf-outputs.json | xargs -I {} echo "dsn={}"          >> "$GITHUB_OUTPUT"
-          jq -r .sentry_auth_token.value        /tmp/tf-outputs.json | xargs -I {} echo "auth_token={}"  >> "$GITHUB_OUTPUT"
-          jq -r .sentry_org.value               /tmp/tf-outputs.json | xargs -I {} echo "org={}"         >> "$GITHUB_OUTPUT"
-          jq -r .sentry_project_dashboard.value /tmp/tf-outputs.json | xargs -I {} echo "project={}"     >> "$GITHUB_OUTPUT"
-
-      - name: Build (OpenNext — Cloudflare Workers)
-        run: pnpm --filter @namthuanvn/dashboard run build:pages
-        env:
-          NEXT_PUBLIC_APP_ENV: ${{ inputs.environment }}
-          NEXT_PUBLIC_APP_RELEASE: ${{ steps.sha.outputs.value }}
-          NEXT_PUBLIC_API_URL: ${{ inputs.api_url }}
-          NEXT_PUBLIC_DASHBOARD_URL: https://${{ inputs.domain }}
-          NEXT_PUBLIC_VAPID_PUBLIC_KEY: ${{ steps.vapid.outputs.public_key }}
-          NEXT_PUBLIC_SENTRY_DSN: ${{ steps.sentry.outputs.dsn }}
-          SENTRY_AUTH_TOKEN: ${{ steps.sentry.outputs.auth_token }}
-          SENTRY_ORG: ${{ steps.sentry.outputs.org }}
-          SENTRY_PROJECT: ${{ steps.sentry.outputs.project }}
+          jq -r .sentry_dsn_dashboard.value /tmp/tf-outputs.json | xargs -I {} echo "dsn={}" >> "$GITHUB_OUTPUT"
 
       - name: Deploy Worker
-        # Pass the dashboard Sentry DSN as a runtime wrangler var so the worker's
-        # `@sentry/cloudflare` wrap (apps/dashboard/worker.ts) can report
-        # server-side errors. Same value baked into the client build above as
-        # NEXT_PUBLIC_SENTRY_DSN; empty in envs without a DSN → Sentry disabled.
-        run: pnpm --filter @namthuanvn/dashboard run deploy${{ inputs.deploy_script_suffix }} -- --var "SENTRY_DSN:${{ steps.sentry.outputs.dsn }}"
+        # No Next.js build — the dispatcher is a plain Worker. SENTRY_DSN is its
+        # only runtime var (its worker wraps `withSentry` with a dashboard-router
+        # service tag); empty in envs without a DSN → Sentry disabled.
+        run: pnpm --filter @namthuanvn/dispatcher run deploy${{ inputs.deploy_script_suffix }} -- --var "SENTRY_DSN:${{ steps.sentry.outputs.dsn }}" --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
 
   # ───────────────────────────────────────────────────────────────────────────
   # 7. Pingback. The dispatcher in the private repo created a *pending*
@@ -456,19 +524,21 @@ jobs:
   #    (no deployment_id / sha in the event payload).
   # ───────────────────────────────────────────────────────────────────────────
   report-deployment:
-    name: 7 · Report · deployment status
+    name: 9 · Report · deployment status
     # ci-gate is in `needs:` so a CI failure (which skips terraform-apply +
     # everything downstream) still surfaces as a `failure` state to the
     # Deployment-status pingback. Outcome is strict all-success: a mid-graph
     # failure (terraform-apply, monitor, leaves, tier-1.5) leaves gateway +
-    # dashboard as `skipped` — not `failure` — so checking only for
-    # `failure`/`cancelled` would incorrectly report success.
+    # zones + dispatch as `skipped` — not `failure` — so checking only for
+    # `failure`/`cancelled` would incorrectly report success. `deploy-dispatch`
+    # is the terminal job (it `needs: deploy-zones`), so its success implies the
+    # whole zone matrix succeeded too.
     #
     # `!cancelled()` (not `always()`): a run cancelled by concurrency
     # (superseded staging deploy — expected, not an error) skips reporting
     # entirely — no Telegram alert, and its pending GitHub Deployment is
     # auto-marked inactive when the superseding deploy posts `success`.
-    needs: [ci-gate, deploy-worker-gateway, deploy-dashboard]
+    needs: [ci-gate, deploy-worker-gateway, deploy-zones, deploy-dispatch]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
@@ -477,7 +547,8 @@ jobs:
         run: |
           if [ "${{ needs.ci-gate.result }}" = "success" ] && \
              [ "${{ needs.deploy-worker-gateway.result }}" = "success" ] && \
-             [ "${{ needs.deploy-dashboard.result }}" = "success" ]; then
+             [ "${{ needs.deploy-zones.result }}" = "success" ] && \
+             [ "${{ needs.deploy-dispatch.result }}" = "success" ]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
           else
             echo "state=failure" >> "$GITHUB_OUTPUT"
@@ -535,7 +606,8 @@ jobs:
           COMMIT_SHA: ${{ inputs.commit_sha }}
           R_CI: ${{ needs.ci-gate.result }}
           R_GATEWAY: ${{ needs.deploy-worker-gateway.result }}
-          R_DASHBOARD: ${{ needs.deploy-dashboard.result }}
+          R_ZONES: ${{ needs.deploy-zones.result }}
+          R_DISPATCH: ${{ needs.deploy-dispatch.result }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -559,7 +631,7 @@ jobs:
           if [ -n "$SAFE_TITLE" ]; then TEXT="${TEXT}: ${SAFE_TITLE}"; fi
           if [ -n "$META" ]; then TEXT="${TEXT}"$'\n'"${META}"; fi
           TEXT="${TEXT}"$'\n'"Ref: <code>${CHECKOUT_REF}</code>"
-          TEXT="${TEXT}"$'\n'"Jobs: ci-gate ${R_CI} · gateway ${R_GATEWAY} · dashboard ${R_DASHBOARD}"
+          TEXT="${TEXT}"$'\n'"Jobs: ci-gate ${R_CI} · gateway ${R_GATEWAY} · zones ${R_ZONES} · dispatch ${R_DISPATCH}"
           TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
           THREAD_ARGS=()
           if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
