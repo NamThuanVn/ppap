@@ -181,7 +181,7 @@ jobs:
       # `@namthuanvn/dashboard-shell` (a library, no build:pages); the glob
       # degrades to just the shell on branches that predate the Multi-Zone split.
       - name: Build dashboard zones (once)
-        run: pnpm --filter '@namthuanvn/dashboard*' --if-present run build:pages
+        run: pnpm --filter './apps/*' --if-present run build:pages
 
       # Isolated-state branch of db-reset.sh: per-service `wrangler d1 migrations
       # apply --persist-to .wrangler/state-e2e`, no ExMS demo seed — exactly the
