@@ -165,16 +165,23 @@ jobs:
       - name: Cache Next build
         uses: actions/cache@v5
         with:
-          path: apps/dashboard/.next/cache
-          key: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/dashboard/**', 'packages/**') }}
+          # Every zone's Next compiler cache (the glob matches each app that has
+          # one — shell + Multi-Zone workers; just the shell pre-split).
+          path: apps/*/.next/cache
+          key: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/**', 'packages/**') }}
           restore-keys: |
             next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
             next-${{ runner.os }}-
 
       # Generic relative `/api` build — no host/port baked, so the same bundle
-      # boots on every shard's free port.
-      - name: Build dashboard (once)
-        run: pnpm --filter @namthuanvn/dashboard build:pages
+      # boots on every shard's free port. Builds EVERY dashboard zone that has a
+      # `build:pages` script — the shell (`@namthuanvn/dashboard`) plus each
+      # Multi-Zone worker (`-expense`/`-exms`/`-hris`/`-utilities`); the e2e stack
+      # boots all of them, so all must be prebuilt. `--if-present` skips
+      # `@namthuanvn/dashboard-shell` (a library, no build:pages); the glob
+      # degrades to just the shell on branches that predate the Multi-Zone split.
+      - name: Build dashboard zones (once)
+        run: pnpm --filter '@namthuanvn/dashboard*' --if-present run build:pages
 
       # Isolated-state branch of db-reset.sh: per-service `wrangler d1 migrations
       # apply --persist-to .wrangler/state-e2e`, no ExMS demo seed — exactly the
@@ -185,8 +192,10 @@ jobs:
       # tar (not a raw many-small-files upload) so the .open-next file count
       # doesn't make upload/download slow. Content is mostly-incompressible
       # sqlite + an already-minified bundle, so skip artifact gzip.
+      # Bundle every zone's `.open-next` (the `apps/*/.open-next` glob expands to
+      # each built zone — shell + Multi-Zone workers; just the shell pre-split).
       - name: Package build + seed bundle
-        run: tar -cf e2e-bundle.tar apps/dashboard/.open-next .wrangler/state-e2e
+        run: tar -cf e2e-bundle.tar apps/*/.open-next .wrangler/state-e2e
 
       - name: Upload e2e bundle
         uses: actions/upload-artifact@v7
@@ -283,9 +292,12 @@ jobs:
           PORT="$(cat .wrangler/e2e-port 2>/dev/null || true)"
           if [ -z "$PORT" ]; then echo "::error::e2e:serve never reported a port"; tail -n 80 e2e-serve.log; exit 1; fi
           echo "base=http://localhost:$PORT" >> "$GITHUB_OUTPUT"
-          # Build + seed are prebuilt now, so only the wrangler cold start remains
-          # → allow up to 2 min (was 5 when the build ran here too).
-          deadline=$((SECONDS + 120))
+          # Build + seed are prebuilt now, so only the wrangler cold start
+          # remains — but the Multi-Zone stack boots the main process (dispatcher
+          # + shell + gateway + leaves) PLUS one `wrangler dev` per zone worker
+          # (serve-stack waits on each zone's port before the main process), so
+          # allow up to 5 min for that heavier cold start.
+          deadline=$((SECONDS + 300))
           while (( SECONDS < deadline )); do
             if ! kill -0 "$SERVE_PID" 2>/dev/null; then
               echo "::error::e2e stack exited before becoming ready"
