@@ -281,7 +281,7 @@ jobs:
         run: |
           set -euo pipefail
           INDEX="assistant-vectors"
-          if npx wrangler vectorize list 2>/dev/null | grep -q "\\b${INDEX}\\b"; then
+          if npx wrangler vectorize list 2>/dev/null | grep -qE "(^|[[:space:]])${INDEX}([[:space:]]|\$)"; then
             echo "✓ Vectorize index '${INDEX}' already exists — skipping create."
           else
             echo "Creating Vectorize index '${INDEX}'..."
