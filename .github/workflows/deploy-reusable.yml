@@ -200,8 +200,8 @@ jobs:
           retention-days: 1
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 2. Deploy monitor-service (Tail Worker) FIRST. Every other worker
-  #    declares `tail_consumers: [{ service: "monitor-service" }]` —
+  # 2. Deploy service-monitor (Tail Worker) FIRST. Every other worker
+  #    declares `tail_consumers: [{ service: "service-monitor" }]` —
   #    Cloudflare rejects a deploy whose tail consumer doesn't exist on the
   #    account, so this job must finish before the leaf matrix or gateway.
   # ───────────────────────────────────────────────────────────────────────────
@@ -280,7 +280,7 @@ jobs:
         if: matrix.service == 'assistant'
         run: |
           set -euo pipefail
-          INDEX="${{ inputs.environment }}-assistant-vectors"
+          INDEX="assistant-vectors"
           if npx wrangler vectorize list 2>/dev/null | grep -q "\\b${INDEX}\\b"; then
             echo "✓ Vectorize index '${INDEX}' already exists — skipping create."
           else
@@ -344,7 +344,7 @@ jobs:
         run: pnpm --filter @namthuanvn/${{ matrix.service }} run deploy -- --var SENTRY_RELEASE:${{ steps.sha.outputs.value }}
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 5. gateway-service — service-binds to every other worker.
+  # 5. service-gateway — service-binds to every other worker.
   # ───────────────────────────────────────────────────────────────────────────
   deploy-worker-gateway:
     name: 6 · Worker · gateway (router)
@@ -384,7 +384,7 @@ jobs:
   #    own standalone OpenNext worker; the dispatcher (next job) fronts the apex
   #    and routes to them over service bindings. All zones build with the same
   #    NEXT_PUBLIC_* env (the client always calls same-origin /api/*) and each
-  #    service-binds to gateway-service for SSR prefetch, so the matrix deploys
+  #    service-binds to service-gateway for SSR prefetch, so the matrix deploys
   #    AFTER the gateway — which transitively waits for every leaf. Adding a
   #    future zone = one matrix entry here + one binding in apps/dispatcher.
   # ───────────────────────────────────────────────────────────────────────────
