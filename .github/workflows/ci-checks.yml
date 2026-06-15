@@ -15,7 +15,7 @@ on:
       e2e_shards:
         description: 'Number of parallel Playwright shards. Tune up/down here; both PR CI and the deploy gate inherit it.'
         type: number
-        default: 4
+        default: 6
       run_e2e:
         description: 'Whether to run the e2e matrix. PR CI keeps the default (true); the deploy gate passes false so staging/production builds are not blocked on dashboard e2e.'
         type: boolean
@@ -137,17 +137,29 @@ jobs:
           echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
           echo "total=$TOTAL"  >> "$GITHUB_OUTPUT"
 
-  # Build the dashboard (OpenNext) + seed the isolated e2e DB ONCE, then publish
-  # both as a single tarball artifact the shards download. This is the dominant
-  # cold-boot cost (a no-cache Next build is ~60–120s on a 2-core runner); doing
-  # it here once instead of per-shard removes 3 of 4 builds + reseeds outright.
-  # Each shard is a separate runner, so its untarred copy of the state dir is its
-  # own mutable DB — shard isolation is preserved without snapshotting.
-  e2e-build:
-    name: 1 · CI · E2E (build + seed)
+  # Build each dashboard zone on its OWN runner, in parallel. The 6 OpenNext
+  # zones are fully independent (no cross-zone deps; dashboard-shell exports raw
+  # `src/` so there's no prebuild step), so a per-zone matrix turns the old
+  # ~258s serial "build all 6 on one 2-core runner" step into ~6 concurrent
+  # ~60–90s builds — the dominant PR-CI / deploy-gate cost. Each leg tars its own
+  # `apps/<zone>/.open-next` and uploads it; the shards download every zone tar
+  # and reassemble the tree. `fail-fast: false` so one zone's build failure
+  # doesn't mask the others. Free on public-repo minutes — fan out wide.
+  e2e-build-zones:
+    name: 1 · CI · E2E (build ${{ matrix.zone.name }})
     if: ${{ inputs.run_e2e }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        zone:
+          - { name: shell, pkg: '@namthuanvn/shell' }
+          - { name: expense, pkg: '@namthuanvn/zone-expense' }
+          - { name: exms, pkg: '@namthuanvn/zone-exms' }
+          - { name: oms, pkg: '@namthuanvn/zone-oms' }
+          - { name: hris, pkg: '@namthuanvn/zone-hris' }
+          - { name: utilities, pkg: '@namthuanvn/zone-utilities' }
     steps:
       - uses: actions/checkout@v6
         with:
@@ -158,65 +170,90 @@ jobs:
 
       - uses: ./.github/actions/install
 
-      # Warm the Next compiler cache across runs. build:pages still runs (so it
-      # always re-evaluates source — no stale-build risk) but reuses prior
+      # Warm THIS zone's Next compiler cache across runs. build:pages still runs
+      # (so it always re-evaluates source — no stale-build risk) but reuses prior
       # compilation work, cutting a cold ~60–120s build to ~20–40s on unchanged
-      # source. Invalidates on lockfile + dashboard/packages source changes.
+      # source. Keyed per-zone so the matrix legs don't clobber one another's
+      # cache. Invalidates on lockfile + dashboard/packages source changes.
       - name: Cache Next build
         uses: actions/cache@v5
         with:
-          # Every zone's Next compiler cache (the glob matches each app that has
-          # one — shell + Multi-Zone workers; just the shell pre-split).
-          path: apps/*/.next/cache
-          key: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/**', 'packages/**') }}
+          path: apps/${{ matrix.zone.name }}/.next/cache
+          key: next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/**', 'packages/**') }}
           restore-keys: |
-            next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
-            next-${{ runner.os }}-
+            next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-
+            next-${{ runner.os }}-${{ matrix.zone.name }}-
 
       # Generic relative `/api` build — no host/port baked, so the same bundle
-      # boots on every shard's free port. Builds EVERY FE app that has a
-      # `build:pages` script — the shell + the four Multi-Zone zones (expense /
-      # exms / hris / utilities); the e2e stack boots all of them, so all must be
-      # prebuilt. `--filter './apps/*'` selects by PATH (the packages no longer
-      # share a `dashboard*` name prefix); `--if-present` skips the dispatcher (a
-      # plain Worker with no build:pages) and any other non-buildable app.
-      - name: Build dashboard zones (once)
-        run: pnpm --filter './apps/*' --if-present run build:pages
-
-      # Isolated-state branch of db-reset.sh: per-service `wrangler d1 migrations
-      # apply --persist-to .wrangler/state-e2e`, no ExMS demo seed — exactly the
-      # DB each shard would have produced itself.
-      - name: Seed e2e database (once)
-        run: STATE_DIR=.wrangler/state-e2e bash scripts/db-reset.sh
+      # boots on every shard's free port.
+      - name: Build zone (OpenNext)
+        run: pnpm --filter ${{ matrix.zone.pkg }} run build:pages
 
       # tar (not a raw many-small-files upload) so the .open-next file count
-      # doesn't make upload/download slow. Content is mostly-incompressible
-      # sqlite + an already-minified bundle, so skip artifact gzip.
-      # Bundle every zone's `.open-next` (the `apps/*/.open-next` glob expands to
-      # each built zone — shell + Multi-Zone workers; just the shell pre-split).
-      - name: Package build + seed bundle
-        run: tar -cf e2e-bundle.tar apps/*/.open-next .wrangler/state-e2e
+      # doesn't make upload/download slow. The bundle is already minified, so
+      # skip artifact gzip. tar preserves the `apps/<zone>/.open-next` path so
+      # the shard reassembles the tree verbatim by untarring every zone tar.
+      - name: Package zone build
+        run: tar -cf zone-${{ matrix.zone.name }}.tar apps/${{ matrix.zone.name }}/.open-next
 
-      - name: Upload e2e bundle
+      - name: Upload zone build
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-bundle
-          path: e2e-bundle.tar
+          name: e2e-zone-${{ matrix.zone.name }}
+          path: zone-${{ matrix.zone.name }}.tar
           retention-days: 1
           compression-level: 0
 
-  # Playwright e2e. Each shard restores the prebuilt dashboard + seeded DB from
-  # the e2e-build artifact, then boots ONE wrangler session via `pnpm e2e:serve`
-  # with BUILD=0 RESEED=0 (dashboard worker primary, gateway & leaves as portless
-  # auxiliaries — on a free port, with NO proxy and NO assistant) and runs its
-  # slice of specs against http://localhost:<port> via PLAYWRIGHT_NO_WEB_SERVER=1
-  # so Playwright doesn't spawn its own server. Because build + seed already ran
-  # once in e2e-build, the per-shard boot is just the wrangler cold start.
+  # Seed the isolated e2e DB ONCE, in parallel with the zone builds (it only
+  # needs the per-service migration scripts, not the dashboard build output).
+  # Isolated-state branch of db-reset.sh: per-service `wrangler d1 migrations
+  # apply --persist-to .wrangler/state-e2e`, no ExMS demo seed — exactly the DB
+  # each shard would have produced itself. Each shard is a separate runner, so
+  # its untarred copy of the state dir is its own mutable DB — shard isolation
+  # is preserved without snapshotting.
+  e2e-seed:
+    name: 1 · CI · E2E (seed db)
+    if: ${{ inputs.run_e2e }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      - name: Seed e2e database (once)
+        run: STATE_DIR=.wrangler/state-e2e bash scripts/db-reset.sh
+
+      # Mostly-incompressible sqlite — skip artifact gzip.
+      - name: Package seed
+        run: tar -cf e2e-seed.tar .wrangler/state-e2e
+
+      - name: Upload e2e seed
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-seed
+          path: e2e-seed.tar
+          retention-days: 1
+          compression-level: 0
+
+  # Playwright e2e. Each shard restores the prebuilt zone bundles + seeded DB
+  # from the e2e-build-zones matrix + e2e-seed artifacts, then boots ONE wrangler
+  # session via `pnpm e2e:serve` with BUILD=0 RESEED=0 (dashboard worker primary,
+  # gateway & leaves as portless auxiliaries — on a free port, with NO proxy and
+  # NO assistant) and runs its slice of specs against http://localhost:<port> via
+  # PLAYWRIGHT_NO_WEB_SERVER=1 so Playwright doesn't spawn its own server. Because
+  # build + seed already ran in parallel upstream, the per-shard boot is just the
+  # wrangler cold start.
   # `fail-fast: false` so one flaky shard doesn't mask failures elsewhere — the
   # aggregated `jobs.e2e.result` still flips to `failure` if any shard fails.
   e2e:
     name: 1 · CI · E2E (shard ${{ matrix.shard }})
-    needs: [e2e-setup, e2e-build]
+    needs: [e2e-setup, e2e-build-zones, e2e-seed]
     if: ${{ inputs.run_e2e }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -234,16 +271,22 @@ jobs:
 
       - uses: ./.github/actions/install
 
-      # Restore the dashboard build (.open-next) + seeded DB (.wrangler/state-e2e)
-      # produced once by e2e-build. Untarred here, this is this shard's own
-      # mutable copy — tests can write freely without affecting other shards.
-      - name: Restore e2e bundle (build + seed)
+      # Restore every zone's build (.open-next) + the seeded DB
+      # (.wrangler/state-e2e), produced in parallel by the e2e-build-zones matrix
+      # + e2e-seed. `pattern: e2e-*` matches all six `e2e-zone-<name>` artifacts
+      # plus `e2e-seed`; `merge-multiple: true` lands every tar in the cwd.
+      # Untarring all of them reassembles the exact same tree the old single
+      # combined bundle produced. This is this shard's own mutable copy — tests
+      # can write freely without affecting other shards.
+      - name: Restore e2e build + seed
         uses: actions/download-artifact@v7
         with:
-          name: e2e-bundle
+          pattern: e2e-*
+          merge-multiple: true
 
-      - name: Unpack e2e bundle
-        run: tar -xf e2e-bundle.tar
+      - name: Unpack e2e build + seed
+        run: |
+          for f in *.tar; do tar -xf "$f"; done
 
       # No /etc/hosts or TLS cert: e2e hits the dashboard worker directly on a
       # free port over plain http://localhost (no proxy, no namthuan.local).
@@ -270,7 +313,7 @@ jobs:
       # Boot a dedicated e2e stack on a free port (dashboard worker + gateway +
       # leaves as bindings — NO proxy, NO assistant) in its own process group so
       # teardown can signal the whole tree. BUILD=0 RESEED=0: the dashboard build
-      # and DB seed already came from the e2e-build artifact, so `e2e:serve` only
+      # and DB seed already came from the restored artifacts, so `e2e:serve` only
       # picks a free port, writes it to `.wrangler/e2e-port`, and runs the wrangler
       # session in the foreground. Playwright then hits http://localhost:<port>
       # directly. `set -m` makes $! the PGID.

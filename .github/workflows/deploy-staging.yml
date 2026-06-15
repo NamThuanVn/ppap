@@ -41,6 +41,10 @@ jobs:
       status_context: deploy-staging
       triggered_by: ${{ github.event.client_payload.triggered_by || inputs.triggered_by || github.actor }}
       run_title: ${{ github.event.client_payload.title }}
+      # Skip the full Playwright e2e suite on the staging gate — the PR merged to
+      # main already ran it on refs/pull/N/merge (= main + PR). biome/typecheck/
+      # lint/vitest still gate here. Production keeps the default (full e2e).
+      run_e2e_gate: false
     secrets:
       TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
       PAT_TOKEN: ${{ secrets.PAT_TOKEN }}

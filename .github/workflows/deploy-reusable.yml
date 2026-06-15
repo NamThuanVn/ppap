@@ -63,6 +63,11 @@ on:
         type: string
         required: false
         default: ''
+      run_e2e_gate:
+        description: 'Whether the pre-deploy CI gate runs the full Playwright e2e suite. Staging passes false (the merged PR already ran e2e on refs/pull/N/merge = main + PR); production keeps the default true.'
+        type: boolean
+        required: false
+        default: true
     secrets:
       TF_API_TOKEN:
         required: true
@@ -101,13 +106,16 @@ jobs:
     uses: ./.github/workflows/ci-checks.yml
     with:
       checkout_ref: ${{ inputs.checkout_ref }}
-      # Require the full Playwright e2e suite before any staging/production
-      # deploy — not just biome/typecheck/lint/vitest. PR CI runs e2e on the
-      # source PR, but this re-validates on the actual deploy ref (sha for
-      # staging, refs/tags/<tag> for production) to catch admin-bypassed
-      # merges + post-merge drift before infra touches Cloudflare. A failing
-      # shard fails ci-gate, which blocks terraform-apply (needs: [ci-gate]).
-      run_e2e: true
+      # Whether this gate runs the full Playwright e2e suite is per-environment
+      # (inputs.run_e2e_gate): production keeps it true; staging passes false
+      # because the PR merged to main already ran full e2e on refs/pull/N/merge
+      # (= main + PR), so re-running it on the auto-deploy is redundant.
+      # biome/typecheck/lint/vitest ALWAYS run here regardless — they re-validate
+      # on the actual deploy ref (sha for staging, refs/tags/<tag> for
+      # production) to catch admin-bypassed merges + post-merge drift before
+      # infra touches Cloudflare. A failing job fails ci-gate, which blocks
+      # terraform-apply (needs: [ci-gate]).
+      run_e2e: ${{ inputs.run_e2e_gate }}
     secrets:
       PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
 
