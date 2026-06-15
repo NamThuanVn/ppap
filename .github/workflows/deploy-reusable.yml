@@ -246,7 +246,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        service: [hris, expense, utilities, exms, notifications, auth, assistant, files]
+        service: [hris, expense, utilities, exms, oms, notifications, auth, assistant, files]
 
     steps:
       - uses: actions/checkout@v6
@@ -380,7 +380,7 @@ jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
   # 6. Next.js dashboard zones via OpenNext → Cloudflare Workers (Multi-Zone).
-  #    The shell + each carved service zone (cost, exms, hris, utilities) is its
+  #    The shell + each carved service zone (expense, exms, oms, hris, utilities) is its
   #    own standalone OpenNext worker; the dispatcher (next job) fronts the apex
   #    and routes to them over service bindings. All zones build with the same
   #    NEXT_PUBLIC_* env (the client always calls same-origin /api/*) and each
@@ -401,6 +401,7 @@ jobs:
           - { name: shell, pkg: '@namthuanvn/shell' }
           - { name: expense, pkg: '@namthuanvn/zone-expense' }
           - { name: exms, pkg: '@namthuanvn/zone-exms' }
+          - { name: oms, pkg: '@namthuanvn/zone-oms' }
           - { name: hris, pkg: '@namthuanvn/zone-hris' }
           - { name: utilities, pkg: '@namthuanvn/zone-utilities' }
 
