@@ -231,6 +231,12 @@ jobs:
   deploy-worker-monitor:
     name: 3 · Worker · monitor (tail logs)
     needs: terraform-apply
+    # The implicit `success()` check is evaluated over the whole transitive
+    # `needs` closure, which includes the (skipped-on-staging) ci-gate — so a
+    # skipped gate would skip this job too even though terraform-apply ran.
+    # `!cancelled() && !failure()` runs on success-OR-skipped ancestors while
+    # still blocking on a genuine upstream failure/cancel.
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
 
     steps:
@@ -266,6 +272,8 @@ jobs:
   deploy-workers-leaves:
     name: 4 · Worker · ${{ matrix.service }} (leaf API)
     needs: [terraform-apply, deploy-worker-monitor]
+    # See deploy-worker-monitor — tolerate the skipped ci-gate in the closure.
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -331,6 +339,8 @@ jobs:
   deploy-workers-tier-1-5:
     name: 5 · Worker · ${{ matrix.service }} (composer)
     needs: deploy-workers-leaves
+    # See deploy-worker-monitor — tolerate the skipped ci-gate in the closure.
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -372,6 +382,8 @@ jobs:
   deploy-worker-gateway:
     name: 6 · Worker · gateway (router)
     needs: deploy-workers-tier-1-5
+    # See deploy-worker-monitor — tolerate the skipped ci-gate in the closure.
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
 
     steps:
@@ -414,6 +426,8 @@ jobs:
   deploy-zones:
     name: 7 · App · ${{ matrix.zone.name }} (Next.js zone)
     needs: [terraform-apply, deploy-worker-gateway]
+    # See deploy-worker-monitor — tolerate the skipped ci-gate in the closure.
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     strategy:
       # One zone failing must not cancel the others — the dispatcher (next job)
@@ -503,6 +517,8 @@ jobs:
   deploy-dispatch:
     name: 8 · App · dispatcher (apex ingress)
     needs: [terraform-apply, deploy-worker-gateway, deploy-zones]
+    # See deploy-worker-monitor — tolerate the skipped ci-gate in the closure.
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
 
     steps:
