@@ -68,6 +68,11 @@ on:
         type: boolean
         required: false
         default: true
+      run_ci_gate:
+        description: 'Whether to run the pre-deploy CI gate (biome/typecheck/lint/vitest[/e2e]) at all. Staging passes false — the source PR already ran the full CI on refs/pull/N/merge before merge, so re-checking the same code on the auto-deploy is redundant; staging goes straight to build/deploy. Production keeps the default true (re-validates on the release tag).'
+        type: boolean
+        required: false
+        default: true
     secrets:
       TF_API_TOKEN:
         required: true
@@ -103,6 +108,12 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   ci-gate:
     name: 1 · CI gate
+    # Per-environment: staging passes run_ci_gate=false (the source PR already ran
+    # full CI on refs/pull/N/merge before merge — re-checking the same code on the
+    # auto-deploy is redundant), so staging goes straight to terraform-apply.
+    # Production keeps it true to re-validate on the release tag. When skipped,
+    # terraform-apply still proceeds (its `if` treats a skipped gate as pass).
+    if: ${{ inputs.run_ci_gate }}
     uses: ./.github/workflows/ci-checks.yml
     with:
       checkout_ref: ${{ inputs.checkout_ref }}
@@ -127,6 +138,10 @@ jobs:
   terraform-apply:
     name: 2 · Infra · Terraform apply
     needs: [ci-gate]
+    # Run when the gate PASSED or was SKIPPED (staging, run_ci_gate=false); only a
+    # genuine gate FAILURE (or cancel) blocks the deploy. Without `always()` a
+    # skipped `needs` would skip this job too.
+    if: ${{ always() && needs.ci-gate.result != 'failure' && needs.ci-gate.result != 'cancelled' }}
     runs-on: ubuntu-latest
     concurrency:
       group: tf-${{ inputs.environment }}
@@ -554,7 +569,11 @@ jobs:
       - name: Compute outcome
         id: outcome
         run: |
-          if [ "${{ needs.ci-gate.result }}" = "success" ] && \
+          # ci-gate is `success` when it ran (production) or `skipped` when the
+          # environment opted out (staging, run_ci_gate=false) — both are OK; only
+          # a `failure`/`cancelled` gate counts against the deploy.
+          if [ "${{ needs.ci-gate.result }}" != "failure" ] && \
+             [ "${{ needs.ci-gate.result }}" != "cancelled" ] && \
              [ "${{ needs.deploy-worker-gateway.result }}" = "success" ] && \
              [ "${{ needs.deploy-zones.result }}" = "success" ] && \
              [ "${{ needs.deploy-dispatch.result }}" = "success" ]; then

@@ -41,9 +41,14 @@ jobs:
       status_context: deploy-staging
       triggered_by: ${{ github.event.client_payload.triggered_by || inputs.triggered_by || github.actor }}
       run_title: ${{ github.event.client_payload.title }}
-      # Skip the full Playwright e2e suite on the staging gate — the PR merged to
-      # main already ran it on refs/pull/N/merge (= main + PR). biome/typecheck/
-      # lint/vitest still gate here. Production keeps the default (full e2e).
+      # Skip the pre-deploy CI gate entirely on staging — the source PR already
+      # ran the full CI (biome/typecheck/lint/vitest + e2e) on refs/pull/N/merge
+      # (= main + PR) before it could merge, so re-checking the same code on the
+      # auto-deploy is redundant; staging goes straight to build/deploy. Production
+      # keeps the gate (defaults true) to re-validate on the release tag.
+      # run_e2e_gate is moot while run_ci_gate=false (the gate doesn't run), but
+      # kept explicit so flipping run_ci_gate back on restores the e2e-skip intent.
+      run_ci_gate: false
       run_e2e_gate: false
     secrets:
       TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
