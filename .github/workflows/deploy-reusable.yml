@@ -279,8 +279,13 @@ jobs:
         env:
           TF_OUTPUTS_JSON: /tmp/tf-outputs.json
 
+      # Call wrangler directly (mirrors each worker's `build` script + --outdir)
+      # rather than `pnpm run build -- --outdir dist`: pnpm forwards the extra
+      # args behind a literal `--`, which wrangler treats as positionals, so the
+      # `--outdir` flag is dropped and no dist/ is written. `exec` has no such
+      # separator. The deploy job uploads dist/index.js with --no-bundle.
       - name: Build worker bundle (dry-run → dist)
-        run: pnpm --filter @namthuanvn/${{ matrix.service }} run build -- --outdir dist
+        run: pnpm --filter @namthuanvn/${{ matrix.service }} exec wrangler deploy src/index.ts --dry-run --minify --outdir dist
 
       - name: Package worker bundle
         run: tar -cf worker-${{ matrix.service }}.tar apis/${{ matrix.service }}/dist
