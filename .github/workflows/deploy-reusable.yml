@@ -3,9 +3,18 @@ name: Deploy · Reusable
 # Reusable workflow shared by deploy-staging.yml and deploy-production.yml.
 # Those wrappers handle the trigger surface (event types, concurrency,
 # environment-specific run-name) and pass per-env inputs in here. This file
-# owns the actual deploy graph: terraform apply → monitor → leaves matrix →
-# tier-1.5 matrix → gateway → dashboard → status pingback. See
-# .claude/ppap.md in the private repo for the full architecture.
+# owns the actual deploy graph: terraform apply → build everything in parallel
+# (worker bundles + zone OpenNext outputs) → one ordered deploy job that uploads
+# the prebuilt artifacts (monitor → leaves → tier-1.5 → gateway → zones →
+# dispatcher) → status pingback. See .claude/ppap.md in the private repo for the
+# full architecture.
+#
+# Why build/deploy are split: builds have no inter-worker dependencies — only
+# DEPLOYS must be ordered (a worker's service/tail bindings require the target
+# to already exist on the account). So all builds fan out in parallel matrices
+# up front and ship their outputs as artifacts; the deploy job then just
+# uploads them in dependency order, skipping the per-tier bundle + the repeated
+# checkout/install that the old build-and-deploy-per-tier graph paid.
 
 on:
   workflow_call:
@@ -223,61 +232,29 @@ jobs:
           retention-days: 1
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 2. Deploy service-monitor (Tail Worker) FIRST. Every other worker
-  #    declares `tail_consumers: [{ service: "service-monitor" }]` —
-  #    Cloudflare rejects a deploy whose tail consumer doesn't exist on the
-  #    account, so this job must finish before the leaf matrix or gateway.
+  # 2. Build every API worker bundle in parallel. `wrangler deploy --dry-run
+  #    --outdir dist` bundles + minifies WITHOUT contacting Cloudflare; the
+  #    output (apis/<svc>/dist) ships as an artifact the deploy job uploads with
+  #    `--no-bundle`. Binding IDs are NOT baked into the JS bundle (they're
+  #    applied from wrangler.jsonc at upload), but we still run
+  #    resolve-wrangler-bindings here so `--dry-run` doesn't choke on the
+  #    `${...}` placeholder IDs in the committed config.
+  #
+  #    Short matrix → gates the (short) front of the deploy job; runs in
+  #    parallel with the slow build-zones matrix.
   # ───────────────────────────────────────────────────────────────────────────
-  deploy-worker-monitor:
-    name: 3 · Worker · monitor (tail logs)
+  build-workers:
+    name: 3 · Build · ${{ matrix.service }} (worker bundle)
     needs: terraform-apply
-    # The implicit `success()` check is evaluated over the whole transitive
-    # `needs` closure, which includes the (skipped-on-staging) ci-gate — so a
-    # skipped gate would skip this job too even though terraform-apply ran.
-    # `!cancelled() && !failure()` runs on success-OR-skipped ancestors while
-    # still blocking on a genuine upstream failure/cancel.
-    if: ${{ !cancelled() && !failure() }}
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
-          ref: ${{ inputs.checkout_ref }}
-          persist-credentials: false
-
-      - name: Capture deploy SHA
-        id: sha
-        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - uses: ./.github/actions/install
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: tf-outputs
-          path: /tmp
-
-      - name: Resolve wrangler bindings
-        run: .github/scripts/resolve-wrangler-bindings.sh monitor ${{ inputs.environment }}
-        env:
-          TF_OUTPUTS_JSON: /tmp/tf-outputs.json
-
-      - name: Deploy Worker
-        run: pnpm --filter @namthuanvn/monitor run deploy -- --var SENTRY_RELEASE:${{ steps.sha.outputs.value }}
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # 3. Leaves in parallel (Cloudflare service-binding tier 1).
-  # ───────────────────────────────────────────────────────────────────────────
-  deploy-workers-leaves:
-    name: 4 · Worker · ${{ matrix.service }} (leaf API)
-    needs: [terraform-apply, deploy-worker-monitor]
-    # See deploy-worker-monitor — tolerate the skipped ci-gate in the closure.
+    # See deploy job below — tolerate the skipped ci-gate in the transitive closure.
     if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     strategy:
+      # One worker failing to bundle must not abort the others — the deploy job
+      # gates on the whole matrix, so a partial failure already blocks the deploy.
+      fail-fast: false
       matrix:
-        service: [hris, expense, utilities, exms, oms, notifications, auth, assistant, files]
+        service: [monitor, hris, expense, utilities, exms, oms, notifications, auth, assistant, files, orchestrator, aggregator, gateway]
 
     steps:
       - uses: actions/checkout@v6
@@ -287,10 +264,6 @@ jobs:
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
-      - name: Capture deploy SHA
-        id: sha
-        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
       - uses: ./.github/actions/install
 
       - uses: actions/download-artifact@v8
@@ -298,140 +271,43 @@ jobs:
           name: tf-outputs
           path: /tmp
 
+      # Resolve so `wrangler deploy --dry-run` sees valid binding IDs instead of
+      # `${...}` placeholders. The resulting JS bundle is binding-ID-agnostic —
+      # the deploy job re-resolves the config it actually uploads with.
       - name: Resolve wrangler bindings
         run: .github/scripts/resolve-wrangler-bindings.sh ${{ matrix.service }} ${{ inputs.environment }}
         env:
           TF_OUTPUTS_JSON: /tmp/tf-outputs.json
 
-      # Vectorize index — Cloudflare TF provider v4 doesn't support
-      # `cloudflare_vectorize_index` (added in v5). Idempotent: first deploy
-      # creates the index + metadata indexes, subsequent deploys are no-ops.
-      # See `.claude/infrastructure.md` § Vectorize bootstrap.
-      - name: Bootstrap Vectorize index (idempotent)
-        if: matrix.service == 'assistant'
-        run: |
-          set -euo pipefail
-          INDEX="assistant-vectors"
-          if npx wrangler vectorize list 2>/dev/null | grep -qE "(^|[[:space:]])${INDEX}([[:space:]]|\$)"; then
-            echo "✓ Vectorize index '${INDEX}' already exists — skipping create."
-          else
-            echo "Creating Vectorize index '${INDEX}'..."
-            npx wrangler vectorize create "${INDEX}" --dimensions=1024 --metric=cosine
-            npx wrangler vectorize create-metadata-index "${INDEX}" --property-name=requiredPermission --type=string
-            npx wrangler vectorize create-metadata-index "${INDEX}" --property-name=entityType --type=string
-            echo "✓ Vectorize index '${INDEX}' created with metadata indexes."
-          fi
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
+      - name: Build worker bundle (dry-run → dist)
+        run: pnpm --filter @namthuanvn/${{ matrix.service }} run build -- --outdir dist
 
-      - name: Apply D1 migrations
-        run: pnpm --filter @namthuanvn/${{ matrix.service }} --if-present db:migrate:remote
+      - name: Package worker bundle
+        run: tar -cf worker-${{ matrix.service }}.tar apis/${{ matrix.service }}/dist
 
-      - name: Deploy Worker
-        run: pnpm --filter @namthuanvn/${{ matrix.service }} run deploy -- --var SENTRY_RELEASE:${{ steps.sha.outputs.value }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: worker-build-${{ matrix.service }}
+          path: worker-${{ matrix.service }}.tar
+          retention-days: 1
+          compression-level: 0
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 4. Tier 1.5 — workers with sibling `services` bindings (orchestrator,
-  #    aggregator). Must run AFTER leaves so the bindings target existing
-  #    workers (Cloudflare error 10143).
+  # 3. Build every Next.js zone (OpenNext → Cloudflare Workers) in parallel.
+  #    `build:pages` writes apps/<zone>/.open-next, which the deploy job uploads
+  #    via `wrangler deploy --env` WITHOUT rebuilding. All NEXT_PUBLIC_* +
+  #    Sentry source-map config is baked HERE at build time (the client always
+  #    calls same-origin /api/*). This matrix needs NOTHING from the worker
+  #    deploys — only tf-outputs for the baked VAPID/Sentry values — so it runs
+  #    fully in parallel with the worker build + the worker deploy chain. This is
+  #    the long pole; overlapping it with everything else is the main win.
   # ───────────────────────────────────────────────────────────────────────────
-  deploy-workers-tier-1-5:
-    name: 5 · Worker · ${{ matrix.service }} (composer)
-    needs: deploy-workers-leaves
-    # See deploy-worker-monitor — tolerate the skipped ci-gate in the closure.
+  build-zones:
+    name: 4 · Build · ${{ matrix.zone.name }} (Next.js zone)
+    needs: terraform-apply
     if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     strategy:
-      matrix:
-        service: [orchestrator, aggregator]
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
-          ref: ${{ inputs.checkout_ref }}
-          persist-credentials: false
-
-      - name: Capture deploy SHA
-        id: sha
-        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - uses: ./.github/actions/install
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: tf-outputs
-          path: /tmp
-
-      - name: Resolve wrangler bindings
-        run: .github/scripts/resolve-wrangler-bindings.sh ${{ matrix.service }} ${{ inputs.environment }}
-        env:
-          TF_OUTPUTS_JSON: /tmp/tf-outputs.json
-
-      - name: Apply D1 migrations
-        run: pnpm --filter @namthuanvn/${{ matrix.service }} --if-present db:migrate:remote
-
-      - name: Deploy Worker
-        run: pnpm --filter @namthuanvn/${{ matrix.service }} run deploy -- --var SENTRY_RELEASE:${{ steps.sha.outputs.value }}
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # 5. service-gateway — service-binds to every other worker.
-  # ───────────────────────────────────────────────────────────────────────────
-  deploy-worker-gateway:
-    name: 6 · Worker · gateway (router)
-    needs: deploy-workers-tier-1-5
-    # See deploy-worker-monitor — tolerate the skipped ci-gate in the closure.
-    if: ${{ !cancelled() && !failure() }}
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
-          ref: ${{ inputs.checkout_ref }}
-          persist-credentials: false
-
-      - name: Capture deploy SHA
-        id: sha
-        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - uses: ./.github/actions/install
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: tf-outputs
-          path: /tmp
-
-      - name: Resolve wrangler bindings
-        run: .github/scripts/resolve-wrangler-bindings.sh gateway ${{ inputs.environment }}
-        env:
-          TF_OUTPUTS_JSON: /tmp/tf-outputs.json
-
-      - name: Deploy Worker
-        run: pnpm --filter @namthuanvn/gateway run deploy${{ inputs.deploy_script_suffix }} -- --var SENTRY_RELEASE:${{ steps.sha.outputs.value }}
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # 6. Next.js dashboard zones via OpenNext → Cloudflare Workers (Multi-Zone).
-  #    The shell + each carved service zone (expense, exms, oms, hris, utilities) is its
-  #    own standalone OpenNext worker; the dispatcher (next job) fronts the apex
-  #    and routes to them over service bindings. All zones build with the same
-  #    NEXT_PUBLIC_* env (the client always calls same-origin /api/*) and each
-  #    service-binds to service-gateway for SSR prefetch, so the matrix deploys
-  #    AFTER the gateway — which transitively waits for every leaf. Adding a
-  #    future zone = one matrix entry here + one binding in apps/dispatcher.
-  # ───────────────────────────────────────────────────────────────────────────
-  deploy-zones:
-    name: 7 · App · ${{ matrix.zone.name }} (Next.js zone)
-    needs: [terraform-apply, deploy-worker-gateway]
-    # See deploy-worker-monitor — tolerate the skipped ci-gate in the closure.
-    if: ${{ !cancelled() && !failure() }}
-    runs-on: ubuntu-latest
-    strategy:
-      # One zone failing must not cancel the others — the dispatcher (next job)
-      # gates on the whole matrix, so a partial failure already blocks the apex.
       fail-fast: false
       matrix:
         zone:
@@ -461,14 +337,18 @@ jobs:
           name: tf-outputs
           path: /tmp
 
-      # Every zone worker (apps/<zone>/wrangler.jsonc) carries no Terraform-owned
-      # resources — only an ASSETS binding + the GATEWAY_SERVICE service binding —
-      # so this just loads the Cloudflare credentials (the `dashboard` case is a
-      # credentials-only no-op on the wrangler config).
-      - name: Load Cloudflare credentials
-        run: .github/scripts/resolve-wrangler-bindings.sh dashboard ${{ inputs.environment }}
-        env:
-          TF_OUTPUTS_JSON: /tmp/tf-outputs.json
+      # Warm THIS zone's Next compiler cache across runs. build:pages still runs
+      # (always re-evaluates source — no stale-build risk) but reuses prior
+      # compilation work. Keyed per-zone so the matrix legs don't clobber one
+      # another's cache.
+      - name: Cache Next build
+        uses: actions/cache@v5
+        with:
+          path: apps/${{ matrix.zone.name }}/.next/cache
+          key: next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/**', 'packages/**') }}
+          restore-keys: |
+            next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-
+            next-${{ runner.os }}-${{ matrix.zone.name }}-
 
       # VAPID public key (Web Push) — lives in HCP, surfaced via tf-outputs.
       - name: Load VAPID public key from tf-outputs
@@ -500,24 +380,52 @@ jobs:
           SENTRY_ORG: ${{ steps.sentry.outputs.org }}
           SENTRY_PROJECT: ${{ steps.sentry.outputs.project }}
 
-      - name: Deploy Worker
-        # Pass the dashboard Sentry DSN as a runtime wrangler var so the zone's
-        # `@sentry/cloudflare` wrap (apps/<zone>/worker.ts) can report server-side
-        # errors. Same value baked into the client build above as
-        # NEXT_PUBLIC_SENTRY_DSN; empty in envs without a DSN → Sentry disabled.
-        run: pnpm --filter ${{ matrix.zone.pkg }} run deploy${{ inputs.deploy_script_suffix }} -- --var "SENTRY_DSN:${{ steps.sentry.outputs.dsn }}"
+      # tar (not a raw many-small-files upload) so the .open-next file count
+      # doesn't make upload/download slow. Already minified → skip artifact gzip.
+      # tar preserves the `apps/<zone>/.open-next` path so the deploy job
+      # reassembles the tree verbatim by untarring.
+      - name: Package zone build
+        run: tar -cf zone-${{ matrix.zone.name }}.tar apps/${{ matrix.zone.name }}/.open-next
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: zone-build-${{ matrix.zone.name }}
+          path: zone-${{ matrix.zone.name }}.tar
+          retention-days: 1
+          compression-level: 0
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 7. Apex dispatcher (apps/dispatcher) — a tiny plain Worker that owns the
-  #    public custom_domain and routes `/api/*` → gateway and every page/asset
-  #    prefix → the owning zone over a service binding. It deploys LAST: its
-  #    `services` bindings target the gateway + all five zone workers, which must
-  #    already exist (Cloudflare error 10143 otherwise).
+  # 4. ONE ordered deploy job. Downloads every prebuilt artifact (worker
+  #    bundles + zone OpenNext outputs), resolves bindings, then uploads in
+  #    strict dependency order within this single job — so the expensive
+  #    checkout + pnpm install happens ONCE for the whole deploy phase instead
+  #    of once per tier:
+  #
+  #      monitor  →  leaves  →  tier-1.5  →  gateway  →  zones  →  dispatcher
+  #
+  #    The order is forced by Cloudflare binding existence:
+  #      • monitor first   — every worker's `tail_consumers` references it (else reject).
+  #      • leaves          — base tier 1 APIs.
+  #      • tier-1.5         — orchestrator/aggregator service-bind to leaves (error 10143).
+  #      • gateway          — service-binds to every worker.
+  #      • zones            — each service-binds to gateway for SSR prefetch.
+  #      • dispatcher       — apex ingress; service-binds gateway + all zones.
+  #    Within a tier order is irrelevant, so leaves / tier-1.5 / zones deploy
+  #    their members concurrently (background + wait) for speed; the tiers
+  #    themselves stay sequential steps.
+  #
+  #    API workers upload prebuilt bundles via `wrangler deploy dist/index.js
+  #    --no-bundle`. Zones run their `deploy:<env>` script on the prebuilt
+  #    .open-next (no rebuild). The dispatcher is a tiny plain Worker — it
+  #    bundles inline at deploy (no prebuilt artifact).
   # ───────────────────────────────────────────────────────────────────────────
-  deploy-dispatch:
-    name: 8 · App · dispatcher (apex ingress)
-    needs: [terraform-apply, deploy-worker-gateway, deploy-zones]
-    # See deploy-worker-monitor — tolerate the skipped ci-gate in the closure.
+  deploy:
+    name: 5 · Deploy · all workers + zones (ordered)
+    needs: [terraform-apply, build-workers, build-zones]
+    # The implicit `success()` check spans the whole transitive `needs` closure,
+    # which includes the (skipped-on-staging) ci-gate — so a skipped gate would
+    # skip this job too. `!cancelled() && !failure()` runs on success-OR-skipped
+    # ancestors while still blocking on a genuine upstream failure/cancel.
     if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
 
@@ -540,45 +448,168 @@ jobs:
           name: tf-outputs
           path: /tmp
 
-      - name: Load Cloudflare credentials
-        run: .github/scripts/resolve-wrangler-bindings.sh dashboard ${{ inputs.environment }}
+      # Pull every prebuilt bundle/zone artifact into one dir, then untar from
+      # the repo root so each tar's `apis/<svc>/dist` and `apps/<zone>/.open-next`
+      # path is restored verbatim.
+      - name: Download prebuilt bundles
+        uses: actions/download-artifact@v8
+        with:
+          pattern: '*-build-*'
+          merge-multiple: true
+          path: /tmp/bundles
+
+      - name: Unpack prebuilt bundles
+        run: for t in /tmp/bundles/*.tar; do tar -xf "$t"; done
+
+      # Resolve config for every API worker (substitutes binding IDs into each
+      # apis/<svc>/wrangler.jsonc) AND export the shared Cloudflare credentials
+      # to $GITHUB_ENV for the deploy + migration steps. `dashboard` is a
+      # credentials-only pass (zones/dispatcher carry no Terraform-owned
+      # resources) — it just guarantees the creds are loaded.
+      - name: Resolve wrangler bindings + credentials
         env:
           TF_OUTPUTS_JSON: /tmp/tf-outputs.json
+        run: |
+          set -euo pipefail
+          for svc in monitor hris expense utilities exms oms notifications auth assistant files orchestrator aggregator gateway dashboard; do
+            .github/scripts/resolve-wrangler-bindings.sh "$svc" ${{ inputs.environment }}
+          done
 
+      # Sentry DSN — runtime `--var` for the zone + dispatcher worker wraps.
       - name: Load Sentry DSN from tf-outputs
         id: sentry
         run: |
           jq -r .sentry_dsn_dashboard.value /tmp/tf-outputs.json | xargs -I {} echo "dsn={}" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy Worker
-        # No Next.js build — the dispatcher is a plain Worker. SENTRY_DSN is its
-        # only runtime var (its worker wraps `withSentry` with a dispatcher
-        # service tag); empty in envs without a DSN → Sentry disabled.
+      # Vectorize index for the assistant leaf — Cloudflare TF provider v4 lacks
+      # `cloudflare_vectorize_index` (added in v5). Idempotent: first run creates
+      # the index + metadata indexes, later runs are no-ops. Must precede the
+      # assistant deploy (its binding references the index).
+      # See `.claude/infrastructure.md` § Vectorize bootstrap.
+      - name: Bootstrap Vectorize index (idempotent)
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          INDEX="assistant-vectors"
+          if npx wrangler vectorize list 2>/dev/null | grep -qE "(^|[[:space:]])${INDEX}([[:space:]]|\$)"; then
+            echo "✓ Vectorize index '${INDEX}' already exists — skipping create."
+          else
+            echo "Creating Vectorize index '${INDEX}'..."
+            npx wrangler vectorize create "${INDEX}" --dimensions=1024 --metric=cosine
+            npx wrangler vectorize create-metadata-index "${INDEX}" --property-name=requiredPermission --type=string
+            npx wrangler vectorize create-metadata-index "${INDEX}" --property-name=entityType --type=string
+            echo "✓ Vectorize index '${INDEX}' created with metadata indexes."
+          fi
+
+      # ── Tier order ────────────────────────────────────────────────────────
+      - name: Deploy monitor (tail logs)
+        run: pnpm --filter @namthuanvn/monitor exec wrangler deploy dist/index.js --no-bundle --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
+
+      # Leaves (tier 1) — independent of one another, so deploy concurrently.
+      # Each: apply its D1 migrations (needs resolved binding + remote DB), then
+      # upload the prebuilt bundle. Per-service logs are grouped; any failure
+      # fails the step.
+      - name: Deploy leaves (tier 1)
+        run: |
+          set -uo pipefail
+          SHA='${{ steps.sha.outputs.value }}'
+          pids=""
+          for svc in hris expense utilities exms oms notifications auth assistant files; do
+            (
+              set -e
+              pnpm --filter "@namthuanvn/$svc" --if-present db:migrate:remote
+              pnpm --filter "@namthuanvn/$svc" exec wrangler deploy dist/index.js --no-bundle --var "SENTRY_RELEASE:$SHA"
+            ) > "/tmp/leaf-$svc.log" 2>&1 &
+            pids="$pids $!:$svc"
+          done
+          fail=0
+          for p in $pids; do
+            pid=${p%%:*}; svc=${p##*:}
+            if ! wait "$pid"; then echo "::error::leaf deploy failed: $svc"; fail=1; fi
+            echo "::group::leaf $svc"; cat "/tmp/leaf-$svc.log"; echo "::endgroup::"
+          done
+          exit "$fail"
+
+      # Tier 1.5 — orchestrator/aggregator service-bind to the leaves above.
+      - name: Deploy composers (tier 1.5)
+        run: |
+          set -uo pipefail
+          SHA='${{ steps.sha.outputs.value }}'
+          pids=""
+          for svc in orchestrator aggregator; do
+            (
+              set -e
+              pnpm --filter "@namthuanvn/$svc" --if-present db:migrate:remote
+              pnpm --filter "@namthuanvn/$svc" exec wrangler deploy dist/index.js --no-bundle --var "SENTRY_RELEASE:$SHA"
+            ) > "/tmp/tier15-$svc.log" 2>&1 &
+            pids="$pids $!:$svc"
+          done
+          fail=0
+          for p in $pids; do
+            pid=${p%%:*}; svc=${p##*:}
+            if ! wait "$pid"; then echo "::error::composer deploy failed: $svc"; fail=1; fi
+            echo "::group::composer $svc"; cat "/tmp/tier15-$svc.log"; echo "::endgroup::"
+          done
+          exit "$fail"
+
+      # Gateway — service-binds to every worker; uses --env (env-specific name +
+      # routes live in its wrangler.jsonc env block).
+      - name: Deploy gateway (router)
+        run: pnpm --filter @namthuanvn/gateway exec wrangler deploy --env ${{ inputs.environment }} dist/index.js --no-bundle --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
+
+      # Zones — each service-binds to gateway; deploy the prebuilt .open-next via
+      # their deploy:<env> script (no rebuild). Independent → concurrent.
+      # SENTRY_DSN is a runtime var for the zone's @sentry/cloudflare worker wrap
+      # (apps/<zone>/worker.ts); empty in envs without a DSN → Sentry disabled.
+      - name: Deploy zones (Next.js)
+        run: |
+          set -uo pipefail
+          DSN='${{ steps.sentry.outputs.dsn }}'
+          SUFFIX='${{ inputs.deploy_script_suffix }}'
+          pids=""
+          for entry in shell:@namthuanvn/shell expense:@namthuanvn/zone-expense exms:@namthuanvn/zone-exms oms:@namthuanvn/zone-oms hris:@namthuanvn/zone-hris utilities:@namthuanvn/zone-utilities; do
+            name=${entry%%:*}; pkg=${entry##*:}
+            ( pnpm --filter "$pkg" run "deploy$SUFFIX" -- --var "SENTRY_DSN:$DSN" ) > "/tmp/zone-$name.log" 2>&1 &
+            pids="$pids $!:$name"
+          done
+          fail=0
+          for p in $pids; do
+            pid=${p%%:*}; name=${p##*:}
+            if ! wait "$pid"; then echo "::error::zone deploy failed: $name"; fail=1; fi
+            echo "::group::zone $name"; cat "/tmp/zone-$name.log"; echo "::endgroup::"
+          done
+          exit "$fail"
+
+      # Apex dispatcher — a tiny plain Worker fronting the public custom_domain,
+      # routing /api/* → gateway and each page/asset prefix → its zone over
+      # service bindings. Deploys LAST: its bindings target the gateway + all six
+      # zone workers, which must already exist (Cloudflare error 10143). No
+      # Next.js build — it bundles inline at deploy. SENTRY_DSN is its only
+      # runtime var (its worker wraps `withSentry` with a dispatcher service tag).
+      - name: Deploy dispatcher (apex ingress)
         run: pnpm --filter @namthuanvn/dispatcher run deploy${{ inputs.deploy_script_suffix }} -- --var "SENTRY_DSN:${{ steps.sentry.outputs.dsn }}" --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 7. Pingback. The dispatcher in the private repo created a *pending*
+  # 5. Pingback. The dispatcher in the private repo created a *pending*
   #    GitHub Deployment; we close it out here with success/failure so
   #    erp-namthuan's Environments tab + commit status reflect the real
   #    outcome. Both steps no-op when the run was a manual workflow_dispatch
   #    (no deployment_id / sha in the event payload).
   # ───────────────────────────────────────────────────────────────────────────
   report-deployment:
-    name: 9 · Report · deployment status
-    # ci-gate is in `needs:` so a CI failure (which skips terraform-apply +
-    # everything downstream) still surfaces as a `failure` state to the
-    # Deployment-status pingback. Outcome is strict all-success: a mid-graph
-    # failure (terraform-apply, monitor, leaves, tier-1.5) leaves gateway +
-    # zones + dispatch as `skipped` — not `failure` — so checking only for
-    # `failure`/`cancelled` would incorrectly report success. `deploy-dispatch`
-    # is the terminal job (it `needs: deploy-zones`), so its success implies the
-    # whole zone matrix succeeded too.
+    name: 6 · Report · deployment status
+    # ci-gate + the build matrices are in `needs:` so a failure anywhere in the
+    # graph (which skips the deploy job) still surfaces as a `failure` state to
+    # the Deployment-status pingback. `deploy` is the single terminal job; its
+    # success implies every tier (workers + zones + dispatcher) succeeded.
     #
     # `!cancelled()` (not `always()`): a run cancelled by concurrency
     # (superseded staging deploy — expected, not an error) skips reporting
     # entirely — no Telegram alert, and its pending GitHub Deployment is
     # auto-marked inactive when the superseding deploy posts `success`.
-    needs: [ci-gate, deploy-worker-gateway, deploy-zones, deploy-dispatch]
+    needs: [ci-gate, build-workers, build-zones, deploy]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
@@ -590,9 +621,7 @@ jobs:
           # a `failure`/`cancelled` gate counts against the deploy.
           if [ "${{ needs.ci-gate.result }}" != "failure" ] && \
              [ "${{ needs.ci-gate.result }}" != "cancelled" ] && \
-             [ "${{ needs.deploy-worker-gateway.result }}" = "success" ] && \
-             [ "${{ needs.deploy-zones.result }}" = "success" ] && \
-             [ "${{ needs.deploy-dispatch.result }}" = "success" ]; then
+             [ "${{ needs.deploy.result }}" = "success" ]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
           else
             echo "state=failure" >> "$GITHUB_OUTPUT"
@@ -649,9 +678,9 @@ jobs:
           RUN_TITLE: ${{ inputs.run_title }}
           COMMIT_SHA: ${{ inputs.commit_sha }}
           R_CI: ${{ needs.ci-gate.result }}
-          R_GATEWAY: ${{ needs.deploy-worker-gateway.result }}
-          R_ZONES: ${{ needs.deploy-zones.result }}
-          R_DISPATCH: ${{ needs.deploy-dispatch.result }}
+          R_BUILD_WORKERS: ${{ needs.build-workers.result }}
+          R_BUILD_ZONES: ${{ needs.build-zones.result }}
+          R_DEPLOY: ${{ needs.deploy.result }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -675,7 +704,7 @@ jobs:
           if [ -n "$SAFE_TITLE" ]; then TEXT="${TEXT}: ${SAFE_TITLE}"; fi
           if [ -n "$META" ]; then TEXT="${TEXT}"$'\n'"${META}"; fi
           TEXT="${TEXT}"$'\n'"Ref: <code>${CHECKOUT_REF}</code>"
-          TEXT="${TEXT}"$'\n'"Jobs: ci-gate ${R_CI} · gateway ${R_GATEWAY} · zones ${R_ZONES} · dispatch ${R_DISPATCH}"
+          TEXT="${TEXT}"$'\n'"Jobs: ci-gate ${R_CI} · build-workers ${R_BUILD_WORKERS} · build-zones ${R_BUILD_ZONES} · deploy ${R_DEPLOY}"
           TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
           THREAD_ARGS=()
           if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
