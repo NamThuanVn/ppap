@@ -158,6 +158,10 @@ jobs:
           - { name: expense, pkg: '@namthuanvn/zone-expense' }
           - { name: exms, pkg: '@namthuanvn/zone-exms' }
           - { name: oms, pkg: '@namthuanvn/zone-oms' }
+          - { name: sourcing, pkg: '@namthuanvn/zone-sourcing' }
+          - { name: bom, pkg: '@namthuanvn/zone-bom' }
+          - { name: quotation, pkg: '@namthuanvn/zone-quotation' }
+          - { name: procurement, pkg: '@namthuanvn/zone-procurement' }
           - { name: hris, pkg: '@namthuanvn/zone-hris' }
           - { name: utilities, pkg: '@namthuanvn/zone-utilities' }
     steps:
@@ -273,7 +277,7 @@ jobs:
 
       # Restore every zone's build (.open-next) + the seeded DB
       # (.wrangler/state-e2e), produced in parallel by the e2e-build-zones matrix
-      # + e2e-seed. `pattern: e2e-*` matches all six `e2e-zone-<name>` artifacts
+      # + e2e-seed. `pattern: e2e-*` matches all ten `e2e-zone-<name>` artifacts
       # plus `e2e-seed`; `merge-multiple: true` lands every tar in the cwd.
       # Untarring all of them reassembles the exact same tree the old single
       # combined bundle produced. This is this shard's own mutable copy — tests
