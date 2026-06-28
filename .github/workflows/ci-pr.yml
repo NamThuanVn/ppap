@@ -95,7 +95,7 @@ jobs:
     uses: ./.github/workflows/ci-checks.yml
     with:
       checkout_ref: refs/pull/${{ github.event.client_payload.pr_number || inputs.pr_number }}/merge
-      e2e_shards: ${{ fromJSON(inputs.e2e_shards || '4') }}
+      e2e_shards: ${{ fromJSON(inputs.e2e_shards || '12') }}
     secrets:
       PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
 
