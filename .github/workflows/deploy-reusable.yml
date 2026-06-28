@@ -254,7 +254,7 @@ jobs:
       # gates on the whole matrix, so a partial failure already blocks the deploy.
       fail-fast: false
       matrix:
-        service: [monitor, hris, expense, utilities, exms, oms, notifications, auth, assistant, files, orchestrator, aggregator, gateway]
+        service: [monitor, hris, expense, utilities, exms, oms, sourcing, bom, quotation, procurement, notifications, auth, assistant, files, orchestrator, aggregator, gateway]
 
     steps:
       - uses: actions/checkout@v6
@@ -320,6 +320,10 @@ jobs:
           - { name: expense, pkg: '@namthuanvn/zone-expense' }
           - { name: exms, pkg: '@namthuanvn/zone-exms' }
           - { name: oms, pkg: '@namthuanvn/zone-oms' }
+          - { name: sourcing, pkg: '@namthuanvn/zone-sourcing' }
+          - { name: bom, pkg: '@namthuanvn/zone-bom' }
+          - { name: quotation, pkg: '@namthuanvn/zone-quotation' }
+          - { name: procurement, pkg: '@namthuanvn/zone-procurement' }
           - { name: hris, pkg: '@namthuanvn/zone-hris' }
           - { name: utilities, pkg: '@namthuanvn/zone-utilities' }
 
@@ -476,7 +480,7 @@ jobs:
           TF_OUTPUTS_JSON: /tmp/tf-outputs.json
         run: |
           set -euo pipefail
-          for svc in monitor hris expense utilities exms oms notifications auth assistant files orchestrator aggregator gateway dashboard; do
+          for svc in monitor hris expense utilities exms oms sourcing bom quotation procurement notifications auth assistant files orchestrator aggregator gateway dashboard; do
             .github/scripts/resolve-wrangler-bindings.sh "$svc" ${{ inputs.environment }}
           done
 
@@ -521,7 +525,7 @@ jobs:
           set -uo pipefail
           SHA='${{ steps.sha.outputs.value }}'
           pids=""
-          for svc in hris expense utilities exms oms notifications auth assistant files; do
+          for svc in hris expense utilities exms oms sourcing bom quotation procurement notifications auth assistant files; do
             (
               set -e
               pnpm --filter "@namthuanvn/$svc" --if-present db:migrate:remote
@@ -574,7 +578,7 @@ jobs:
           DSN='${{ steps.sentry.outputs.dsn }}'
           SUFFIX='${{ inputs.deploy_script_suffix }}'
           pids=""
-          for entry in shell:@namthuanvn/shell expense:@namthuanvn/zone-expense exms:@namthuanvn/zone-exms oms:@namthuanvn/zone-oms hris:@namthuanvn/zone-hris utilities:@namthuanvn/zone-utilities; do
+          for entry in shell:@namthuanvn/shell expense:@namthuanvn/zone-expense exms:@namthuanvn/zone-exms oms:@namthuanvn/zone-oms sourcing:@namthuanvn/zone-sourcing bom:@namthuanvn/zone-bom quotation:@namthuanvn/zone-quotation procurement:@namthuanvn/zone-procurement hris:@namthuanvn/zone-hris utilities:@namthuanvn/zone-utilities; do
             name=${entry%%:*}; pkg=${entry##*:}
             ( pnpm --filter "$pkg" run "deploy$SUFFIX" -- --var "SENTRY_DSN:$DSN" ) > "/tmp/zone-$name.log" 2>&1 &
             pids="$pids $!:$name"
