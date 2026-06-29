@@ -245,71 +245,6 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-  # Boot-verification GATE. Before fanning out to the e2e shards, bring the full
-  # Multi-Zone stack up ONCE (restored zone bundles + seed, exactly as a shard
-  # does) and confirm `/api/health` AND every zone is serving — via the shared
-  # `scripts/ci-boot-e2e.sh`. A zone whose wrangler config/build is broken (e.g.
-  # a missing `assets.directory`) crashes the SHARED stack at boot, which would
-  # otherwise turn EVERY one of the e2e shards red ~25-30 min into the run with a
-  # confusing 12-red signal. This catches that class in ~2-3 min as ONE red job
-  # with a precise `::error::zone <x> …` message, and `e2e` `needs` it so the
-  # shards never start on a broken boot. No Chromium (curl-only) → cheap. One
-  # reboot retry so the gate itself doesn't flake on a transient cold-start.
-  e2e-boot-check:
-    name: 1 · CI · E2E (boot check)
-    needs: [e2e-build-zones, e2e-seed]
-    if: ${{ inputs.run_e2e }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
-          ref: ${{ inputs.checkout_ref }}
-          persist-credentials: false
-
-      - uses: ./.github/actions/install
-
-      - name: Restore e2e build + seed
-        uses: actions/download-artifact@v7
-        with:
-          pattern: e2e-*
-          merge-multiple: true
-
-      - name: Unpack e2e build + seed
-        run: |
-          for f in *.tar; do tar -xf "$f"; done
-
-      - name: Boot stack + verify health + every zone
-        run: |
-          set -uo pipefail
-          # Backward-compat: PRs branched before this change don't ship
-          # scripts/ci-boot-e2e.sh. Skip the gate for them (the e2e shards fall
-          # back to their legacy inline boot). Remove this guard once every open
-          # PR has rebased past this commit.
-          if [ ! -f scripts/ci-boot-e2e.sh ]; then
-            echo "scripts/ci-boot-e2e.sh absent on this branch — skipping boot check (pre-rollout branch)"
-            exit 0
-          fi
-          if bash scripts/ci-boot-e2e.sh; then exit 0; fi
-          echo "::warning::boot check failed on first attempt — rebooting and retrying once"
-          pid="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"
-          [ -n "$pid" ] && { kill -TERM -- -"$pid" 2>/dev/null || true; sleep 2; kill -KILL -- -"$pid" 2>/dev/null || true; }
-          mv e2e-serve.log e2e-serve.attempt1.log 2>/dev/null || true
-          bash scripts/ci-boot-e2e.sh
-
-      - name: Upload boot-check logs
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: e2e-boot-check-log
-          path: |
-            e2e-serve*.log
-            .wrangler/state-e2e/zone-*.log
-          retention-days: 7
-          if-no-files-found: ignore
-
   # Playwright e2e. Each shard restores the prebuilt zone bundles + seeded DB
   # from the e2e-build-zones matrix + e2e-seed artifacts, then boots ONE wrangler
   # session via `pnpm e2e:serve` with BUILD=0 RESEED=0 (dashboard worker primary,
@@ -322,7 +257,7 @@ jobs:
   # aggregated `jobs.e2e.result` still flips to `failure` if any shard fails.
   e2e:
     name: 1 · CI · E2E (shard ${{ matrix.shard }})
-    needs: [e2e-setup, e2e-build-zones, e2e-seed, e2e-boot-check]
+    needs: [e2e-setup, e2e-build-zones, e2e-seed]
     if: ${{ inputs.run_e2e }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -381,10 +316,11 @@ jobs:
 
       # Boot a dedicated e2e stack on a free port (dashboard worker + gateway +
       # leaves as bindings + one `wrangler dev` per zone worker — NO proxy, NO
-      # assistant) via the SHARED scripts/ci-boot-e2e.sh: the exact boot +
-      # /api/health + per-zone probe the e2e-boot-check gate ran, in its own
-      # process group (BUILD=0 RESEED=0 — build + seed came from the restored
-      # artifacts). Then run THIS shard's Playwright slice against the reported
+      # assistant) via scripts/ci-boot-e2e.sh: boot + /api/health + per-zone probe
+      # (a zone that booted but serves 5xx is caught here, before the tests, with
+      # a precise `::error::zone <x> …`), in its own process group (BUILD=0
+      # RESEED=0 — build + seed came from the restored artifacts). Then run THIS
+      # shard's Playwright slice against the reported
       # port. If the run fails AND the serve process has died (a Mode-B mid-run
       # workerd crash → ECONNREFUSED cascade that Playwright's own retries can't
       # recover from, since the server is gone), reboot the stack once and
