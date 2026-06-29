@@ -245,6 +245,71 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+  # Boot-verification GATE. Before fanning out to the e2e shards, bring the full
+  # Multi-Zone stack up ONCE (restored zone bundles + seed, exactly as a shard
+  # does) and confirm `/api/health` AND every zone is serving — via the shared
+  # `scripts/ci-boot-e2e.sh`. A zone whose wrangler config/build is broken (e.g.
+  # a missing `assets.directory`) crashes the SHARED stack at boot, which would
+  # otherwise turn EVERY one of the e2e shards red ~25-30 min into the run with a
+  # confusing 12-red signal. This catches that class in ~2-3 min as ONE red job
+  # with a precise `::error::zone <x> …` message, and `e2e` `needs` it so the
+  # shards never start on a broken boot. No Chromium (curl-only) → cheap. One
+  # reboot retry so the gate itself doesn't flake on a transient cold-start.
+  e2e-boot-check:
+    name: 1 · CI · E2E (boot check)
+    needs: [e2e-build-zones, e2e-seed]
+    if: ${{ inputs.run_e2e }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      - name: Restore e2e build + seed
+        uses: actions/download-artifact@v7
+        with:
+          pattern: e2e-*
+          merge-multiple: true
+
+      - name: Unpack e2e build + seed
+        run: |
+          for f in *.tar; do tar -xf "$f"; done
+
+      - name: Boot stack + verify health + every zone
+        run: |
+          set -uo pipefail
+          # Backward-compat: PRs branched before this change don't ship
+          # scripts/ci-boot-e2e.sh. Skip the gate for them (the e2e shards fall
+          # back to their legacy inline boot). Remove this guard once every open
+          # PR has rebased past this commit.
+          if [ ! -f scripts/ci-boot-e2e.sh ]; then
+            echo "scripts/ci-boot-e2e.sh absent on this branch — skipping boot check (pre-rollout branch)"
+            exit 0
+          fi
+          if bash scripts/ci-boot-e2e.sh; then exit 0; fi
+          echo "::warning::boot check failed on first attempt — rebooting and retrying once"
+          pid="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"
+          [ -n "$pid" ] && { kill -TERM -- -"$pid" 2>/dev/null || true; sleep 2; kill -KILL -- -"$pid" 2>/dev/null || true; }
+          mv e2e-serve.log e2e-serve.attempt1.log 2>/dev/null || true
+          bash scripts/ci-boot-e2e.sh
+
+      - name: Upload boot-check logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-boot-check-log
+          path: |
+            e2e-serve*.log
+            .wrangler/state-e2e/zone-*.log
+          retention-days: 7
+          if-no-files-found: ignore
+
   # Playwright e2e. Each shard restores the prebuilt zone bundles + seeded DB
   # from the e2e-build-zones matrix + e2e-seed artifacts, then boots ONE wrangler
   # session via `pnpm e2e:serve` with BUILD=0 RESEED=0 (dashboard worker primary,
@@ -257,7 +322,7 @@ jobs:
   # aggregated `jobs.e2e.result` still flips to `failure` if any shard fails.
   e2e:
     name: 1 · CI · E2E (shard ${{ matrix.shard }})
-    needs: [e2e-setup, e2e-build-zones, e2e-seed]
+    needs: [e2e-setup, e2e-build-zones, e2e-seed, e2e-boot-check]
     if: ${{ inputs.run_e2e }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -315,67 +380,85 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium
 
       # Boot a dedicated e2e stack on a free port (dashboard worker + gateway +
-      # leaves as bindings — NO proxy, NO assistant) in its own process group so
-      # teardown can signal the whole tree. BUILD=0 RESEED=0: the dashboard build
-      # and DB seed already came from the restored artifacts, so `e2e:serve` only
-      # picks a free port, writes it to `.wrangler/e2e-port`, and runs the wrangler
-      # session in the foreground. Playwright then hits http://localhost:<port>
-      # directly. `set -m` makes $! the PGID.
-      - name: Boot e2e stack
-        id: e2e
+      # leaves as bindings + one `wrangler dev` per zone worker — NO proxy, NO
+      # assistant) via the SHARED scripts/ci-boot-e2e.sh: the exact boot +
+      # /api/health + per-zone probe the e2e-boot-check gate ran, in its own
+      # process group (BUILD=0 RESEED=0 — build + seed came from the restored
+      # artifacts). Then run THIS shard's Playwright slice against the reported
+      # port. If the run fails AND the serve process has died (a Mode-B mid-run
+      # workerd crash → ECONNREFUSED cascade that Playwright's own retries can't
+      # recover from, since the server is gone), reboot the stack once and
+      # re-run the shard. A genuine test failure (stack still alive) is NOT
+      # retried — we never mask real red.
+      - name: Boot e2e stack + run Playwright shard ${{ matrix.shard }}/${{ needs.e2e-setup.outputs.total }}
+        env:
+          PLAYWRIGHT_NO_WEB_SERVER: '1'
+          SHARD: ${{ matrix.shard }}
+          TOTAL: ${{ needs.e2e-setup.outputs.total }}
         run: |
           set -uo pipefail
-          set -m
-          nohup env BUILD=0 RESEED=0 pnpm e2e:serve >e2e-serve.log 2>&1 &
-          SERVE_PID=$!
-          set +m
-          echo "serve_pid=$SERVE_PID" >> "$GITHUB_OUTPUT"
-          # Port file is written before the build, so it appears quickly.
-          for _ in $(seq 1 60); do
-            [ -s .wrangler/e2e-port ] && break
-            kill -0 "$SERVE_PID" 2>/dev/null || { echo "::error::e2e:serve exited early"; tail -n 80 e2e-serve.log; exit 1; }
-            sleep 1
-          done
-          PORT="$(cat .wrangler/e2e-port 2>/dev/null || true)"
-          if [ -z "$PORT" ]; then echo "::error::e2e:serve never reported a port"; tail -n 80 e2e-serve.log; exit 1; fi
-          echo "base=http://localhost:$PORT" >> "$GITHUB_OUTPUT"
-          # Build + seed are prebuilt now, so only the wrangler cold start
-          # remains — but the Multi-Zone stack boots the main process (dispatcher
-          # + shell + gateway + leaves) PLUS one `wrangler dev` per zone worker
-          # (serve-stack waits on each zone's port before the main process), so
-          # allow up to 5 min for that heavier cold start.
-          deadline=$((SECONDS + 300))
-          while (( SECONDS < deadline )); do
-            if ! kill -0 "$SERVE_PID" 2>/dev/null; then
-              echo "::error::e2e stack exited before becoming ready"
-              tail -n 80 e2e-serve.log
-              exit 1
-            fi
-            if curl -sf "http://localhost:$PORT/api/health" >/dev/null 2>&1; then
-              echo "✓ e2e stack ready on :$PORT (PID $SERVE_PID)"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "::error::Timed out after 120s waiting for http://localhost:$PORT/api/health"
-          tail -n 80 e2e-serve.log
-          kill -KILL -- -"$SERVE_PID" 2>/dev/null || true
-          exit 1
-
-      - name: Run Playwright shard ${{ matrix.shard }}/${{ needs.e2e-setup.outputs.total }}
-        env:
-          PLAYWRIGHT_BASE_URL: ${{ steps.e2e.outputs.base }}
-          PLAYWRIGHT_NO_WEB_SERVER: '1'
-        run: |
-          pnpm exec playwright test --reporter=line \
-            --shard=${{ matrix.shard }}/${{ needs.e2e-setup.outputs.total }}
+          # Backward-compat: PRs branched before this change don't ship
+          # scripts/ci-boot-e2e.sh — boot the legacy inline way (no zone probe,
+          # no reboot-retry) so their e2e still runs. Remove once every open PR
+          # has rebased past this commit.
+          if [ ! -f scripts/ci-boot-e2e.sh ]; then
+            set -m
+            nohup env BUILD=0 RESEED=0 pnpm e2e:serve >e2e-serve.log 2>&1 &
+            SERVE_PID=$!
+            set +m
+            echo "$SERVE_PID" > .wrangler/e2e-serve.pid
+            for _ in $(seq 1 60); do
+              [ -s .wrangler/e2e-port ] && break
+              kill -0 "$SERVE_PID" 2>/dev/null || { echo "::error::e2e:serve exited early"; tail -n 80 e2e-serve.log; exit 1; }
+              sleep 1
+            done
+            PORT="$(cat .wrangler/e2e-port 2>/dev/null || true)"
+            [ -z "$PORT" ] && { echo "::error::e2e:serve never reported a port"; tail -n 80 e2e-serve.log; exit 1; }
+            deadline=$((SECONDS + 300))
+            ready=0
+            while (( SECONDS < deadline )); do
+              kill -0 "$SERVE_PID" 2>/dev/null || { echo "::error::e2e stack exited before becoming ready"; tail -n 80 e2e-serve.log; exit 1; }
+              curl -sf "http://localhost:$PORT/api/health" >/dev/null 2>&1 && { ready=1; break; }
+              sleep 1
+            done
+            [ "$ready" = 1 ] || { echo "::error::Timed out waiting for /api/health"; tail -n 80 e2e-serve.log; exit 1; }
+            PLAYWRIGHT_BASE_URL="http://localhost:$PORT" pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL"
+            exit $?
+          fi
+          serve_alive() { local p; p="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+          teardown_serve() {
+            local p; p="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"
+            [ -n "$p" ] || return 0
+            kill -TERM -- -"$p" 2>/dev/null || true; sleep 2; kill -KILL -- -"$p" 2>/dev/null || true
+          }
+          run_shard() {
+            bash scripts/ci-boot-e2e.sh || return 1
+            PLAYWRIGHT_BASE_URL="http://localhost:$(cat .wrangler/e2e-port)" \
+              pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL"
+          }
+          # Capture run_shard's real exit code directly — do NOT use
+          # `if run_shard; then exit 0; fi; status=$?`, since a bash `if` with a
+          # false condition and no else returns 0, which would mask a genuine
+          # first-attempt failure as success.
+          run_shard
+          status=$?
+          [ "$status" -eq 0 ] && exit 0
+          if serve_alive; then
+            echo "::error::shard $SHARD/$TOTAL failed with the stack still alive — a genuine test failure, not retrying"
+            teardown_serve
+            exit "$status"
+          fi
+          echo "::warning::e2e stack died mid-run (likely a workerd crash) — rebooting and re-running shard $SHARD/$TOTAL once"
+          teardown_serve
+          # Keep the first attempt's boot log for the failure upload.
+          mv e2e-serve.log e2e-serve.attempt1.log 2>/dev/null || true
+          run_shard
 
       - name: Tear down e2e stack
         if: always()
-        env:
-          SERVE_PID: ${{ steps.e2e.outputs.serve_pid }}
         run: |
-          if [ -n "${SERVE_PID:-}" ]; then
+          SERVE_PID="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"
+          if [ -n "$SERVE_PID" ]; then
             kill -TERM -- -"$SERVE_PID" 2>/dev/null || true
             sleep 2
             kill -KILL -- -"$SERVE_PID" 2>/dev/null || true
@@ -389,6 +472,6 @@ jobs:
           path: |
             playwright-report/
             test-results/
-            e2e-serve.log
+            e2e-serve*.log
           retention-days: 7
           if-no-files-found: ignore
