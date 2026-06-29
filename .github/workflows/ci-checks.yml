@@ -320,17 +320,25 @@ jobs:
       # (a zone that booted but serves 5xx is caught here, before the tests, with
       # a precise `::error::zone <x> …`), in its own process group (BUILD=0
       # RESEED=0 — build + seed came from the restored artifacts). Then run THIS
-      # shard's Playwright slice against the reported
-      # port. If the run fails AND the serve process has died (a Mode-B mid-run
-      # workerd crash → ECONNREFUSED cascade that Playwright's own retries can't
-      # recover from, since the server is gone), reboot the stack once and
-      # re-run the shard. A genuine test failure (stack still alive) is NOT
-      # retried — we never mask real red.
+      # shard's Playwright slice against the reported port. Reboot the stack and
+      # re-run the shard ONCE on an INFRA failure — the boot failed (a crashed /
+      # SQLITE_BUSY-locked zone) OR the tests failed because the serve process
+      # died mid-run (a workerd crash → ECONNREFUSED cascade Playwright's own
+      # retries can't recover, since the server is gone). A test failure with the
+      # stack still ALIVE is genuine red — never retried, so we don't mask it.
       - name: Boot e2e stack + run Playwright shard ${{ matrix.shard }}/${{ needs.e2e-setup.outputs.total }}
         env:
           PLAYWRIGHT_NO_WEB_SERVER: '1'
           SHARD: ${{ matrix.shard }}
           TOTAL: ${{ needs.e2e-setup.outputs.total }}
+          # The e2e base URL stays `localhost` (design-system specs hardcode
+          # `domain: localhost` theme cookies, see scripts/e2e-run.sh). On the CI
+          # runner Node resolves `localhost` to IPv6 `::1` first, but wrangler dev
+          # listens on IPv4 only → Playwright's Node `request` fixture got
+          # `connect ECONNREFUSED ::1:<port>`. Force IPv4-first resolution so
+          # `localhost` connects to 127.0.0.1 where the worker actually listens,
+          # without changing the cookie domain.
+          NODE_OPTIONS: --dns-result-order=ipv4first
         run: |
           set -uo pipefail
           # Backward-compat: PRs branched before this change don't ship
@@ -367,28 +375,34 @@ jobs:
             [ -n "$p" ] || return 0
             kill -TERM -- -"$p" 2>/dev/null || true; sleep 2; kill -KILL -- -"$p" 2>/dev/null || true
           }
-          run_shard() {
-            bash scripts/ci-boot-e2e.sh || return 1
+          # One attempt = boot the stack, then run this shard's slice. A boot
+          # failure returns the sentinel 70 (an INFRA failure — a crashed/locked
+          # zone, e.g. SENTRY_DO SQLITE_BUSY) so it's distinguishable from a
+          # Playwright test failure (small exit codes). The helper already tears
+          # its own stack down on boot failure.
+          attempt() {
+            bash scripts/ci-boot-e2e.sh || return 70
             PLAYWRIGHT_BASE_URL="http://localhost:$(cat .wrangler/e2e-port)" \
               pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL"
           }
-          # Capture run_shard's real exit code directly — do NOT use
-          # `if run_shard; then exit 0; fi; status=$?`, since a bash `if` with a
-          # false condition and no else returns 0, which would mask a genuine
-          # first-attempt failure as success.
-          run_shard
-          status=$?
-          [ "$status" -eq 0 ] && exit 0
-          if serve_alive; then
+          attempt
+          rc=$?
+          [ "$rc" -eq 0 ] && exit 0
+          # Reboot+retry ONCE for an infra failure: boot failed (rc=70), OR the
+          # tests failed AND the serve process died mid-run (a workerd crash →
+          # ECONNREFUSED cascade Playwright's own retries can't recover). A test
+          # failure with the stack STILL ALIVE is genuine red — never retried, so
+          # we don't mask real failures.
+          if [ "$rc" -ne 70 ] && serve_alive; then
             echo "::error::shard $SHARD/$TOTAL failed with the stack still alive — a genuine test failure, not retrying"
             teardown_serve
-            exit "$status"
+            exit "$rc"
           fi
-          echo "::warning::e2e stack died mid-run (likely a workerd crash) — rebooting and re-running shard $SHARD/$TOTAL once"
+          echo "::warning::infra failure on shard $SHARD/$TOTAL (rc=$rc) — rebooting the stack and re-running this shard once"
           teardown_serve
           # Keep the first attempt's boot log for the failure upload.
           mv e2e-serve.log e2e-serve.attempt1.log 2>/dev/null || true
-          run_shard
+          attempt
 
       - name: Tear down e2e stack
         if: always()
