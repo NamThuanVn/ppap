@@ -253,8 +253,13 @@ jobs:
   # PLAYWRIGHT_NO_WEB_SERVER=1 so Playwright doesn't spawn its own server. Because
   # build + seed already ran in parallel upstream, the per-shard boot is just the
   # wrangler cold start.
-  # `fail-fast: false` so one flaky shard doesn't mask failures elsewhere — the
-  # aggregated `jobs.e2e.result` still flips to `failure` if any shard fails.
+  # `fail-fast: true`: the first shard to hard-fail cancels the others so the
+  # run stops fast instead of grinding through all shards (paired with
+  # Playwright `maxFailures: 1`, which stops a shard at its first hard failure).
+  # Flaky tests pass on retry and never hard-fail, so this does NOT cancel on a
+  # flaky retry — only a genuine failure. The aggregated `jobs.e2e.result` still
+  # flips to `failure` if any shard fails. Trade-off vs the old `false`: you see
+  # one failure at a time (fix, re-run) rather than the full failure set at once.
   e2e:
     name: 1 · CI · E2E (shard ${{ matrix.shard }})
     needs: [e2e-setup, e2e-build-zones, e2e-seed]
