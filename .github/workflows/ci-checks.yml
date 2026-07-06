@@ -15,7 +15,7 @@ on:
       e2e_shards:
         description: 'Number of parallel Playwright shards. Tune up/down here; both PR CI and the deploy gate inherit it.'
         type: number
-        default: 6
+        default: 12
       run_e2e:
         description: 'Whether to run the e2e matrix. PR CI keeps the default (true); the deploy gate passes false so staging/production builds are not blocked on dashboard e2e.'
         type: boolean
