@@ -1,7 +1,7 @@
 name: CI · PR · Lint · Typecheck · Test · E2E
 
 # PR CI entrypoint. Triggered cross-repo by erp-namthuan/.github/workflows/
-# ci-pr-dispatch.yml via repository_dispatch[ci]; workflow_dispatch is the
+# pr-triage-and-ci-dispatch.yml via repository_dispatch[ci]; workflow_dispatch is the
 # manual re-run escape hatch. The actual job graph (biome / typecheck /
 # lint / test / e2e-shards) lives in ci-checks.yml (reusable workflow_call)
 # — this file just wires that graph to the PR-CI trigger surface and pings
@@ -100,7 +100,7 @@ jobs:
       PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
 
   # Posts the final commit-status update on the PR's head SHA, replacing the
-  # `pending` status that ci-pr-dispatch.yml created. `if: !cancelled()` so
+  # `pending` status that pr-triage-and-ci-dispatch.yml created. `if: !cancelled()` so
   # failures still get a final pingback, but runs cancelled by concurrency
   # (superseded by a newer push — expected, not an error) stay silent: the
   # superseding run re-posts a fresh pending status and delivers the real
