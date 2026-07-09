@@ -20,6 +20,10 @@ on:
         description: 'Whether to run the e2e matrix. PR CI keeps the default (true); the deploy gate passes false so staging/production builds are not blocked on dashboard e2e.'
         type: boolean
         default: true
+      e2e_changed_only:
+        description: 'Scope e2e to the changed service''s specs (broad/shared change → full suite, nothing relevant → skip). PR CI passes true; the production deploy gate leaves the default false → full suite. See scripts/e2e-plan.sh.'
+        type: boolean
+        default: false
     outputs:
       biome:
         description: 'Result of the biome job'
@@ -34,8 +38,8 @@ on:
         description: 'Result of the test job'
         value: ${{ jobs.test.result }}
       e2e:
-        description: 'Aggregated result of the e2e matrix (success only when all shards pass)'
-        value: ${{ jobs.e2e.result }}
+        description: 'Aggregated e2e result: success when all shards pass OR when a change-scoped run had nothing relevant to test (skip); failure if any shard failed.'
+        value: ${{ jobs.e2e-aggregate.outputs.result }}
     secrets:
       PAT_TOKEN:
         required: true
@@ -115,27 +119,69 @@ jobs:
 
       - run: pnpm test:ci
 
-  # Fans the integer `e2e_shards` input into a JSON array (`[1,2,...,N]`) so
-  # the e2e matrix below can consume it via fromJSON. GitHub Actions has no
-  # native "shard 1..N from a number" matrix syntax. Outputs both the array
-  # and the total so the playwright --shard=N/TOTAL flag stays in sync.
-  e2e-setup:
-    name: 1 · CI · E2E (plan shards)
+  # Plan the e2e run. Two responsibilities:
+  #   1. Decide SCOPE — when e2e_changed_only is true (PR CI), diff the PR
+  #      (HEAD^1..HEAD on refs/pull/N/merge) through scripts/e2e-plan.sh:
+  #      full | scoped <specs> | skip. Otherwise (deploy gate) → full.
+  #   2. Fan the effective shard count into a JSON array (`[1,2,...,N]`) for the
+  #      matrix via fromJSON — full → e2e_shards shards; scoped → 1 shard (a
+  #      handful of specs doesn't need 12 stacks); skip → empty (matrix no-op).
+  # Pure git + jq + bash (no pnpm install). `run` is 'true' unless mode==skip.
+  e2e-plan:
+    name: 1 · CI · E2E (plan)
     if: ${{ inputs.run_e2e }}
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 5
     outputs:
-      shards: ${{ steps.gen.outputs.shards }}
-      total: ${{ steps.gen.outputs.total }}
+      run: ${{ steps.plan.outputs.run }}
+      mode: ${{ steps.plan.outputs.mode }}
+      targets: ${{ steps.plan.outputs.targets }}
+      shards: ${{ steps.plan.outputs.shards }}
+      total: ${{ steps.plan.outputs.total }}
     steps:
-      - id: gen
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          # Full history so HEAD^1 (the PR's base parent on the merge ref) is
+          # available for the diff.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: plan
         env:
+          CHANGED_ONLY: ${{ inputs.e2e_changed_only }}
           TOTAL: ${{ inputs.e2e_shards }}
         run: |
           set -euo pipefail
-          SHARDS=$(seq 1 "$TOTAL" | jq -R 'tonumber' | jq -cs '.')
-          echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
-          echo "total=$TOTAL"  >> "$GITHUB_OUTPUT"
+          MODE=full
+          TARGETS=""
+          if [ "$CHANGED_ONLY" = "true" ]; then
+            # HEAD^1 on refs/pull/N/merge = the base (main); the diff to HEAD is
+            # exactly the PR's delta.
+            DECISION="$(E2E_PLAN_BASE=HEAD^1 bash scripts/e2e-plan.sh)"
+            MODE="${DECISION%% *}"
+            TARGETS="${DECISION#"$MODE"}"; TARGETS="${TARGETS# }"
+          fi
+          case "$MODE" in
+            skip)
+              echo "run=false"  >> "$GITHUB_OUTPUT"
+              echo "shards=[]"  >> "$GITHUB_OUTPUT"
+              echo "total=0"    >> "$GITHUB_OUTPUT" ;;
+            scoped)
+              echo "run=true"   >> "$GITHUB_OUTPUT"
+              echo "shards=[1]" >> "$GITHUB_OUTPUT"
+              echo "total=1"    >> "$GITHUB_OUTPUT" ;;
+            *)
+              SHARDS=$(seq 1 "$TOTAL" | jq -R 'tonumber' | jq -cs '.')
+              echo "run=true"       >> "$GITHUB_OUTPUT"
+              echo "shards=$SHARDS"  >> "$GITHUB_OUTPUT"
+              echo "total=$TOTAL"    >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "mode=$MODE"       >> "$GITHUB_OUTPUT"
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          echo "▶ e2e plan: mode=$MODE targets=[$TARGETS]" >&2
 
   # Build each dashboard zone on its OWN runner, in parallel. The 6 OpenNext
   # zones are fully independent (no cross-zone deps; dashboard-shell exports raw
@@ -147,7 +193,10 @@ jobs:
   # doesn't mask the others. Free on public-repo minutes — fan out wide.
   e2e-build-zones:
     name: 1 · CI · E2E (build ${{ matrix.zone.name }})
-    if: ${{ inputs.run_e2e }}
+    needs: e2e-plan
+    # Skipped when the plan says nothing e2e-relevant changed. A scoped run still
+    # builds ALL zones — the e2e stack boots the whole multi-zone router.
+    if: ${{ inputs.run_e2e && needs.e2e-plan.outputs.run == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -217,7 +266,8 @@ jobs:
   # is preserved without snapshotting.
   e2e-seed:
     name: 1 · CI · E2E (seed db)
-    if: ${{ inputs.run_e2e }}
+    needs: e2e-plan
+    if: ${{ inputs.run_e2e && needs.e2e-plan.outputs.run == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -262,14 +312,14 @@ jobs:
   # one failure at a time (fix, re-run) rather than the full failure set at once.
   e2e:
     name: 1 · CI · E2E (shard ${{ matrix.shard }})
-    needs: [e2e-setup, e2e-build-zones, e2e-seed]
-    if: ${{ inputs.run_e2e }}
+    needs: [e2e-plan, e2e-build-zones, e2e-seed]
+    if: ${{ inputs.run_e2e && needs.e2e-plan.outputs.run == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: true
       matrix:
-        shard: ${{ fromJSON(needs.e2e-setup.outputs.shards) }}
+        shard: ${{ fromJSON(needs.e2e-plan.outputs.shards) }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -331,11 +381,14 @@ jobs:
       # died mid-run (a workerd crash → ECONNREFUSED cascade Playwright's own
       # retries can't recover, since the server is gone). A test failure with the
       # stack still ALIVE is genuine red — never retried, so we don't mask it.
-      - name: Boot e2e stack + run Playwright shard ${{ matrix.shard }}/${{ needs.e2e-setup.outputs.total }}
+      - name: Boot e2e stack + run Playwright shard ${{ matrix.shard }}/${{ needs.e2e-plan.outputs.total }}
         env:
           PLAYWRIGHT_NO_WEB_SERVER: '1'
           SHARD: ${{ matrix.shard }}
-          TOTAL: ${{ needs.e2e-setup.outputs.total }}
+          TOTAL: ${{ needs.e2e-plan.outputs.total }}
+          # Space-separated spec paths on a change-scoped run; empty on a full
+          # run (Playwright then runs every spec). Word-split intentionally.
+          E2E_TARGETS: ${{ needs.e2e-plan.outputs.targets }}
           # The e2e base URL stays `localhost` (design-system specs hardcode
           # `domain: localhost` theme cookies, see scripts/e2e-run.sh). On the CI
           # runner Node resolves `localhost` to IPv6 `::1` first, but wrangler dev
@@ -371,7 +424,8 @@ jobs:
               sleep 1
             done
             [ "$ready" = 1 ] || { echo "::error::Timed out waiting for /api/health"; tail -n 80 e2e-serve.log; exit 1; }
-            PLAYWRIGHT_BASE_URL="http://localhost:$PORT" pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL"
+            # shellcheck disable=SC2086  # E2E_TARGETS is an intentional path list
+            PLAYWRIGHT_BASE_URL="http://localhost:$PORT" pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL" $E2E_TARGETS
             exit $?
           fi
           serve_alive() { local p; p="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
@@ -387,8 +441,9 @@ jobs:
           # its own stack down on boot failure.
           attempt() {
             bash scripts/ci-boot-e2e.sh || return 70
+            # shellcheck disable=SC2086  # E2E_TARGETS is an intentional path list
             PLAYWRIGHT_BASE_URL="http://localhost:$(cat .wrangler/e2e-port)" \
-              pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL"
+              pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL" $E2E_TARGETS
           }
           attempt
           rc=$?
@@ -430,3 +485,38 @@ jobs:
             e2e-serve*.log
           retention-days: 7
           if-no-files-found: ignore
+
+  # Collapse the sharded e2e matrix into the single `e2e` workflow output the
+  # callers consume. Load-bearing for the change-scoped path: when the plan says
+  # `skip` (nothing e2e-relevant changed), the e2e matrix is SKIPPED — but a
+  # skipped job reports `skipped`, and ci-pr.yml's report flips CI red on
+  # anything other than `success`. Mapping skip → success keeps that contract
+  # intact. Runs always() so it reports even when the matrix skipped/failed.
+  e2e-aggregate:
+    name: 1 · CI · E2E (result)
+    needs: [e2e-plan, e2e]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      result: ${{ steps.agg.outputs.result }}
+    steps:
+      - id: agg
+        env:
+          PLAN_RESULT: ${{ needs.e2e-plan.result }}
+          PLAN_RUN: ${{ needs.e2e-plan.outputs.run }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+        run: |
+          set -euo pipefail
+          if [ "$PLAN_RESULT" = "skipped" ]; then
+            # e2e disabled for this caller (run_e2e=false) — mirror the old
+            # `jobs.e2e.result` (skipped) so nothing downstream changes.
+            RESULT=skipped
+          elif [ "$PLAN_RUN" != "true" ]; then
+            # Change-scoped plan found nothing e2e-relevant → treat as pass.
+            RESULT=success
+          else
+            RESULT="$E2E_RESULT"
+          fi
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+          echo "▶ e2e aggregate: plan=$PLAN_RESULT run=$PLAN_RUN e2e=$E2E_RESULT → $RESULT" >&2

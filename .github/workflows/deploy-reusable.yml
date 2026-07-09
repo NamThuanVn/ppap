@@ -82,6 +82,16 @@ on:
         type: boolean
         required: false
         default: true
+      deploy_only_changed:
+        description: 'Build & deploy only the workers/zones that changed between base_sha and checkout_ref. Staging passes true; production leaves the default false (full deploy for a deterministic release baseline). A cross-cutting/shared change or a missing base_sha falls back to a full deploy regardless — see .github/scripts/compute-deploy-targets.sh.'
+        type: boolean
+        required: false
+        default: false
+      base_sha:
+        description: 'Previous main tip (github.event.before) to diff against when deploy_only_changed is true. Empty (manual dispatch) → full deploy.'
+        type: string
+        required: false
+        default: ''
     secrets:
       TF_API_TOKEN:
         required: true
@@ -103,7 +113,43 @@ env:
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
-  # 0. CI gate. Runs biome / typecheck / lint / vitest in parallel against
+  # 0. Plan the deploy scope. Staging passes deploy_only_changed=true + base_sha
+  #    (previous main tip); this job diffs base_sha..checkout_ref and emits the
+  #    changed subset of workers + zones. Production (deploy_only_changed=false),
+  #    a cross-cutting/shared-package change, or a missing/unreachable base_sha
+  #    all fall back to the FULL canonical lists — so the build matrices + deploy
+  #    tiers behave exactly as before. Pure git + bash (no install); runs in
+  #    parallel with the CI gate. See .github/scripts/compute-deploy-targets.sh.
+  # ───────────────────────────────────────────────────────────────────────────
+  changes:
+    name: 0 · Plan · changed workers + zones
+    runs-on: ubuntu-latest
+    outputs:
+      workers: ${{ steps.plan.outputs.workers }}
+      zones: ${{ steps.plan.outputs.zones }}
+      workers_list: ${{ steps.plan.outputs.workers_list }}
+      zones_list: ${{ steps.plan.outputs.zones_list }}
+      deploy_dispatcher: ${{ steps.plan.outputs.deploy_dispatcher }}
+      deploy_all: ${{ steps.plan.outputs.deploy_all }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          # Full history so base_sha (an ancestor on main) is reachable for the diff.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compute deploy targets
+        id: plan
+        env:
+          DEPLOY_ONLY_CHANGED: ${{ inputs.deploy_only_changed }}
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: .github/scripts/compute-deploy-targets.sh
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 1. CI gate. Runs biome / typecheck / lint / vitest in parallel against
   #    the deploy ref BEFORE any infra touches Cloudflare or HCP. Lives in
   #    ppap (not the private repo) so deploys cost zero billed minutes —
   #    same reusable workflow PR-CI uses, just with a different ref.
@@ -245,16 +291,19 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   build-workers:
     name: 3 · Build · ${{ matrix.service }} (worker bundle)
-    needs: terraform-apply
-    # See deploy job below — tolerate the skipped ci-gate in the transitive closure.
-    if: ${{ !cancelled() && !failure() }}
+    needs: [terraform-apply, changes]
+    # See deploy job below — tolerate the skipped ci-gate in the transitive
+    # closure. Skip entirely when no worker changed (empty selection).
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.workers != '[]' }}
     runs-on: ubuntu-latest
     strategy:
       # One worker failing to bundle must not abort the others — the deploy job
       # gates on the whole matrix, so a partial failure already blocks the deploy.
       fail-fast: false
       matrix:
-        service: [monitor, hris, expense, utilities, exms, oms, sourcing, bom, quotation, procurement, notifications, auth, assistant, files, orchestrator, aggregator, gateway]
+        # The changed subset (full canonical list on a full/production deploy) —
+        # computed by the `changes` job. See compute-deploy-targets.sh.
+        service: ${{ fromJSON(needs.changes.outputs.workers) }}
 
     steps:
       - uses: actions/checkout@v6
@@ -309,23 +358,15 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   build-zones:
     name: 4 · Build · ${{ matrix.zone.name }} (Next.js zone)
-    needs: terraform-apply
-    if: ${{ !cancelled() && !failure() }}
+    needs: [terraform-apply, changes]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.zones != '[]' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        zone:
-          - { name: shell, pkg: '@namthuanvn/shell' }
-          - { name: expense, pkg: '@namthuanvn/zone-expense' }
-          - { name: exms, pkg: '@namthuanvn/zone-exms' }
-          - { name: oms, pkg: '@namthuanvn/zone-oms' }
-          - { name: sourcing, pkg: '@namthuanvn/zone-sourcing' }
-          - { name: bom, pkg: '@namthuanvn/zone-bom' }
-          - { name: quotation, pkg: '@namthuanvn/zone-quotation' }
-          - { name: procurement, pkg: '@namthuanvn/zone-procurement' }
-          - { name: hris, pkg: '@namthuanvn/zone-hris' }
-          - { name: utilities, pkg: '@namthuanvn/zone-utilities' }
+        # The changed zone subset ({name,pkg} objects; full canonical list on a
+        # full/production deploy) — computed by the `changes` job.
+        zone: ${{ fromJSON(needs.changes.outputs.zones) }}
 
     steps:
       - uses: actions/checkout@v6
@@ -430,7 +471,7 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   deploy:
     name: 5 · Deploy · all workers + zones (ordered)
-    needs: [terraform-apply, build-workers, build-zones]
+    needs: [changes, terraform-apply, build-workers, build-zones]
     # The implicit `success()` check spans the whole transitive `needs` closure,
     # which includes the (skipped-on-staging) ci-gate — so a skipped gate would
     # skip this job too. `!cancelled() && !failure()` runs on success-OR-skipped
@@ -467,20 +508,26 @@ jobs:
           merge-multiple: true
           path: /tmp/bundles
 
+      # Tolerate zero artifacts: a selective deploy that only touched, say, the
+      # dispatcher builds no worker/zone bundle, so /tmp/bundles is empty.
       - name: Unpack prebuilt bundles
-        run: for t in /tmp/bundles/*.tar; do tar -xf "$t"; done
+        run: |
+          shopt -s nullglob
+          for t in /tmp/bundles/*.tar; do tar -xf "$t"; done
 
-      # Resolve config for every API worker (substitutes binding IDs into each
-      # apis/<svc>/wrangler.jsonc) AND export the shared Cloudflare credentials
-      # to $GITHUB_ENV for the deploy + migration steps. `dashboard` is a
+      # Resolve config for each SELECTED API worker (substitutes binding IDs into
+      # apis/<svc>/wrangler.jsonc) AND export the shared Cloudflare credentials to
+      # $GITHUB_ENV for the deploy + migration steps. `dashboard` is a
       # credentials-only pass (zones/dispatcher carry no Terraform-owned
-      # resources) — it just guarantees the creds are loaded.
+      # resources) — always included so the creds are loaded even when no worker
+      # changed. WORKERS is the changed subset (full list on a full deploy).
       - name: Resolve wrangler bindings + credentials
         env:
           TF_OUTPUTS_JSON: /tmp/tf-outputs.json
+          WORKERS: ${{ needs.changes.outputs.workers_list }}
         run: |
           set -euo pipefail
-          for svc in monitor hris expense utilities exms oms sourcing bom quotation procurement notifications auth assistant files orchestrator aggregator gateway dashboard; do
+          for svc in $WORKERS dashboard; do
             .github/scripts/resolve-wrangler-bindings.sh "$svc" ${{ inputs.environment }}
           done
 
@@ -494,8 +541,10 @@ jobs:
       # `cloudflare_vectorize_index` (added in v5). Idempotent: first run creates
       # the index + metadata indexes, later runs are no-ops. Must precede the
       # assistant deploy (its binding references the index).
-      # See `.claude/infrastructure.md` § Vectorize bootstrap.
+      # See `.claude/infrastructure.md` § Vectorize bootstrap. Only needed when
+      # the assistant leaf is being (re)deployed — its binding references the index.
       - name: Bootstrap Vectorize index (idempotent)
+        if: ${{ contains(fromJSON(needs.changes.outputs.workers), 'assistant') }}
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
@@ -514,6 +563,7 @@ jobs:
 
       # ── Tier order ────────────────────────────────────────────────────────
       - name: Deploy monitor (tail logs)
+        if: ${{ contains(fromJSON(needs.changes.outputs.workers), 'monitor') }}
         run: pnpm --filter @namthuanvn/monitor exec wrangler deploy dist/index.js --no-bundle --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
 
       # Leaves (tier 1) — independent of one another, so deploy concurrently.
@@ -521,11 +571,16 @@ jobs:
       # upload the prebuilt bundle. Per-service logs are grouped; any failure
       # fails the step.
       - name: Deploy leaves (tier 1)
+        env:
+          WORKERS: ${{ needs.changes.outputs.workers_list }}
         run: |
           set -uo pipefail
           SHA='${{ steps.sha.outputs.value }}'
           pids=""
+          # The hardcoded list fixes tier membership + order; each member deploys
+          # only if it's in the changed set (WORKERS). Empty set → deploys nothing.
           for svc in hris expense utilities exms oms sourcing bom quotation procurement notifications auth assistant files; do
+            case " $WORKERS " in *" $svc "*) ;; *) continue ;; esac
             (
               set -e
               pnpm --filter "@namthuanvn/$svc" --if-present db:migrate:remote
@@ -543,11 +598,14 @@ jobs:
 
       # Tier 1.5 — orchestrator/aggregator service-bind to the leaves above.
       - name: Deploy composers (tier 1.5)
+        env:
+          WORKERS: ${{ needs.changes.outputs.workers_list }}
         run: |
           set -uo pipefail
           SHA='${{ steps.sha.outputs.value }}'
           pids=""
           for svc in orchestrator aggregator; do
+            case " $WORKERS " in *" $svc "*) ;; *) continue ;; esac
             (
               set -e
               pnpm --filter "@namthuanvn/$svc" --if-present db:migrate:remote
@@ -564,8 +622,11 @@ jobs:
           exit "$fail"
 
       # Gateway — service-binds to every worker; uses --env (env-specific name +
-      # routes live in its wrangler.jsonc env block).
+      # routes live in its wrangler.jsonc env block). Bindings resolve by worker
+      # NAME, so an unchanged gateway keeps routing to a redeployed leaf — it
+      # only redeploys when its own package changed.
       - name: Deploy gateway (router)
+        if: ${{ contains(fromJSON(needs.changes.outputs.workers), 'gateway') }}
         run: pnpm --filter @namthuanvn/gateway exec wrangler deploy --env ${{ inputs.environment }} dist/index.js --no-bundle --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
 
       # Zones — each service-binds to gateway; deploy the prebuilt .open-next via
@@ -573,12 +634,16 @@ jobs:
       # SENTRY_DSN is a runtime var for the zone's @sentry/cloudflare worker wrap
       # (apps/<zone>/worker.ts); empty in envs without a DSN → Sentry disabled.
       - name: Deploy zones (Next.js)
+        env:
+          ZONES: ${{ needs.changes.outputs.zones_list }}
         run: |
           set -uo pipefail
           DSN='${{ steps.sentry.outputs.dsn }}'
           SUFFIX='${{ inputs.deploy_script_suffix }}'
           pids=""
-          for entry in shell:@namthuanvn/shell expense:@namthuanvn/zone-expense exms:@namthuanvn/zone-exms oms:@namthuanvn/zone-oms sourcing:@namthuanvn/zone-sourcing bom:@namthuanvn/zone-bom quotation:@namthuanvn/zone-quotation procurement:@namthuanvn/zone-procurement hris:@namthuanvn/zone-hris utilities:@namthuanvn/zone-utilities; do
+          # ZONES is the changed subset as "name:pkg" pairs (full list on a full
+          # deploy). Empty → deploys no zone.
+          for entry in $ZONES; do
             name=${entry%%:*}; pkg=${entry##*:}
             ( pnpm --filter "$pkg" run "deploy$SUFFIX" -- --var "SENTRY_DSN:$DSN" ) > "/tmp/zone-$name.log" 2>&1 &
             pids="$pids $!:$name"
@@ -597,7 +662,10 @@ jobs:
       # zone workers, which must already exist (Cloudflare error 10143). No
       # Next.js build — it bundles inline at deploy. SENTRY_DSN is its only
       # runtime var (its worker wraps `withSentry` with a dispatcher service tag).
+      # Redeploys only when its own package changed (its bindings resolve the
+      # gateway + zones by NAME, so unchanged targets stay valid).
       - name: Deploy dispatcher (apex ingress)
+        if: ${{ needs.changes.outputs.deploy_dispatcher == 'true' }}
         run: pnpm --filter @namthuanvn/dispatcher run deploy${{ inputs.deploy_script_suffix }} -- --var "SENTRY_DSN:${{ steps.sentry.outputs.dsn }}" --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
 
   # ───────────────────────────────────────────────────────────────────────────
