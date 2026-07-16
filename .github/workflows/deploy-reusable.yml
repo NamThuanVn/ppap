@@ -141,11 +141,49 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Baseline for the change-diff = the last commit that SUCCESSFULLY deployed
+      # to this environment, not the previous push tip. A deploy that was
+      # cancelled (superseded by a newer merge) or failed never advances the
+      # baseline, so its files reappear in the next run's diff window and are
+      # re-deployed — no more main↔staging drift when back-to-back merges cancel
+      # an in-flight change-scoped deploy. Only meaningful for change-scoped
+      # (staging) runs; production is full-deploy and ignores base_sha.
+      - name: Resolve baseline = last successful deploy
+        id: baseline
+        if: inputs.deploy_only_changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          PRIVATE_REPO: ${{ env.PRIVATE_REPO }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          # Deployments list is newest-first. The current run's own Deployment is
+          # still `pending`, and a cancelled/failed prior deploy's latest status
+          # is not `success`, so both are skipped. GitHub auto-inactivates OLDER
+          # successes only once a NEWER success lands, so the first success we hit
+          # walking newest-first is the true last-good deploy.
+          BASE=""
+          for id in $(gh api "repos/$PRIVATE_REPO/deployments?environment=$ENVIRONMENT&per_page=30" --jq '.[].id'); do
+            state=$(gh api "repos/$PRIVATE_REPO/deployments/$id/statuses?per_page=1" --jq '.[0].state // empty')
+            if [ "$state" = "success" ]; then
+              BASE=$(gh api "repos/$PRIVATE_REPO/deployments/$id" --jq '.sha')
+              break
+            fi
+          done
+          if [ -n "$BASE" ]; then
+            echo "✓ baseline = last successful $ENVIRONMENT deploy: $BASE"
+          else
+            echo "no prior successful $ENVIRONMENT deploy — falling back to base_sha / full deploy"
+          fi
+          echo "base_sha=$BASE" >> "$GITHUB_OUTPUT"
+
       - name: Compute deploy targets
         id: plan
         env:
           DEPLOY_ONLY_CHANGED: ${{ inputs.deploy_only_changed }}
-          BASE_SHA: ${{ inputs.base_sha }}
+          # Prefer the last-successful-deploy baseline; fall back to the payload's
+          # previous-push tip (and compute-deploy-targets.sh full-deploys if empty).
+          BASE_SHA: ${{ steps.baseline.outputs.base_sha || inputs.base_sha }}
         run: .github/scripts/compute-deploy-targets.sh
 
   # ───────────────────────────────────────────────────────────────────────────
