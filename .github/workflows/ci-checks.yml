@@ -520,3 +520,77 @@ jobs:
           fi
           echo "result=$RESULT" >> "$GITHUB_OUTPUT"
           echo "▶ e2e aggregate: plan=$PLAN_RESULT run=$PLAN_RUN e2e=$E2E_RESULT → $RESULT" >&2
+
+  # Precompute the "green-but-noisy" signals ONCE, server-side, into a tiny
+  # `ci-noise-report` artifact so /watch-ci and /fix-ci read ONE small file
+  # instead of downloading every e2e shard log over the network. It captures the
+  # exact four masks a green run hides (see .claude/commands/fix-ci.md): flaky
+  # retries, report-only dup-testid / hydration-error annotations, biome
+  # warnings, and vitest stderr — same signals, a fraction of the client's time.
+  #
+  # SAFE BY CONSTRUCTION: this job only READS this run's own job logs (default
+  # GITHUB_TOKEN, actions:read via the workflow's read-all) and ALWAYS exits 0,
+  # so it can never change the pass/fail the caller's `report` job posts (that
+  # status is computed only from the biome/typecheck/lint/test/e2e outputs
+  # above — this job is not one of them). If it errors or the artifact is
+  # absent (e.g. a PR whose CI predates this job), the client falls back to its
+  # own per-shard log grep. Because it `needs` the check jobs, the artifact is
+  # ready by the time the CI status flips green.
+  noise-report:
+    name: 1 · CI · Noise report
+    needs: [biome, test, e2e-aggregate]
+    # PR CI only (run_e2e=true) — the deploy gate (run_e2e=false) has no
+    # /watch-ci consumer, so keep this off the deploy critical path entirely.
+    if: ${{ always() && inputs.run_e2e }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Scan this run's logs for noise
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          tmp="$(mktemp -d)"
+          : > "$tmp/e2e.log"; : > "$tmp/biome.log"; : > "$tmp/test.log"
+          # Map every job in THIS run to (id, name); pull each relevant job's log
+          # once. Job names carry the reusable-workflow prefix ("checks / 1 · CI
+          # · E2E (shard 3)") — substring match still finds them.
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" --paginate \
+            --jq '.jobs[]? | [(.id|tostring), .name] | @tsv' 2>/dev/null \
+            | while IFS="$(printf '\t')" read -r id name; do
+                [ -n "$id" ] || continue
+                case "$name" in
+                  *"E2E (shard"*)  dest="$tmp/e2e.log" ;;
+                  *"Biome"*)       dest="$tmp/biome.log" ;;
+                  *"Unit tests"*)  dest="$tmp/test.log" ;;
+                  *)               continue ;;
+                esac
+                gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${id}/logs" 2>/dev/null \
+                  | sed -E 's/\x1b\[[0-9;]*m//g' >> "$dest" || true
+              done
+          # grep -c already prints the count (0 on no match) — `|| true` only
+          # swallows its exit-1-on-zero, never adds a second line.
+          num() { grep -oiE "$1" "$2" 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}'; }
+          cnt() { grep -acE "$1" "$2" 2>/dev/null || true; }
+          flaky=$(num '([0-9]+) flaky' "$tmp/e2e.log")
+          dup=$(cnt '\[dup-testid\]' "$tmp/e2e.log")
+          hyd=$(cnt '\[hydration-error\]' "$tmp/e2e.log")
+          biomew=$(num 'Found ([0-9]+) warning' "$tmp/biome.log")
+          vitest=$(cnt 'stderr \||not wrapped in act' "$tmp/test.log")
+          total=$(( ${flaky:-0} + ${dup:-0} + ${hyd:-0} + ${biomew:-0} + ${vitest:-0} ))
+          clean=true; [ "$total" -gt 0 ] && clean=false
+          mkdir -p ci-noise
+          printf '{"flaky":%s,"dup_testid":%s,"hydration":%s,"biome_warnings":%s,"vitest_stderr":%s,"clean":%s}\n' \
+            "${flaky:-0}" "${dup:-0}" "${hyd:-0}" "${biomew:-0}" "${vitest:-0}" "$clean" \
+            | tee ci-noise/ci-noise-report.json
+          exit 0
+
+      - name: Upload noise report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-noise-report
+          path: ci-noise/ci-noise-report.json
+          retention-days: 7
+          if-no-files-found: ignore
