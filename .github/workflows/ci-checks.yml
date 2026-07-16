@@ -40,6 +40,12 @@ on:
       e2e:
         description: 'Aggregated e2e result: success when all shards pass OR when a change-scoped run had nothing relevant to test (skip); failure if any shard failed.'
         value: ${{ jobs.e2e-aggregate.outputs.result }}
+      noise_clean:
+        description: '"true" when the run has zero flaky / dup-testid / hydration / biome-warning / vitest-stderr; "false" otherwise. Empty if the noise scan did not run.'
+        value: ${{ jobs.noise-report.outputs.clean }}
+      noise_summary:
+        description: 'Compact per-signal noise counts, e.g. "flaky 0 · dup 0 · hyd 0 · biome 1 · vitest 0".'
+        value: ${{ jobs.noise-report.outputs.summary }}
     secrets:
       PAT_TOKEN:
         required: true
@@ -529,13 +535,22 @@ jobs:
   # warnings, and vitest stderr — same signals, a fraction of the client's time.
   #
   # SAFE BY CONSTRUCTION: this job only READS this run's own job logs (default
-  # GITHUB_TOKEN, actions:read via the workflow's read-all) and ALWAYS exits 0,
-  # so it can never change the pass/fail the caller's `report` job posts (that
-  # status is computed only from the biome/typecheck/lint/test/e2e outputs
-  # above — this job is not one of them). If it errors or the artifact is
-  # absent (e.g. a PR whose CI predates this job), the client falls back to its
-  # own per-shard log grep. Because it `needs` the check jobs, the artifact is
-  # ready by the time the CI status flips green.
+  # GITHUB_TOKEN, actions:read via the workflow's read-all). It publishes:
+  #   • a tiny `ci-noise-report` artifact — /watch-ci and /fix-ci read ONE file
+  #     instead of downloading every shard log;
+  #   • `clean` + `summary` job outputs — ci-pr.yml's `report` job reads these to
+  #     gate the labeled auto-merge and to post the PR CI comment.
+  # `continue-on-error: true` PLUS `set +e` means it can NEVER red the run or
+  # affect the CI status the `report` job posts (that status is computed only
+  # from the biome/typecheck/lint/test/e2e outputs above). If it can't run or
+  # the artifact is absent (a PR whose CI predates this job), the client falls
+  # back to its own per-shard log grep and `report` treats noise as unknown
+  # (→ not clean → no auto-merge).
+  #
+  # NOTE: GitHub runs `run:` steps as `bash -e {0}` (errexit ON). The scan is a
+  # pipeline of greps that legitimately exit non-zero on "no match", so we MUST
+  # `set +e` — otherwise a zero-match grep aborts the step before the outputs /
+  # artifact are written (that was the original failure: run 29478177936).
   noise-report:
     name: 1 · CI · Noise report
     needs: [biome, test, e2e-aggregate]
@@ -544,13 +559,18 @@ jobs:
     if: ${{ always() && inputs.run_e2e }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
+    continue-on-error: true
+    outputs:
+      clean: ${{ steps.scan.outputs.clean }}
+      summary: ${{ steps.scan.outputs.summary }}
     steps:
       - name: Scan this run's logs for noise
+        id: scan
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail   # errexit OFF — zero-match greps below exit non-zero by design
           tmp="$(mktemp -d)"
           : > "$tmp/e2e.log"; : > "$tmp/biome.log"; : > "$tmp/test.log"
           # Map every job in THIS run to (id, name); pull each relevant job's log
@@ -567,23 +587,28 @@ jobs:
                   *)               continue ;;
                 esac
                 gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${id}/logs" 2>/dev/null \
-                  | sed -E 's/\x1b\[[0-9;]*m//g' >> "$dest" || true
+                  | sed -E 's/\x1b\[[0-9;]*m//g' >> "$dest"
               done
-          # grep -c already prints the count (0 on no match) — `|| true` only
-          # swallows its exit-1-on-zero, never adds a second line.
+          # grep exits non-zero on no-match; with errexit OFF that's fine — awk
+          # always prints a number, and grep -c always prints its count.
           num() { grep -oiE "$1" "$2" 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}'; }
-          cnt() { grep -acE "$1" "$2" 2>/dev/null || true; }
-          flaky=$(num '([0-9]+) flaky' "$tmp/e2e.log")
-          dup=$(cnt '\[dup-testid\]' "$tmp/e2e.log")
-          hyd=$(cnt '\[hydration-error\]' "$tmp/e2e.log")
-          biomew=$(num 'Found ([0-9]+) warning' "$tmp/biome.log")
-          vitest=$(cnt 'stderr \||not wrapped in act' "$tmp/test.log")
-          total=$(( ${flaky:-0} + ${dup:-0} + ${hyd:-0} + ${biomew:-0} + ${vitest:-0} ))
+          cnt() { grep -acE "$1" "$2" 2>/dev/null | head -1; }
+          flaky=$(num '([0-9]+) flaky' "$tmp/e2e.log"); flaky=${flaky:-0}
+          dup=$(cnt '\[dup-testid\]' "$tmp/e2e.log"); dup=${dup:-0}
+          hyd=$(cnt '\[hydration-error\]' "$tmp/e2e.log"); hyd=${hyd:-0}
+          biomew=$(num 'Found ([0-9]+) warning' "$tmp/biome.log"); biomew=${biomew:-0}
+          vitest=$(cnt 'stderr \||not wrapped in act' "$tmp/test.log"); vitest=${vitest:-0}
+          total=$(( flaky + dup + hyd + biomew + vitest ))
           clean=true; [ "$total" -gt 0 ] && clean=false
+          summary=$(printf 'flaky %s · dup %s · hyd %s · biome %s · vitest %s' "$flaky" "$dup" "$hyd" "$biomew" "$vitest")
+          {
+            echo "clean=$clean"
+            echo "summary=$summary"
+          } >> "$GITHUB_OUTPUT"
           mkdir -p ci-noise
           printf '{"flaky":%s,"dup_testid":%s,"hydration":%s,"biome_warnings":%s,"vitest_stderr":%s,"clean":%s}\n' \
-            "${flaky:-0}" "${dup:-0}" "${hyd:-0}" "${biomew:-0}" "${vitest:-0}" "$clean" \
-            | tee ci-noise/ci-noise-report.json
+            "$flaky" "$dup" "$hyd" "$biomew" "$vitest" "$clean" | tee ci-noise/ci-noise-report.json
+          echo "▶ noise: $summary → clean=$clean"
           exit 0
 
       - name: Upload noise report

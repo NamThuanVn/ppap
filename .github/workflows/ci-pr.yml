@@ -163,6 +163,87 @@ jobs:
             -f target_url="$RUN_URL"
           echo "✓ Updated CI status on $HEAD_SHA — $STATE ($DESC)"
 
+      # Post/refresh a sticky CI report comment on the source PR, and — for PRs
+      # labeled `auto-merge` — squash-merge them when CI is green AND noise-clean.
+      # Best-effort: `set +e` + `exit 0` so a comment/merge hiccup (or a PAT
+      # missing contents/PR write) never reds this job after the status posted.
+      # `/clear-todo-issue` adds the `auto-merge` label, so its PRs merge here on
+      # green+clean (which is also why its own classifier-blocked `gh pr merge`
+      # is no longer needed — CI lands the merge).
+      - name: Report to PR + auto-merge when labeled & clean
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
+          STATE: ${{ steps.status.outputs.state }}
+          NOISE_CLEAN: ${{ needs.checks.outputs.noise_clean }}
+          NOISE_SUMMARY: ${{ needs.checks.outputs.noise_summary }}
+          DESC: ${{ steps.status.outputs.desc }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e -o pipefail
+          [ -n "${PR_NUMBER:-}" ] || { echo "No PR number (manual dispatch?) — skipping PR report."; exit 0; }
+          REPO="${{ env.PRIVATE_REPO }}"
+          NOISE_SUMMARY="${NOISE_SUMMARY:-unknown (scan unavailable)}"
+          # PR metadata.
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > /tmp/pr.json 2>/dev/null
+          LABELS=$(jq -r '[.labels[].name] | join(",")' /tmp/pr.json 2>/dev/null)
+          DRAFT=$(jq -r '.draft // false' /tmp/pr.json 2>/dev/null)
+          MERGEABLE=$(jq -r '.mergeable // "null"' /tmp/pr.json 2>/dev/null)
+          MERGED=$(jq -r '.merged // false' /tmp/pr.json 2>/dev/null)
+          HAS_LABEL=false; case ",$LABELS," in *",auto-merge,"*) HAS_LABEL=true ;; esac
+
+          # Decide the auto-merge action + human-readable reason.
+          MERGE_LINE=""
+          if [ "$MERGED" = "true" ]; then
+            MERGE_LINE="✅ Already merged."
+          elif [ "$HAS_LABEL" != "true" ]; then
+            MERGE_LINE="ℹ️ Not auto-merged — add the \`auto-merge\` label to enable."
+          elif [ "$DRAFT" = "true" ]; then
+            MERGE_LINE="ℹ️ Draft — auto-merge skipped until marked ready."
+          elif [ "$STATE" != "success" ]; then
+            MERGE_LINE="⏸️ Labeled \`auto-merge\`, but **CI is not green** — not merged."
+          elif [ "$NOISE_CLEAN" != "true" ]; then
+            MERGE_LINE="⏸️ Labeled \`auto-merge\` and green, but **noise present** ($NOISE_SUMMARY) — not merged. Clear the noise to auto-merge."
+          elif [ "$MERGEABLE" = "false" ]; then
+            MERGE_LINE="⚠️ Labeled \`auto-merge\` and green+clean, but **has conflicts** — resolve before it can merge."
+          else
+            # Eligible: green + noise-clean + labeled + non-draft + mergeable (true/null).
+            if gh api -X PUT "repos/$REPO/pulls/$PR_NUMBER/merge" -f merge_method=squash >/tmp/merge.json 2>/tmp/merge.err; then
+              MERGE_LINE="✅ **Auto-merged (squash)** — labeled \`auto-merge\`, CI green, noise-clean."
+            else
+              MERGE_LINE="⚠️ Auto-merge attempt failed: $(tr -d '\n' </tmp/merge.err | sed 's/\"//g' | cut -c1-160). PR left green + ready."
+            fi
+          fi
+
+          # Sticky comment (upsert by hidden marker) — one comment per PR, refreshed each run.
+          BODY=$(cat <<EOF
+          <!-- ci-report -->
+          ## CI report — $( [ "$STATE" = "success" ] && echo "✅ green" || echo "❌ failing" )
+
+          $DESC
+
+          **Noise:** $NOISE_SUMMARY → $( [ "$NOISE_CLEAN" = "true" ] && echo "clean ✓" || echo "not clean ✗" )
+
+          $MERGE_LINE
+
+          [View CI run]($RUN_URL)
+          EOF
+          )
+          CID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq '[.[] | select(.body|startswith("<!-- ci-report -->"))][0].id' 2>/dev/null)
+          if [ -n "$CID" ] && [ "$CID" != "null" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$CID" -f body="$BODY" >/dev/null 2>&1 \
+              && echo "✓ Updated CI report comment on PR #$PR_NUMBER" \
+              || echo "::warning::could not update CI report comment (PAT missing issues:write?)"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$BODY" >/dev/null 2>&1 \
+              && echo "✓ Posted CI report comment on PR #$PR_NUMBER" \
+              || echo "::warning::could not post CI report comment (PAT missing issues:write?)"
+          fi
+          echo "▶ $MERGE_LINE"
+          exit 0
+
       # Failure-only Telegram alert to the build topic of the team supergroup
       # (same bot as the runtime error alerts; secrets live in this repo's
       # Actions secrets). Non-fatal: a Telegram outage must not flip the CI
