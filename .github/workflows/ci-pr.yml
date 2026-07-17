@@ -163,14 +163,17 @@ jobs:
             -f target_url="$RUN_URL"
           echo "✓ Updated CI status on $HEAD_SHA — $STATE ($DESC)"
 
-      # Post/refresh a sticky CI report comment on the source PR, and — for PRs
-      # labeled `auto-merge` — squash-merge them when CI is green AND noise-clean.
-      # Best-effort: `set +e` + `exit 0` so a comment/merge hiccup (or a PAT
-      # missing contents/PR write) never reds this job after the status posted.
-      # `/clear-todo-issue` adds the `auto-merge` label, so its PRs merge here on
-      # green+clean (which is also why its own classifier-blocked `gh pr merge`
-      # is no longer needed — CI lands the merge).
-      - name: Report to PR + auto-merge when labeled & clean
+      # Post/refresh a sticky CI report comment on the source PR; flip ANY draft
+      # ready-for-review once CI is green + noise-clean; and — for PRs labeled
+      # `auto-merge` — squash-merge them on the same green+clean bar. The auto-ready
+      # is unconditional (this is the single owner of draft → ready — the /ship,
+      # /ship-docs, /create-pull-request commands no longer flip it themselves); the
+      # merge is label-gated. Best-effort: `set +e` + `exit 0` so a comment/ready/merge
+      # hiccup (or a PAT missing contents/PR write) never reds this job after the
+      # status posted. `/clear-todo-issue` adds the `auto-merge` label, so its PRs
+      # merge here on green+clean (which is also why its own classifier-blocked
+      # `gh pr merge` is no longer needed — CI lands the merge).
+      - name: Report to PR + auto-ready + auto-merge when clean
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
@@ -193,12 +196,31 @@ jobs:
           MERGED=$(jq -r '.merged // false' /tmp/pr.json 2>/dev/null)
           HAS_LABEL=false; case ",$LABELS," in *",auto-merge,"*) HAS_LABEL=true ;; esac
 
-          # Decide the auto-merge action + human-readable reason. A DRAFT PR that
-          # carries the `auto-merge` label is FLIPPED READY here (then merged) once
-          # it is green + clean: the draft state keeps the merge button disabled
-          # while Claude is still driving CI (so a human can't accidentally merge a
-          # not-yet-done PR), and the `auto-merge` label is what authorizes CI to
-          # complete it. Drafts WITHOUT the label are left untouched (a human's WIP).
+          # Auto-ready: flip ANY draft to ready for review once CI is green +
+          # noise-clean — independent of the `auto-merge` label. The draft state
+          # keeps the merge button disabled while CI is still being driven; once the
+          # run is green + noise-clean there is nothing left to drive, so CI hands the
+          # PR to humans by marking it ready. Single run — the PR dispatcher ignores
+          # `ready_for_review`, so no re-dispatch loop. (Merging is separate and still
+          # requires the `auto-merge` label — see the decision tree below.)
+          READY_LINE=""
+          if [ "$MERGED" != "true" ] && [ "$DRAFT" = "true" ] && [ "$STATE" = "success" ] && [ "$NOISE_CLEAN" = "true" ]; then
+            PR_NODE_ID=$(jq -r '.node_id' /tmp/pr.json 2>/dev/null)
+            if [ -n "$PR_NODE_ID" ] && [ "$PR_NODE_ID" != "null" ] \
+               && gh api graphql -f query='mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}' \
+                    -f id="$PR_NODE_ID" >/dev/null 2>&1; then
+              DRAFT=false
+              READY_LINE="✅ **Marked ready for review** — green + noise-clean."
+              echo "✓ marked draft PR #$PR_NUMBER ready for review (green + noise-clean)"
+            else
+              READY_LINE="⚠️ Could not mark ready for review (PAT missing PR write?)."
+              echo "::warning::could not mark PR #$PR_NUMBER ready for review"
+            fi
+          fi
+
+          # Decide the auto-merge action + human-readable reason. Merging requires the
+          # `auto-merge` label (unlike the auto-ready above, which is unconditional).
+          # `/clear-todo-issue` adds the label, so its PRs merge here on green+clean.
           MERGE_LINE=""
           if [ "$MERGED" = "true" ]; then
             MERGE_LINE="✅ Already merged."
@@ -211,24 +233,10 @@ jobs:
           elif [ "$MERGEABLE" = "false" ]; then
             MERGE_LINE="⚠️ Labeled \`auto-merge\` and green+clean, but **has conflicts** — resolve before it can merge."
           else
-            # Eligible: green + noise-clean + labeled + mergeable (true/null).
-            # If it's still a draft, mark it ready FIRST (single run, no re-dispatch —
-            # the PR dispatcher ignores ready_for_review), then squash-merge.
-            READY_NOTE=""
-            if [ "$DRAFT" = "true" ]; then
-              PR_NODE_ID=$(jq -r '.node_id' /tmp/pr.json 2>/dev/null)
-              if [ -n "$PR_NODE_ID" ] && [ "$PR_NODE_ID" != "null" ]; then
-                if gh api graphql -f query='mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}' \
-                     -f id="$PR_NODE_ID" >/dev/null 2>&1; then
-                  READY_NOTE=" (draft → ready)"
-                  echo "✓ marked draft PR #$PR_NUMBER ready for review"
-                else
-                  echo "::warning::could not mark PR #$PR_NUMBER ready (PAT missing PR write?) — merge may fail while draft"
-                fi
-              fi
-            fi
+            # Eligible: green + noise-clean + labeled + mergeable (true/null). The PR
+            # was already flipped ready by the auto-ready block above; squash-merge it.
             if gh api -X PUT "repos/$REPO/pulls/$PR_NUMBER/merge" -f merge_method=squash >/tmp/merge.json 2>/tmp/merge.err; then
-              MERGE_LINE="✅ **Auto-merged (squash)$READY_NOTE** — labeled \`auto-merge\`, CI green, noise-clean."
+              MERGE_LINE="✅ **Auto-merged (squash)** — labeled \`auto-merge\`, CI green, noise-clean."
             else
               MERGE_LINE="⚠️ Auto-merge attempt failed: $(tr -d '\n' </tmp/merge.err | sed 's/\"//g' | cut -c1-160). PR left green + ready."
             fi
@@ -242,6 +250,8 @@ jobs:
           $DESC
 
           **Noise:** $NOISE_SUMMARY → $( [ "$NOISE_CLEAN" = "true" ] && echo "clean ✓" || echo "not clean ✗" )
+
+          $READY_LINE
 
           $MERGE_LINE
 
