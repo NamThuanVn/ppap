@@ -193,24 +193,42 @@ jobs:
           MERGED=$(jq -r '.merged // false' /tmp/pr.json 2>/dev/null)
           HAS_LABEL=false; case ",$LABELS," in *",auto-merge,"*) HAS_LABEL=true ;; esac
 
-          # Decide the auto-merge action + human-readable reason.
+          # Decide the auto-merge action + human-readable reason. A DRAFT PR that
+          # carries the `auto-merge` label is FLIPPED READY here (then merged) once
+          # it is green + clean: the draft state keeps the merge button disabled
+          # while Claude is still driving CI (so a human can't accidentally merge a
+          # not-yet-done PR), and the `auto-merge` label is what authorizes CI to
+          # complete it. Drafts WITHOUT the label are left untouched (a human's WIP).
           MERGE_LINE=""
           if [ "$MERGED" = "true" ]; then
             MERGE_LINE="✅ Already merged."
           elif [ "$HAS_LABEL" != "true" ]; then
             MERGE_LINE="ℹ️ Not auto-merged — add the \`auto-merge\` label to enable."
-          elif [ "$DRAFT" = "true" ]; then
-            MERGE_LINE="ℹ️ Draft — auto-merge skipped until marked ready."
+          elif [ "$NOISE_CLEAN" != "true" ]; then
+            MERGE_LINE="⏸️ Labeled \`auto-merge\`, but **noise present** ($NOISE_SUMMARY) — not merged. Clear the noise to auto-merge."
           elif [ "$STATE" != "success" ]; then
             MERGE_LINE="⏸️ Labeled \`auto-merge\`, but **CI is not green** — not merged."
-          elif [ "$NOISE_CLEAN" != "true" ]; then
-            MERGE_LINE="⏸️ Labeled \`auto-merge\` and green, but **noise present** ($NOISE_SUMMARY) — not merged. Clear the noise to auto-merge."
           elif [ "$MERGEABLE" = "false" ]; then
             MERGE_LINE="⚠️ Labeled \`auto-merge\` and green+clean, but **has conflicts** — resolve before it can merge."
           else
-            # Eligible: green + noise-clean + labeled + non-draft + mergeable (true/null).
+            # Eligible: green + noise-clean + labeled + mergeable (true/null).
+            # If it's still a draft, mark it ready FIRST (single run, no re-dispatch —
+            # the PR dispatcher ignores ready_for_review), then squash-merge.
+            READY_NOTE=""
+            if [ "$DRAFT" = "true" ]; then
+              PR_NODE_ID=$(jq -r '.node_id' /tmp/pr.json 2>/dev/null)
+              if [ -n "$PR_NODE_ID" ] && [ "$PR_NODE_ID" != "null" ]; then
+                if gh api graphql -f query='mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}' \
+                     -f id="$PR_NODE_ID" >/dev/null 2>&1; then
+                  READY_NOTE=" (draft → ready)"
+                  echo "✓ marked draft PR #$PR_NUMBER ready for review"
+                else
+                  echo "::warning::could not mark PR #$PR_NUMBER ready (PAT missing PR write?) — merge may fail while draft"
+                fi
+              fi
+            fi
             if gh api -X PUT "repos/$REPO/pulls/$PR_NUMBER/merge" -f merge_method=squash >/tmp/merge.json 2>/tmp/merge.err; then
-              MERGE_LINE="✅ **Auto-merged (squash)** — labeled \`auto-merge\`, CI green, noise-clean."
+              MERGE_LINE="✅ **Auto-merged (squash)$READY_NOTE** — labeled \`auto-merge\`, CI green, noise-clean."
             else
               MERGE_LINE="⚠️ Auto-merge attempt failed: $(tr -d '\n' </tmp/merge.err | sed 's/\"//g' | cut -c1-160). PR left green + ready."
             fi
