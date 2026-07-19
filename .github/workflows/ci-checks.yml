@@ -54,6 +54,14 @@ permissions: read-all
 
 env:
   PRIVATE_REPO: NamThuanVn/erp-namthuan
+  # Pre-seed init.defaultBranch so actions/checkout's internal `git init` stops
+  # printing the "hint: git config --global init.defaultBranch <name>" line on
+  # every job. git reads these GIT_CONFIG_* env vars as extra config, so the
+  # hint's precondition (unset init.defaultBranch) is never met. Cosmetic
+  # CI-log-noise removal only.
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
 
 jobs:
   biome:

@@ -3,13 +3,22 @@ description: Setup pnpm + Node, restore node_modules cache, install only on cach
 
 runs:
   using: composite
+  # NODE_OPTIONS=--no-deprecation on every node-running setup step drops Node
+  # deprecation warnings (e.g. "[DEP0169] DeprecationWarning: url.parse()")
+  # emitted by the third-party setup tooling (pnpm/action-setup, setup-node) —
+  # CI-log noise we can't fix at the source. Scoped to setup only, so genuine
+  # deprecations in our own build / test / e2e steps still surface.
   steps:
     - uses: pnpm/action-setup@v5
+      env:
+        NODE_OPTIONS: --no-deprecation
 
     - uses: actions/setup-node@v6
       with:
         node-version: '22'
         cache: pnpm
+      env:
+        NODE_OPTIONS: --no-deprecation
 
     - name: Restore node_modules cache
       id: cache
@@ -21,8 +30,12 @@ runs:
           apps/*/node_modules
           packages/*/node_modules
         key: pnpm-modules-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+      env:
+        NODE_OPTIONS: --no-deprecation
 
     - name: Install dependencies
       if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
+      env:
+        NODE_OPTIONS: --no-deprecation
       run: pnpm install --frozen-lockfile --prefer-offline
