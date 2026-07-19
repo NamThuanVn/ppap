@@ -41,10 +41,10 @@ on:
         description: 'Aggregated e2e result: success when all shards pass OR when a change-scoped run had nothing relevant to test (skip); failure if any shard failed.'
         value: ${{ jobs.e2e-aggregate.outputs.result }}
       noise_clean:
-        description: '"true" when the run has zero flaky / dup-testid / hydration / biome-warning / vitest-stderr; "false" otherwise. Empty if the noise scan did not run.'
+        description: '"true" when the run has zero flaky / dup-testid / hydration / i18n-missing / font-preload / http-404 / biome-warning / vitest-stderr; "false" otherwise. Empty if the noise scan did not run.'
         value: ${{ jobs.noise-report.outputs.clean }}
       noise_summary:
-        description: 'Compact per-signal noise counts, e.g. "flaky 0 · dup 0 · hyd 0 · biome 1 · vitest 0".'
+        description: 'Compact per-signal noise counts, e.g. "flaky 0 · dup 0 · hyd 0 · i18n 0 · font 0 · 404 0 · biome 0 · vitest 0".'
         value: ${{ jobs.noise-report.outputs.summary }}
     secrets:
       PAT_TOKEN:
@@ -538,8 +538,9 @@ jobs:
   # Precompute the "green-but-noisy" signals ONCE, server-side, into a tiny
   # `ci-noise-report` artifact so /watch-ci and /fix-ci read ONE small file
   # instead of downloading every e2e shard log over the network. It captures the
-  # exact four masks a green run hides (see .claude/commands/fix-ci.md): flaky
-  # retries, report-only dup-testid / hydration-error annotations, biome
+  # masks a green run hides (see .claude/commands/fix-ci.md): flaky retries,
+  # report-only dup-testid / hydration-error annotations, the browser-only
+  # i18n-missing / font-preload / http-404 signals the e2e fixtures tag, biome
   # warnings, and vitest stderr — same signals, a fraction of the client's time.
   #
   # SAFE BY CONSTRUCTION: this job only READS this run's own job logs (default
@@ -604,18 +605,23 @@ jobs:
           flaky=$(num '([0-9]+) flaky' "$tmp/e2e.log"); flaky=${flaky:-0}
           dup=$(cnt '\[dup-testid\]' "$tmp/e2e.log"); dup=${dup:-0}
           hyd=$(cnt '\[hydration-error\]' "$tmp/e2e.log"); hyd=${hyd:-0}
+          # Browser-only signals the e2e fixtures tag per test (apps/shell/e2e/fixtures.ts):
+          # missing i18n keys, unused next/font preloads, 4xx/404 resource loads.
+          i18n=$(cnt '\[i18n-missing\]' "$tmp/e2e.log"); i18n=${i18n:-0}
+          font=$(cnt '\[font-preload\]' "$tmp/e2e.log"); font=${font:-0}
+          http404=$(cnt '\[http-404\]' "$tmp/e2e.log"); http404=${http404:-0}
           biomew=$(num 'Found ([0-9]+) warning' "$tmp/biome.log"); biomew=${biomew:-0}
           vitest=$(cnt 'stderr \||not wrapped in act' "$tmp/test.log"); vitest=${vitest:-0}
-          total=$(( flaky + dup + hyd + biomew + vitest ))
+          total=$(( flaky + dup + hyd + i18n + font + http404 + biomew + vitest ))
           clean=true; [ "$total" -gt 0 ] && clean=false
-          summary=$(printf 'flaky %s · dup %s · hyd %s · biome %s · vitest %s' "$flaky" "$dup" "$hyd" "$biomew" "$vitest")
+          summary=$(printf 'flaky %s · dup %s · hyd %s · i18n %s · font %s · 404 %s · biome %s · vitest %s' "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest")
           {
             echo "clean=$clean"
             echo "summary=$summary"
           } >> "$GITHUB_OUTPUT"
           mkdir -p ci-noise
-          printf '{"flaky":%s,"dup_testid":%s,"hydration":%s,"biome_warnings":%s,"vitest_stderr":%s,"clean":%s}\n' \
-            "$flaky" "$dup" "$hyd" "$biomew" "$vitest" "$clean" | tee ci-noise/ci-noise-report.json
+          printf '{"flaky":%s,"dup_testid":%s,"hydration":%s,"i18n_missing":%s,"font_preload":%s,"http_4xx":%s,"biome_warnings":%s,"vitest_stderr":%s,"clean":%s}\n' \
+            "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest" "$clean" | tee ci-noise/ci-noise-report.json
           echo "▶ noise: $summary → clean=$clean"
           exit 0
 
