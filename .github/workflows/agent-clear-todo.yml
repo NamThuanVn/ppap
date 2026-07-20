@@ -1,0 +1,313 @@
+name: Agent · clear-todo-issue
+
+# Runs the repo's autonomous /clear-todo-issue Claude Code session HEADLESS on
+# ppap's free public-repo runners — one workflow run = one /loop tick: each
+# matrix agent claims ONE Project #1 Todo item (atomic create-ref on the shared
+# fork), implements + tests + browse-verifies it, opens a draft PR labeled
+# auto-merge, drives CI green+clean, and ends the item Done (merged) or parked
+# to Pending. The Claude Code CLI is installed directly (NOT the
+# claude-code-action) so the full repo experience loads: CLAUDE.md, slash
+# commands, Stop hooks (require-tests …), .mcp.json MCP servers (codegraph,
+# playwright-headless) and subagents.
+#
+# Claude auth is a POOL of subscription accounts: the CLAUDE_CODE_OAUTH_TOKENS
+# secret holds a newline-separated list of tokens (add one = edit the secret,
+# no workflow change). .github/scripts/agent-claude-run.sh probes each for
+# an available quota window, spreads parallel agents across accounts, and fails
+# over mid-run (--resume) when one hits its usage limit. GitHub identity is
+# PAT_TOKEN (the itdevnamthuan account) — the checkout targets ITS fork, so
+# claims are atomic among all CI agents (they share this fork as `origin`).
+# Human sessions on OTHER forks are covered by the command's open-PR backstop.
+#
+# Dispatched from the private repo by agent-todo-dispatch.yml
+# (repository_dispatch[agent-todo]); workflow_dispatch is the manual/smoke-test
+# entry. Filename is deliberately NOT ci-*.yml → the sync mirrors it to
+# NamThuanVn/ppap only, never to the CI fleet. NOTE the transcript artifact +
+# logs are PUBLIC (accepted trade-off — see .claude/ppap.md § Agent runs).
+
+run-name: "${{ format('Agent · todo · {0}× · by {1}', github.event.client_payload.parallel || inputs.parallel || '1', github.event.client_payload.triggered_by || github.actor) }}"
+
+on:
+  repository_dispatch:
+    types: [agent-todo]
+  workflow_dispatch:
+    inputs:
+      parallel:
+        description: 'How many agents to run in parallel (soft-capped at 8; agents beyond the token-pool size share accounts).'
+        required: false
+        default: '1'
+        type: string
+      item:
+        description: 'Optional /clear-todo-issue argument (issue URL/number, PR number, or docs/ba folder path). Empty = board Todo claim.'
+        required: false
+        default: ''
+        type: string
+      claude_version:
+        description: 'Claude Code CLI version to install (pin; bump deliberately).'
+        required: false
+        default: '2.1.211'
+        type: string
+      model:
+        description: 'Optional --model override for the main session (empty = account default).'
+        required: false
+        default: ''
+        type: string
+
+permissions: read-all
+
+# NO concurrency group on purpose: parallel agents must coexist, and a
+# re-dispatch must never cancel an in-flight agent mid-item (a cancelled agent
+# strands its claimed item In Progress).
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+  # PAT_TOKEN's own fork — push works without any cross-account grant. Must
+  # exist before the first run (gh repo fork NamThuanVn/erp-namthuan
+  # --clone=false, as itdevnamthuan).
+  FORK_REPO: itdevnamthuan/erp-namthuan
+
+jobs:
+  # Normalize the trigger inputs into a matrix. Both repository_dispatch
+  # client_payload values AND workflow_dispatch inputs arrive as STRINGS —
+  # tonumber-coerce unconditionally.
+  plan:
+    name: Plan fan-out
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.fan.outputs.matrix }}
+      item: ${{ steps.fan.outputs.item }}
+      model: ${{ steps.fan.outputs.model }}
+      claude_version: ${{ steps.fan.outputs.claude_version }}
+    steps:
+      - name: Compute matrix
+        id: fan
+        env:
+          RAW_PARALLEL: ${{ github.event.client_payload.parallel || inputs.parallel || '1' }}
+          RAW_ITEM: ${{ github.event.client_payload.item || inputs.item || '' }}
+          RAW_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
+          RAW_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
+        run: |
+          set -euo pipefail
+          # Soft runaway guard, independent of the token-pool size (the run
+          # script spreads agents across however many tokens the pool holds;
+          # extra agents share accounts, which is allowed).
+          N=$(printf '%s' "$RAW_PARALLEL" | jq -R 'tonumber? // 1 | floor')
+          if [ "$N" -lt 1 ]; then N=1; fi
+          if [ "$N" -gt 8 ]; then
+            echo "::warning::parallel=$N capped to 8 (soft runaway guard)"
+            N=8
+          fi
+          echo "matrix=$(jq -cn --argjson n "$N" '[range(0;$n)]')" >> "$GITHUB_OUTPUT"
+          echo "item=$RAW_ITEM"             >> "$GITHUB_OUTPUT"
+          echo "model=$RAW_MODEL"           >> "$GITHUB_OUTPUT"
+          echo "claude_version=$RAW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "✓ fan-out: $N agent(s) · item='${RAW_ITEM:-<board claim>}' · claude=$RAW_VERSION"
+
+  agent:
+    name: Agent ${{ matrix.idx }}
+    needs: plan
+    runs-on: ubuntu-latest
+    # 30 min under GitHub's 360-min hard cap: leave room for the always-steps.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      # De-thrash the board sweep: parallel agents starting together would all
+      # rank the same Todo set at once. Claims stay atomic regardless — this
+      # only reduces wasted yield-and-retry rounds.
+      - name: Stagger start
+        if: matrix.idx != 0
+        run: sleep $(( ${{ matrix.idx }} * 90 ))
+
+      # /clear-todo-issue's pre-flight REQUIRES a fork layout: origin = the
+      # agent fork, upstream = the private repo. Full history (fetch-depth 0):
+      # the agent does arbitrary git ops (conflict merges, history reads) and
+      # shallow-clone edge cases are subtle CI-only failures.
+      - name: Checkout agent fork
+        uses: actions/checkout@v6
+        with:
+          repository: itdevnamthuan/erp-namthuan
+          ref: main
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Fork sync is a manual local-only step in normal dev (scripts/
+      # sync-fork.sh) — nothing keeps the fork fresh unattended, and a stale
+      # fork would run every bootstrap step below at an old revision. Freshen
+      # it FIRST, then wire the dual-remote layout + git identity the command
+      # expects. `gh auth setup-git` installs a credential helper covering
+      # every github.com remote (fork pushes + upstream fetches).
+      - name: Freshen fork + set up remotes and identity
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh repo sync "$FORK_REPO" -b main
+          gh auth setup-git
+          git fetch origin main
+          git reset --hard origin/main
+          git remote add upstream "https://github.com/${PRIVATE_REPO}.git"
+          git fetch upstream main
+          LOGIN=$(gh api user --jq .login)
+          git config user.name "$LOGIN"
+          git config user.email "${LOGIN}@users.noreply.github.com"
+          echo "✓ fork fresh at $(git rev-parse --short HEAD) · acting as @$LOGIN"
+
+      - name: Install dependencies
+        uses: ./.github/actions/install
+
+      # Same Chromium cache pattern as ci-checks.yml — /browse (headless) and
+      # any e2e the agent runs need it.
+      - name: Resolve Playwright version
+        id: pw
+        run: |
+          set -euo pipefail
+          VER=$(node -e "console.log(require('./node_modules/@playwright/test/package.json').version)")
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      # The codegraph MCP server serves a ~330MB gitignored SQLite index.
+      # Content-keyed cache (NOT github.sha — that would be THIS repo's sha,
+      # not the indexed checkout's): exact hit skips the build, a stale restore
+      # is reconciled by the script's fast `codegraph sync` path, a miss pays
+      # the full `init -i`.
+      - name: Cache codegraph index
+        uses: actions/cache@v5
+        with:
+          path: .codegraph
+          key: codegraph-v1-${{ hashFiles('apps/**', 'apis/**', 'packages/**') }}
+          restore-keys: |
+            codegraph-v1-
+
+      - name: Build codegraph index
+        run: bash scripts/mcp-codegraph.sh
+
+      - name: Install Claude Code CLI
+        env:
+          CLAUDE_VERSION: ${{ needs.plan.outputs.claude_version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version
+
+      # The main event. GH_TOKEN = PAT_TOKEN is the gh identity for the whole
+      # session (claim refs, board GraphQL, PR create, /watch-ci across the
+      # fleet orgs). The wrapper owns token-pool selection + mid-run failover.
+      # No ANTHROPIC_API_KEY here — ever (it outranks the OAuth pool).
+      - name: Run /clear-todo-issue headless
+        id: run
+        env:
+          CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          AGENT_INDEX: ${{ matrix.idx }}
+          ITEM_ARG: ${{ needs.plan.outputs.item }}
+          CLAUDE_MODEL: ${{ needs.plan.outputs.model }}
+        run: bash .github/scripts/agent-claude-run.sh
+
+      # PUBLIC artifact (this is a public repo) — accepted trade-off.
+      - name: Upload transcript
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-transcript-${{ matrix.idx }}
+          path: |
+            agent-transcript.jsonl
+            agent-result.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "### Agent ${{ matrix.idx }} — /clear-todo-issue"
+            echo ""
+            if [ -s agent-result.json ]; then
+              SUBTYPE=$(jq -r '.subtype // "n/a"' agent-result.json)
+              TURNS=$(jq -r '.num_turns // "n/a"' agent-result.json)
+              echo "- **Result subtype:** \`$SUBTYPE\` · **turns:** $TURNS"
+              echo ""
+              echo '```'
+              jq -r '.result // "<no result text>"' agent-result.json | tail -40
+              echo '```'
+            else
+              echo "_no result event captured (see transcript artifact)_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      # Terminal-state backstop. If the run died AFTER claiming but BEFORE a
+      # terminal checkpoint, the item is stranded In Progress/assigned with a
+      # live claim ref — flag it on the issue so a human (or the next tick's
+      # returned-from-Pending path) can unstick it. If a PR was already open
+      # with the auto-merge label, ppap's ci-pr.yml still lands it on
+      # green+clean, so this is chiefly the pre-PR window. Best-effort: grep
+      # heuristics over the transcript, never reds the job further.
+      - name: Flag stranded item
+        if: failure() || cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          [ -s agent-transcript.jsonl ] || exit 0
+          grep -q 'claimed + branch' agent-transcript.jsonl || exit 0
+          if grep -qE 'merged PR #|parked to Pending|split into .* slices|BACKLOG EMPTY' agent-transcript.jsonl; then
+            echo "terminal checkpoint found — nothing stranded"
+            exit 0
+          fi
+          ISSUE=$(grep -a -- '--add-assignee' agent-transcript.jsonl \
+            | grep -oE 'gh issue edit [0-9]+' | grep -oE '[0-9]+' | head -1)
+          if [ -z "$ISSUE" ]; then
+            echo "::warning::run ended non-terminal after a claim, but the claimed issue number could not be parsed — check the transcript"
+            exit 0
+          fi
+          gh issue comment "$ISSUE" --repo "$PRIVATE_REPO" --body \
+            "⚠️ CI agent run ended without reaching a terminal state — this item may be stranded In Progress with a live claim branch. Run: $RUN_URL (see .claude/commands/clear-todo-issue.md § Stale claim refs)." \
+            && echo "✓ flagged possibly-stranded issue #$ISSUE" \
+            || echo "::warning::could not comment on issue #$ISSUE"
+          exit 0
+
+      # Failure-only Telegram to the build topic — same bot/secrets/shape as
+      # deploy-reusable.yml's notify step; non-fatal, skips when unset.
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured — skipping notify."
+            exit 0
+          fi
+          TEXT="🤖🚨 <b>Agent run failed</b> — clear-todo-issue (agent ${{ matrix.idx }})"
+          TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" \
+            -d parse_mode=HTML \
+            -d disable_web_page_preview=true; then
+            echo "✓ Telegram failure alert sent."
+          else
+            echo "::warning::Telegram notify failed."
+          fi
