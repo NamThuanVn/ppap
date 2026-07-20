@@ -104,6 +104,12 @@ jobs:
           set -euo pipefail
           gh repo sync "$FORK_REPO" -b main
           gh auth setup-git
+          # Pin gh's default repo to the fork: with origin+upstream remotes and
+          # no default, bare `gh repo view` resolves ambiguously in CI (the
+          # first live run wasted turns disambiguating) — pinned, the command's
+          # pre-flight `gh repo view --json parent` resolves fork + parent
+          # exactly as on a dev machine.
+          gh repo set-default "$FORK_REPO"
           git fetch origin main
           git reset --hard origin/main
           git remote add upstream "https://github.com/${PRIVATE_REPO}.git"
