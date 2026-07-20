@@ -5,9 +5,13 @@ name: Agent · clear-todo-issue
 # single Project #1 Todo item (atomic create-ref on the agent fork), implements
 # + tests + browse-verifies it, opens a draft PR labeled auto-merge, drives CI
 # green+clean, ends the item Done (merged) or parked to Pending, then the run
-# finishes. For parallelism, fire multiple independent runs (each dispatcher
-# invocation starts one) — there is deliberately NO matrix and NO cron/loop
-# here yet; repetition stays manual until the flow is proven.
+# finishes. Parallelism + repetition are owned by agent-loop.yml (the top-up
+# controller in this repo): loop-spawned runs carry client_payload.loop='true',
+# and the final "Continue loop" step chains back to the controller ONLY when
+# this run ended in a PRODUCTIVE terminal state — a BACKLOG EMPTY or failed
+# run never chains, so the loop always terminates. One-shot runs (manual
+# workflow_dispatch, or the private dispatcher with an `item`) carry no loop
+# flag and never chain.
 #
 # The Claude Code CLI is installed directly (NOT claude-code-action) so the
 # full repo experience loads: CLAUDE.md, slash commands, Stop hooks
@@ -170,6 +174,20 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/claude" --version
 
+      # The same first-time setup a dev worktree gets (pnpm menu →
+      # worktree:init): machine check (linux no-op) → pnpm install (no-op —
+      # the install action already ran) → db:reset (local D1 wipe +
+      # migrations + demo seeds: the agent's dev:serve//browse stack needs
+      # them ready instead of burning session turns seeding) → codegraph
+      # re-sync (fast skip on the cached index) → MCP wiring (sentry /
+      # playwright / databases; databases skips cleanly when uv is absent,
+      # and the wrapper's later ~/.claude.json trust seed MERGES, so these
+      # registrations survive). Placed AFTER the CLI install on purpose: the
+      # mcp:* scripts hard-require `claude` in PATH. --verbose = plain
+      # sequential output for the public job log (no spinner interleaving).
+      - name: First-time setup (pnpm worktree:init)
+        run: pnpm worktree:init --verbose
+
       # The main event. GH_TOKEN = PAT_TOKEN is the gh identity for the whole
       # session (claim refs, board GraphQL, PR create, /watch-ci across the
       # fleet orgs). The wrapper owns workspace trust, token-pool selection and
@@ -279,3 +297,38 @@ jobs:
           else
             echo "::warning::Telegram notify failed."
           fi
+
+      # Self-perpetuation (LAST step on purpose — the job exits right after
+      # dispatching, shrinking the window where this dying lane double-counts
+      # itself in the controller's active-run tally; exclude_run_id covers the
+      # rest). Chains ONLY when: the agent step succeeded, this run was
+      # loop-spawned (client_payload.loop == 'true' — STRING compare, payload
+      # values arrive as strings), AND the transcript shows a PRODUCTIVE
+      # terminal state. BACKLOG EMPTY and failures never chain — that is the
+      # invariant that lets the loop terminate despite agent-loop.yml's
+      # over-counting backlog probe. Best-effort: a failed chain dispatch just
+      # ends this lane (agent-todo-dispatch.yml or the next BA-docs merge
+      # restarts the loop); it never reds the job. always() + outcome gate so
+      # an artifact-upload hiccup can't kill the loop.
+      - name: Continue loop
+        if: always() && steps.run.outcome == 'success' && github.event.client_payload.loop == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
+        run: |
+          set +e
+          [ -s agent-transcript.jsonl ] || { echo "no transcript — lane ends here"; exit 0; }
+          # has_terminal() from agent-claude-run.sh MINUS 'BACKLOG EMPTY'.
+          if ! grep -aqE 'merged PR #|PR #[0-9]+ merged|parked to Pending|split into [0-9]+ slices|abandoned \(already covered\)' agent-transcript.jsonl; then
+            echo "no productive terminal state (BACKLOG EMPTY, most likely) — lane ends here"
+            exit 0
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
+            -f event_type=agent-loop \
+            -f client_payload[triggered_by]="${TRIGGERED_BY}" \
+            -f client_payload[exclude_run_id]="${GITHUB_RUN_ID}"; then
+            echo "✓ chained agent-loop (exclude_run_id=${GITHUB_RUN_ID})"
+          else
+            echo "::warning::agent-loop chain dispatch failed — this lane ends; restart via agent-todo-dispatch.yml or the next BA-docs merge"
+          fi
+          exit 0
