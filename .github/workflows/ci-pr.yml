@@ -178,6 +178,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
           STATE: ${{ steps.status.outputs.state }}
           NOISE_CLEAN: ${{ needs.checks.outputs.noise_clean }}
           NOISE_SUMMARY: ${{ needs.checks.outputs.noise_summary }}
@@ -190,6 +191,29 @@ jobs:
           NOISE_SUMMARY="${NOISE_SUMMARY:-unknown (scan unavailable)}"
           # PR metadata.
           gh api "repos/$REPO/pulls/$PR_NUMBER" > /tmp/pr.json 2>/dev/null
+          # Stale-run guard: with CI fanned out across multiple ppap repos, a
+          # superseded run in another org can outlive the cancel sweep (dispatch
+          # → run-creation latency). The commit Status above is sha-scoped and
+          # safe, but everything below — sticky comment, auto-ready, auto-merge
+          # — is PR-scoped, so a stale run must not touch it (a late "✅ green"
+          # comment for an old sha would mislead reviewers). Manual
+          # workflow_dispatch reruns carry no head_sha → guard intentionally
+          # skipped, preserving manual-rerun semantics.
+          CURRENT_HEAD=$(jq -r '.head.sha // ""' /tmp/pr.json 2>/dev/null)
+          if [ -n "${HEAD_SHA:-}" ]; then
+            if [ -z "$CURRENT_HEAD" ]; then
+              # Fail CLOSED on a dispatch run: if the metadata fetch failed we
+              # can't prove this run isn't stale, and a stale "✅ green" comment
+              # is worse than a missing one. (Manual reruns have no HEAD_SHA
+              # and never reach here.)
+              echo "::warning::could not verify PR #$PR_NUMBER head (metadata fetch failed) — skipping PR report/ready/merge."
+              exit 0
+            fi
+            if [ "$CURRENT_HEAD" != "$HEAD_SHA" ]; then
+              echo "Stale run: tested $HEAD_SHA but PR #$PR_NUMBER head is now $CURRENT_HEAD — skipping PR report/ready/merge."
+              exit 0
+            fi
+          fi
           LABELS=$(jq -r '[.labels[].name] | join(",")' /tmp/pr.json 2>/dev/null)
           DRAFT=$(jq -r '.draft // false' /tmp/pr.json 2>/dev/null)
           MERGEABLE=$(jq -r '.mergeable // "null"' /tmp/pr.json 2>/dev/null)
@@ -235,7 +259,12 @@ jobs:
           else
             # Eligible: green + noise-clean + labeled + mergeable (true/null). The PR
             # was already flipped ready by the auto-ready block above; squash-merge it.
-            if gh api -X PUT "repos/$REPO/pulls/$PR_NUMBER/merge" -f merge_method=squash >/tmp/merge.json 2>/tmp/merge.err; then
+            # `sha=` makes the merge atomic: GitHub 409s if the head moved between the
+            # stale-run guard's read and this call, so a raced push can never merge
+            # unvalidated content. (Empty on manual reruns — precondition skipped.)
+            MERGE_ARGS=(-f merge_method=squash)
+            if [ -n "${HEAD_SHA:-}" ]; then MERGE_ARGS+=(-f sha="$HEAD_SHA"); fi
+            if gh api -X PUT "repos/$REPO/pulls/$PR_NUMBER/merge" "${MERGE_ARGS[@]}" >/tmp/merge.json 2>/tmp/merge.err; then
               MERGE_LINE="✅ **Auto-merged (squash)** — labeled \`auto-merge\`, CI green, noise-clean."
             else
               MERGE_LINE="⚠️ Auto-merge attempt failed: $(tr -d '\n' </tmp/merge.err | sed 's/\"//g' | cut -c1-160). PR left green + ready."
@@ -271,64 +300,3 @@ jobs:
           fi
           echo "▶ $MERGE_LINE"
           exit 0
-
-      # Failure-only Telegram alert to the build topic of the team supergroup
-      # (same bot as the runtime error alerts; secrets live in this repo's
-      # Actions secrets). Non-fatal: a Telegram outage must not flip the CI
-      # report job red after the commit status was already posted.
-      # `!cancelled()` (not `always()`) so a cancel arriving mid-job never
-      # fires the alert.
-      - name: Notify Telegram on failure
-        if: ${{ !cancelled() && steps.status.outputs.state == 'failure' }}
-        env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
-          PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
-          PR_TITLE: ${{ github.event.client_payload.title }}
-          ACTOR: ${{ github.event.client_payload.triggered_by }}
-          BRANCH: ${{ github.event.client_payload.head_ref }}
-          IS_FORK: ${{ github.event.client_payload.is_fork }}
-          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
-          DESC: ${{ steps.status.outputs.desc }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-            echo "Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID empty) — skipping notify."
-            exit 0
-          fi
-          # PR titles + branch names are user-controlled text inside
-          # parse_mode=HTML — escape both.
-          esc() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
-          SAFE_TITLE=$(esc "${PR_TITLE:-}")
-          SAFE_BRANCH=$(esc "${BRANCH:-}")
-          PR_URL="https://github.com/${{ env.PRIVATE_REPO }}/pull/${PR_NUMBER}"
-          # Context line: actor · branch · commit. Every field is optional —
-          # manual workflow_dispatch re-runs carry no client_payload, so the
-          # line collapses gracefully (or disappears entirely).
-          META=""
-          if [ -n "${ACTOR:-}" ]; then META="by @${ACTOR}"; fi
-          if [ -n "$SAFE_BRANCH" ]; then
-            FORK_TAG=""
-            if [ "${IS_FORK:-false}" = "true" ]; then FORK_TAG=" (fork)"; fi
-            META="${META:+$META · }branch <code>${SAFE_BRANCH}</code>${FORK_TAG}"
-          fi
-          if [ -n "${HEAD_SHA:-}" ]; then
-            META="${META:+$META · }commit <a href=\"https://github.com/${{ env.PRIVATE_REPO }}/commit/${HEAD_SHA}\">${HEAD_SHA:0:7}</a>"
-          fi
-          TEXT="❌ <b>PR CI failed</b> — <a href=\"${PR_URL}\">PR #${PR_NUMBER}</a>${SAFE_TITLE:+: ${SAFE_TITLE}}"
-          if [ -n "$META" ]; then TEXT="${TEXT}"$'\n'"${META}"; fi
-          TEXT="${TEXT}"$'\n'"${DESC}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
-          THREAD_ARGS=()
-          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
-          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${CHAT_ID}" \
-            "${THREAD_ARGS[@]}" \
-            --data-urlencode "text=${TEXT}" \
-            -d parse_mode=HTML \
-            -d disable_web_page_preview=true; then
-            echo "✓ Telegram failure alert sent."
-          else
-            echo "::warning::Telegram notify failed (PR CI failure alert not delivered)."
-          fi
