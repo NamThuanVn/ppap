@@ -12,7 +12,7 @@ name: CI · PR · Lint · Typecheck · Test · E2E
 # Note: this collapses the fork-safety boundary that a separate CI_PAT
 # would have provided — see the trade-off note in .claude/ppap.md § PAT_TOKEN.
 
-run-name: "CI · PR #${{ github.event.client_payload.pr_number || inputs.pr_number }} · ${{ github.event.client_payload.title || 'manual rerun' }}"
+run-name: "${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('CI · PR #{0} · {1}', github.event.client_payload.pr_number || inputs.pr_number, github.event.client_payload.title || 'manual rerun') || 'CI · manual · main' }}"
 
 on:
   repository_dispatch:
@@ -20,8 +20,8 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'PR number on NamThuanVn/erp-namthuan to (re)run CI for'
-        required: true
+        description: 'PR number on NamThuanVn/erp-namthuan to (re)run CI for. Leave EMPTY to smoke-test the full CI graph against erp-namthuan main.'
+        required: false
         type: string
       e2e_shards:
         description: 'Override default Playwright shard count for a manual re-run (leave empty to use ci-checks.yml default).'
@@ -86,19 +86,21 @@ jobs:
   # each job's `result` as a workflow_call output, so the report job below
   # can build a per-job summary without re-querying the API.
   #
-  # refs/pull/<N>/merge resolves to the merge commit GitHub computes between
-  # the PR head and the base. Mirrors what `pull_request` would test. If the
-  # PR has merge conflicts this ref is absent and the checkout step fails —
-  # which surfaces as a Check Run failure with a clear "resolve conflict"
-  # hint in the report summary.
+  # A PR (repository_dispatch, or workflow_dispatch WITH a number) checks out
+  # refs/pull/<N>/merge — the merge commit GitHub computes between the PR head
+  # and base, mirroring what `pull_request` would test (absent on a merge
+  # conflict → checkout fails → the report surfaces a "resolve conflict" hint).
+  # A manual workflow_dispatch with NO number checks out erp-namthuan `main`
+  # instead, so the full CI graph can be smoke-tested without opening a PR.
   checks:
     uses: ./.github/workflows/ci-checks.yml
     with:
-      checkout_ref: refs/pull/${{ github.event.client_payload.pr_number || inputs.pr_number }}/merge
+      checkout_ref: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('refs/pull/{0}/merge', github.event.client_payload.pr_number || inputs.pr_number) || 'main' }}
       e2e_shards: ${{ fromJSON(inputs.e2e_shards || '12') }}
-      # Run only the changed service's e2e specs (broad/shared change → full
-      # suite; nothing relevant → skip). See scripts/e2e-plan.sh.
-      e2e_changed_only: true
+      # PR CI runs only the changed service's e2e specs (broad/shared change →
+      # full; nothing relevant → skip; see scripts/e2e-plan.sh). A manual main
+      # run has no PR diff to scope against → run the full suite.
+      e2e_changed_only: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && true || false }}
     secrets:
       PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
 
