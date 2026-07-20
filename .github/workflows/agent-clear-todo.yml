@@ -1,19 +1,23 @@
 name: Agent · clear-todo-issue
 
 # Runs the repo's autonomous /clear-todo-issue Claude Code session HEADLESS on
-# ppap's free public-repo runners — one workflow run = one /loop tick: each
-# matrix agent claims ONE Project #1 Todo item (atomic create-ref on the shared
-# fork), implements + tests + browse-verifies it, opens a draft PR labeled
-# auto-merge, drives CI green+clean, and ends the item Done (merged) or parked
-# to Pending. The Claude Code CLI is installed directly (NOT the
-# claude-code-action) so the full repo experience loads: CLAUDE.md, slash
-# commands, Stop hooks (require-tests …), .mcp.json MCP servers (codegraph,
-# playwright-headless) and subagents.
+# ppap's free public-repo runners. ONE run = ONE agent = ONE item: it claims a
+# single Project #1 Todo item (atomic create-ref on the agent fork), implements
+# + tests + browse-verifies it, opens a draft PR labeled auto-merge, drives CI
+# green+clean, ends the item Done (merged) or parked to Pending, then the run
+# finishes. For parallelism, fire multiple independent runs (each dispatcher
+# invocation starts one) — there is deliberately NO matrix and NO cron/loop
+# here yet; repetition stays manual until the flow is proven.
+#
+# The Claude Code CLI is installed directly (NOT claude-code-action) so the
+# full repo experience loads: CLAUDE.md, slash commands, Stop hooks
+# (require-tests …), .mcp.json MCP servers (codegraph, playwright-headless)
+# and subagents.
 #
 # Claude auth is a POOL of subscription accounts: the CLAUDE_CODE_OAUTH_TOKENS
 # secret holds a newline-separated list of tokens (add one = edit the secret,
 # no workflow change). .github/scripts/agent-claude-run.sh probes each for
-# an available quota window, spreads parallel agents across accounts, and fails
+# an available quota window, rotates the starting account per run, and fails
 # over mid-run (--resume) when one hits its usage limit. GitHub identity is
 # PAT_TOKEN (the itdevnamthuan account) — the checkout targets ITS fork, so
 # claims are atomic among all CI agents (they share this fork as `origin`).
@@ -25,18 +29,13 @@ name: Agent · clear-todo-issue
 # NamThuanVn/ppap only, never to the CI fleet. NOTE the transcript artifact +
 # logs are PUBLIC (accepted trade-off — see .claude/ppap.md § Agent runs).
 
-run-name: "${{ format('Agent · todo · {0}× · by {1}', github.event.client_payload.parallel || inputs.parallel || '1', github.event.client_payload.triggered_by || github.actor) }}"
+run-name: "${{ format('Agent · todo · by {0}', github.event.client_payload.triggered_by || github.actor) }}"
 
 on:
   repository_dispatch:
     types: [agent-todo]
   workflow_dispatch:
     inputs:
-      parallel:
-        description: 'How many agents to run in parallel (soft-capped at 8; agents beyond the token-pool size share accounts).'
-        required: false
-        default: '1'
-        type: string
       item:
         description: 'Optional /clear-todo-issue argument (issue URL/number, PR number, or docs/ba folder path). Empty = board Todo claim.'
         required: false
@@ -55,8 +54,8 @@ on:
 
 permissions: read-all
 
-# NO concurrency group on purpose: parallel agents must coexist, and a
-# re-dispatch must never cancel an in-flight agent mid-item (a cancelled agent
+# NO concurrency group on purpose: independent runs must coexist, and a new
+# dispatch must never cancel an in-flight agent mid-item (a cancelled agent
 # strands its claimed item In Progress).
 
 env:
@@ -67,61 +66,18 @@ env:
   FORK_REPO: itdevnamthuan/erp-namthuan
 
 jobs:
-  # Normalize the trigger inputs into a matrix. Both repository_dispatch
-  # client_payload values AND workflow_dispatch inputs arrive as STRINGS —
-  # tonumber-coerce unconditionally.
-  plan:
-    name: Plan fan-out
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.fan.outputs.matrix }}
-      item: ${{ steps.fan.outputs.item }}
-      model: ${{ steps.fan.outputs.model }}
-      claude_version: ${{ steps.fan.outputs.claude_version }}
-    steps:
-      - name: Compute matrix
-        id: fan
-        env:
-          RAW_PARALLEL: ${{ github.event.client_payload.parallel || inputs.parallel || '1' }}
-          RAW_ITEM: ${{ github.event.client_payload.item || inputs.item || '' }}
-          RAW_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
-          RAW_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
-        run: |
-          set -euo pipefail
-          # Soft runaway guard, independent of the token-pool size (the run
-          # script spreads agents across however many tokens the pool holds;
-          # extra agents share accounts, which is allowed).
-          N=$(printf '%s' "$RAW_PARALLEL" | jq -R 'tonumber? // 1 | floor')
-          if [ "$N" -lt 1 ]; then N=1; fi
-          if [ "$N" -gt 8 ]; then
-            echo "::warning::parallel=$N capped to 8 (soft runaway guard)"
-            N=8
-          fi
-          echo "matrix=$(jq -cn --argjson n "$N" '[range(0;$n)]')" >> "$GITHUB_OUTPUT"
-          echo "item=$RAW_ITEM"             >> "$GITHUB_OUTPUT"
-          echo "model=$RAW_MODEL"           >> "$GITHUB_OUTPUT"
-          echo "claude_version=$RAW_VERSION" >> "$GITHUB_OUTPUT"
-          echo "✓ fan-out: $N agent(s) · item='${RAW_ITEM:-<board claim>}' · claude=$RAW_VERSION"
-
   agent:
-    name: Agent ${{ matrix.idx }}
-    needs: plan
+    name: Agent
     runs-on: ubuntu-latest
     # 30 min under GitHub's 360-min hard cap: leave room for the always-steps.
     timeout-minutes: 330
-    strategy:
-      fail-fast: false
-      matrix:
-        idx: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      # Both repository_dispatch client_payload values and workflow_dispatch
+      # inputs arrive as strings; either side may be absent per trigger.
+      ITEM_ARG: ${{ github.event.client_payload.item || inputs.item || '' }}
+      CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
+      CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
     steps:
-      # De-thrash the board sweep: parallel agents starting together would all
-      # rank the same Todo set at once. Claims stay atomic regardless — this
-      # only reduces wasted yield-and-retry rounds.
-      - name: Stagger start
-        if: matrix.idx != 0
-        run: sleep $(( ${{ matrix.idx }} * 90 ))
-
       # /clear-todo-issue's pre-flight REQUIRES a fork layout: origin = the
       # agent fork, upstream = the private repo. Full history (fetch-depth 0):
       # the agent does arbitrary git ops (conflict merges, history reads) and
@@ -195,8 +151,6 @@ jobs:
         run: bash scripts/mcp-codegraph.sh
 
       - name: Install Claude Code CLI
-        env:
-          CLAUDE_VERSION: ${{ needs.plan.outputs.claude_version }}
         run: |
           set -euo pipefail
           curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
@@ -205,16 +159,14 @@ jobs:
 
       # The main event. GH_TOKEN = PAT_TOKEN is the gh identity for the whole
       # session (claim refs, board GraphQL, PR create, /watch-ci across the
-      # fleet orgs). The wrapper owns token-pool selection + mid-run failover.
-      # No ANTHROPIC_API_KEY here — ever (it outranks the OAuth pool).
+      # fleet orgs). The wrapper owns workspace trust, token-pool selection and
+      # mid-run failover. No ANTHROPIC_API_KEY here — ever (it outranks the
+      # OAuth pool).
       - name: Run /clear-todo-issue headless
         id: run
         env:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-          AGENT_INDEX: ${{ matrix.idx }}
-          ITEM_ARG: ${{ needs.plan.outputs.item }}
-          CLAUDE_MODEL: ${{ needs.plan.outputs.model }}
         run: bash .github/scripts/agent-claude-run.sh
 
       # PUBLIC artifact (this is a public repo) — accepted trade-off.
@@ -222,7 +174,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: agent-transcript-${{ matrix.idx }}
+          name: agent-transcript
           path: |
             agent-transcript.jsonl
             agent-result.json
@@ -234,7 +186,7 @@ jobs:
         run: |
           set -uo pipefail
           {
-            echo "### Agent ${{ matrix.idx }} — /clear-todo-issue"
+            echo "### Agent — /clear-todo-issue"
             echo ""
             if [ -s agent-result.json ]; then
               SUBTYPE=$(jq -r '.subtype // "n/a"' agent-result.json)
@@ -252,7 +204,7 @@ jobs:
 
       # Terminal-state backstop. If the run died AFTER claiming but BEFORE a
       # terminal checkpoint, the item is stranded In Progress/assigned with a
-      # live claim ref — flag it on the issue so a human (or the next tick's
+      # live claim ref — flag it on the issue so a human (or the next run's
       # returned-from-Pending path) can unstick it. If a PR was already open
       # with the auto-merge label, ppap's ci-pr.yml still lands it on
       # green+clean, so this is chiefly the pre-PR window. Best-effort: grep
@@ -297,7 +249,7 @@ jobs:
             echo "Telegram not configured — skipping notify."
             exit 0
           fi
-          TEXT="🤖🚨 <b>Agent run failed</b> — clear-todo-issue (agent ${{ matrix.idx }})"
+          TEXT="🤖🚨 <b>Agent run failed</b> — clear-todo-issue"
           TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
           THREAD_ARGS=()
           if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
