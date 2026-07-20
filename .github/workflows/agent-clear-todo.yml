@@ -140,6 +140,13 @@ jobs:
       - name: Install Playwright Chromium
         run: pnpm exec playwright install --with-deps chromium
 
+      # Pre-warm the @playwright/mcp npx cache: .mcp.json spawns TWO servers
+      # (headed + headless) concurrently at session start, and a cold npx cache
+      # races its own install (same ENOTEMPTY class as codegraph's npx note) —
+      # observed as playwright-headless:failed in a live run's init line.
+      - name: Pre-warm playwright MCP package
+        run: npx -y @playwright/mcp --version
+
       # The codegraph MCP server serves a ~330MB gitignored SQLite index.
       # Content-keyed cache (NOT github.sha — that would be THIS repo's sha,
       # not the indexed checkout's): exact hit skips the build, a stale restore
@@ -208,15 +215,18 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
-      # Terminal-state backstop. If the run died AFTER claiming but BEFORE a
+      # Terminal-state backstop. If the run ended AFTER claiming but BEFORE a
       # terminal checkpoint, the item is stranded In Progress/assigned with a
       # live claim ref — flag it on the issue so a human (or the next run's
-      # returned-from-Pending path) can unstick it. If a PR was already open
-      # with the auto-merge label, ppap's ci-pr.yml still lands it on
-      # green+clean, so this is chiefly the pre-PR window. Best-effort: grep
-      # heuristics over the transcript, never reds the job further.
+      # returned-from-Pending path) can unstick it. Runs on always(): a
+      # silent-stop run can end with job conclusion SUCCESS (run 29733332566 /
+      # issue #1157), so failure() alone misses the exact case this exists
+      # for. The greps no-op on a genuinely terminal run. If a PR was already
+      # open with the auto-merge label, ppap's ci-pr.yml still lands it on
+      # green+clean, so this is chiefly the pre-PR window. Best-effort, never
+      # reds the job further.
       - name: Flag stranded item
-        if: failure() || cancelled()
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -224,7 +234,7 @@ jobs:
           set +e
           [ -s agent-transcript.jsonl ] || exit 0
           grep -q 'claimed + branch' agent-transcript.jsonl || exit 0
-          if grep -qE 'merged PR #|parked to Pending|split into .* slices|BACKLOG EMPTY' agent-transcript.jsonl; then
+          if grep -aqE 'merged PR #|PR #[0-9]+ merged|parked to Pending|split into [0-9]+ slices|BACKLOG EMPTY|abandoned \(already covered\)' agent-transcript.jsonl; then
             echo "terminal checkpoint found — nothing stranded"
             exit 0
           fi
