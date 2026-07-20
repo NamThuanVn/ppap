@@ -252,7 +252,17 @@ jobs:
           set +e
           [ -s agent-transcript.jsonl ] || exit 0
           grep -q 'claimed + branch' agent-transcript.jsonl || exit 0
-          if grep -aqE 'merged PR #|PR #[0-9]+ merged|parked to Pending|split into [0-9]+ slices|BACKLOG EMPTY|abandoned \(already covered\)' agent-transcript.jsonl; then
+          # A genuine terminal state is the final run-summary block the agent
+          # PRINTS as assistant TEXT — a concrete `Result:` line. A whole-file
+          # grep false-positives: the loaded command doc (user/system event) and
+          # the agent's own ScheduleWakeup nudge prompts (tool_use inputs) both
+          # quote every marker phrase as a template, so a stranded run mid-boot-
+          # wait mis-cleared here on a "parked to Pending" inside a wakeup prompt
+          # (run 29742534515). Restrict to assistant text (fromjson? skips the
+          # stderr lines tee merges in) and anchor on the emitted Result: line.
+          if jq -rR 'fromjson? | select(.type=="assistant") | .message.content[]?
+                       | select(.type=="text") | .text' agent-transcript.jsonl 2>/dev/null \
+               | grep -qE '^Result: +(merged PR #[0-9]+|parked to Pending|split into [0-9]+ slices|abandoned \(already covered\)|BACKLOG EMPTY)'; then
             echo "terminal checkpoint found — nothing stranded"
             exit 0
           fi
