@@ -11,13 +11,14 @@ name: Agent · loop
 #     agent-todo-dispatch.yml with an empty `item` (repository_dispatch);
 #   · by ba-to-issues.yml in the private repo after a merged BA-docs PR minted
 #     at least one sweepable (ba-bug/ba-change) issue;
-#   · by each agent run that ends in a PRODUCTIVE terminal state (merged /
-#     parked / split / abandoned) — the "Continue loop" step in
-#     agent-clear-todo.yml. A BACKLOG EMPTY or failed run never re-triggers,
-#     so the loop always winds down even though the backlog probe over-counts
-#     (an over-counted candidate yields one BACKLOG EMPTY run, which dies).
+#   · by each agent run that EXECUTED a solve-verdict (MERGED / PARK / SPLIT /
+#     ABANDONED with green executor steps) — the "Continue loop" step in
+#     agent-clear-todo.yml. A backlog-empty claim, a NONE verdict (salvaged
+#     run), or any failure never re-triggers, so the loop always winds down
+#     even though the backlog probe over-counts (an over-counted candidate
+#     yields one cheap backlog-empty claim run, which dies pre-bootstrap).
 #
-# Cap = repo variable AGENT_MAX_PARALLEL (unset → 2). KILL SWITCH:
+# Cap = repo variable AGENT_MAX_PARALLEL (unset → 6). KILL SWITCH:
 #   gh variable set AGENT_MAX_PARALLEL -R NamThuanVn/ppap --body 0
 # → this controller dispatches nothing; in-flight agents finish their current
 # item and their lanes die (top-up yields 0). Keep the cap conservative: agent
@@ -39,7 +40,7 @@ on:
   workflow_dispatch:
     inputs:
       max_parallel:
-        description: 'Override the AGENT_MAX_PARALLEL cap for this invocation only (empty = repo variable, unset variable = 2).'
+        description: 'Override the AGENT_MAX_PARALLEL cap for this invocation only (empty = repo variable, unset variable = 6).'
         required: false
         default: ''
         type: string
@@ -70,14 +71,13 @@ jobs:
       # inputs arrive as STRINGS; either side may be absent per trigger.
       CAP_OVERRIDE: ${{ github.event.client_payload.max_parallel || inputs.max_parallel || '' }}
       CAP_VAR: ${{ vars.AGENT_MAX_PARALLEL || '' }}
-      EXCLUDE_RUN_ID: ${{ github.event.client_payload.exclude_run_id || '' }}
       TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
     steps:
       - name: Resolve cap
         id: cap
         run: |
           set -euo pipefail
-          CAP="${CAP_OVERRIDE:-${CAP_VAR:-2}}"
+          CAP="${CAP_OVERRIDE:-${CAP_VAR:-6}}"
           if ! printf '%s' "$CAP" | grep -qE '^[0-9]+$'; then
             echo "::error::cap '$CAP' is not a non-negative integer (payload/input override or AGENT_MAX_PARALLEL variable)"
             exit 1
@@ -91,12 +91,12 @@ jobs:
           fi
           echo "cap=$CAP" >> "$GITHUB_OUTPUT"
 
-      # Same intentionally-over-counting probe as the private dispatcher used
-      # to run (open + unassigned; board Status/blockers invisible): the
-      # agent's Phase 0 is the authoritative check and exits BACKLOG EMPTY
-      # harmlessly on a false positive. ba-feature is EXCLUDED on purpose —
-      # new-feature issues are manual-only (never auto-swept), so counting
-      # them would burn one BACKLOG EMPTY run per tick forever.
+      # Intentionally-over-counting probe (open + unassigned; board Status/
+      # blockers invisible): agent-clear-todo's scripted claim is the
+      # authoritative check and ends a false-positive run in ~1-2 min, before
+      # the heavy bootstrap. ba-feature is EXCLUDED on purpose — new-feature
+      # issues are manual-only (never auto-swept), so counting them would burn
+      # one empty claim run per tick forever.
       - name: Probe private-repo backlog
         id: probe
         if: steps.cap.outputs.proceed == 'true'
@@ -132,26 +132,34 @@ jobs:
           CANDIDATES: ${{ steps.probe.outputs.candidates }}
         run: |
           set -euo pipefail
-          # The runs-list `status` param is single-valued → two calls. Use the
-          # top-level total_count (server-side filtered count) — never
-          # `.workflow_runs | length`, which is bounded by per_page.
+          # The runs-list `status` param is single-valued → two calls. The list
+          # index is EVENTUALLY CONSISTENT: a just-completed run can stay
+          # listed as in_progress for several seconds after it finished —
+          # observed live (controller 29755617192 counted active=2 with one
+          # real agent → K=0 → a lane died with 4 candidates on the board). So
+          # never trust the list alone: collect the candidate run IDS, then
+          # fresh-verify EACH with a direct GET (strongly consistent) and
+          # count only genuine queued/in_progress survivors. A failed per-id
+          # GET counts as active (conservative — never overshoots the cap;
+          # active runs ≤ cap, so per_page=100 needs no pagination).
+          IDS=$(for S in queued in_progress; do
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${AGENT_WORKFLOW}/runs?status=${S}&per_page=100" \
+              --jq '.workflow_runs[].id'
+          done | sort -u)
           ACTIVE=0
-          for S in queued in_progress; do
-            N=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${AGENT_WORKFLOW}/runs?status=${S}&per_page=1" \
-              --jq '.total_count')
-            echo "· $S agent runs: $N"
-            ACTIVE=$(( ACTIVE + N ))
+          for ID in $IDS; do
+            ST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ID}" --jq '.status' 2>/dev/null || echo "unknown")
+            case "$ST" in
+              queued|in_progress|unknown)
+                ACTIVE=$(( ACTIVE + 1 ))
+                echo "· run $ID: $ST (counted)"
+                ;;
+              *)
+                echo "· run $ID: $ST — stale list entry, not counted"
+                ;;
+            esac
           done
-          # A chain-dispatching lane is dying but its job is still in_progress
-          # (post-run steps) — don't let it hold a slot it is about to free.
-          if [ -n "${EXCLUDE_RUN_ID:-}" ]; then
-            ST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${EXCLUDE_RUN_ID}" --jq '.status' 2>/dev/null || echo "unknown")
-            if [ "$ST" = "queued" ] || [ "$ST" = "in_progress" ]; then
-              ACTIVE=$(( ACTIVE - 1 ))
-              echo "· excluding finishing run $EXCLUDE_RUN_ID (status=$ST) → active=$ACTIVE"
-            fi
-          fi
-          [ "$ACTIVE" -lt 0 ] && ACTIVE=0
+          echo "· live agent runs: $ACTIVE"
           K=$(( CAP - ACTIVE ))
           [ "$K" -gt "$CANDIDATES" ] && K="$CANDIDATES"
           [ "$K" -lt 0 ] && K=0

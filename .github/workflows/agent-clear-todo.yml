@@ -1,37 +1,48 @@
 name: Agent · clear-todo-issue
 
-# Runs the repo's autonomous /clear-todo-issue Claude Code session HEADLESS on
-# ppap's free public-repo runners. ONE run = ONE agent = ONE item: it claims a
-# single Project #1 Todo item (atomic create-ref on the agent fork), implements
-# + tests + browse-verifies it, opens a draft PR labeled auto-merge, drives CI
-# green+clean, ends the item Done (merged) or parked to Pending, then the run
-# finishes. Parallelism + repetition are owned by agent-loop.yml (the top-up
-# controller in this repo): loop-spawned runs carry client_payload.loop='true',
-# and the final "Continue loop" step chains back to the controller ONLY when
-# this run ended in a PRODUCTIVE terminal state — a BACKLOG EMPTY or failed
-# run never chains, so the loop always terminates. One-shot runs (manual
-# workflow_dispatch, or the private dispatcher with an `item`) carry no loop
-# flag and never chain.
+# Runs ONE headless agent iteration on ppap's free public-repo runners.
+# ONE run = ONE agent = ONE item. Since the solve-issue split, a loop run is a
+# PIPELINE, not a single LLM session:
 #
-# The Claude Code CLI is installed directly (NOT claude-code-action) so the
-# full repo experience loads: CLAUDE.md, slash commands, Stop hooks
-# (require-tests …), .mcp.json MCP servers (codegraph, playwright-headless)
-# and subagents.
+#   1. SCRIPTED CLAIM (agent-board/claim-todo.mjs, BEFORE the heavy bootstrap):
+#      picks an eligible Project #1 Todo leaf, wins the atomic create-ref lock,
+#      assigns + flips the board — deterministically (stale claim refs are
+#      auto-cleaned age-gated via STALE_REF_HOURS; slice branches carry the
+#      canonical -s<issue> suffix). Empty backlog → the job ends GREEN here in
+#      ~1-2 min (bootstrap skipped) and never chains the loop.
+#   2. /solve-issue (Claude Code CLI, installed directly — NOT
+#      claude-code-action — so CLAUDE.md, slash commands, Stop hooks, .mcp.json
+#      MCP servers and subagents all load): solves the pre-claimed item to a
+#      confirmed-merged PR, or emits a typed solve-verdict block. ZERO board
+#      writes inside the session.
+#   3. EXECUTORS (typed on the parsed verdict): finalize-merged / execute-park /
+#      execute-split mutate the board; salvage-or-revert is the backstop for a
+#      run that died without a verdict — it preserves WIP on a
+#      salvage/<issue>-<run_id> branch + draft PR + Claude-session artifact,
+#      then releases the item back to Todo (the next claim resumes it).
 #
-# Claude auth is a POOL of subscription accounts: the CLAUDE_CODE_OAUTH_TOKENS
-# secret holds a newline-separated list of tokens (add one = edit the secret,
-# no workflow change). .github/scripts/agent-claude-run.sh probes each for
-# an available quota window, rotates the starting account per run, and fails
-# over mid-run (--resume) when one hits its usage limit. GitHub identity is
-# PAT_TOKEN (the itdevnamthuan account) — the checkout targets ITS fork, so
-# claims are atomic among all CI agents (they share this fork as `origin`).
-# Human sessions on OTHER forks are covered by the command's open-PR backstop.
+# A manual `item` input (issue URL / PR number / docs-ba folder) takes the
+# LEGACY WRAPPER path instead: no scripted claim; the session runs
+# /clear-todo-issue <item>, which does its own claim + board writes.
 #
-# Dispatched from the private repo by agent-todo-dispatch.yml
-# (repository_dispatch[agent-todo]); workflow_dispatch is the manual/smoke-test
-# entry. Filename is deliberately NOT ci-*.yml → the sync mirrors it to
-# NamThuanVn/ppap only, never to the CI fleet. NOTE the transcript artifact +
-# logs are PUBLIC (accepted trade-off — see .claude/ppap.md § Agent runs).
+# Parallelism + repetition are owned by agent-loop.yml: loop-spawned runs carry
+# client_payload.loop='true', and the final "Continue loop" step chains back to
+# the controller ONLY on an executed verdict (MERGED/PARK/SPLIT/ABANDONED with
+# green executors). A backlog-empty claim, a NONE verdict (salvaged), or any
+# failure never chains — the loop always terminates.
+#
+# Claude auth is a POOL of subscription accounts (CLAUDE_CODE_OAUTH_TOKENS, one
+# newline-separated secret); .github/scripts/agent-claude-run.sh probes,
+# rotates, and fails over mid-run. GitHub identity is PAT_TOKEN (the
+# itdevnamthuan account) — the checkout targets ITS fork, so claims are atomic
+# among all CI agents. Human sessions on OTHER forks are covered by the
+# open-PR backstop.
+#
+# Dispatched by agent-loop.yml (repository_dispatch[agent-todo]);
+# workflow_dispatch is the manual/smoke-test entry. Filename is deliberately
+# NOT ci-*.yml → the sync mirrors it to NamThuanVn/ppap only, never to the CI
+# fleet. NOTE the transcript + session artifacts and logs are PUBLIC (accepted
+# trade-off — see .claude/ppap.md § Agent runs).
 
 run-name: "${{ format('Agent · todo · by {0}', github.event.client_payload.triggered_by || github.actor) }}"
 
@@ -41,7 +52,7 @@ on:
   workflow_dispatch:
     inputs:
       item:
-        description: 'Optional /clear-todo-issue argument (issue URL/number, PR number, or docs/ba folder path). Empty = board Todo claim.'
+        description: 'Optional: issue URL/number, PR number, or docs/ba folder path → one-shot LEGACY /clear-todo-issue <item> run. Empty = scripted board claim + /solve-issue.'
         required: false
         default: ''
         type: string
@@ -60,7 +71,8 @@ permissions: read-all
 
 # NO concurrency group on purpose: independent runs must coexist, and a new
 # dispatch must never cancel an in-flight agent mid-item (a cancelled agent
-# strands its claimed item In Progress).
+# strands its claimed item In Progress until salvage-or-revert / the stale-ref
+# rule recovers it).
 
 env:
   PRIVATE_REPO: NamThuanVn/erp-namthuan
@@ -73,7 +85,8 @@ jobs:
   agent:
     name: Agent
     runs-on: ubuntu-latest
-    # 30 min under GitHub's 360-min hard cap: leave room for the always-steps.
+    # 30 min under GitHub's 360-min hard cap: leave room for the always-steps
+    # (a timeout-killed run still executes salvage-or-revert).
     timeout-minutes: 330
     env:
       # Both repository_dispatch client_payload values and workflow_dispatch
@@ -82,10 +95,10 @@ jobs:
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
     steps:
-      # /clear-todo-issue's pre-flight REQUIRES a fork layout: origin = the
-      # agent fork, upstream = the private repo. Full history (fetch-depth 0):
-      # the agent does arbitrary git ops (conflict merges, history reads) and
-      # shallow-clone edge cases are subtle CI-only failures.
+      # /solve-issue's pre-flight REQUIRES a fork layout: origin = the agent
+      # fork, upstream = the private repo. Full history (fetch-depth 0): the
+      # agent does arbitrary git ops and shallow-clone edge cases are subtle
+      # CI-only failures.
       - name: Checkout agent fork
         uses: actions/checkout@v6
         with:
@@ -95,12 +108,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Fork sync is a manual local-only step in normal dev (scripts/
-      # sync-fork.sh) — nothing keeps the fork fresh unattended, and a stale
-      # fork would run every bootstrap step below at an old revision. Freshen
-      # it FIRST, then wire the dual-remote layout + git identity the command
-      # expects. `gh auth setup-git` installs a credential helper covering
-      # every github.com remote (fork pushes + upstream fetches).
+      # Fork sync is a manual local-only step in normal dev — freshen it FIRST,
+      # then wire the dual-remote layout + git identity. `gh auth setup-git`
+      # installs a credential helper covering every github.com remote.
       - name: Freshen fork + set up remotes and identity
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
@@ -109,10 +119,7 @@ jobs:
           gh repo sync "$FORK_REPO" -b main
           gh auth setup-git
           # Pin gh's default repo to the fork: with origin+upstream remotes and
-          # no default, bare `gh repo view` resolves ambiguously in CI (the
-          # first live run wasted turns disambiguating) — pinned, the command's
-          # pre-flight `gh repo view --json parent` resolves fork + parent
-          # exactly as on a dev machine.
+          # no default, bare `gh repo view` resolves ambiguously in CI.
           gh repo set-default "$FORK_REPO"
           git fetch origin main
           git reset --hard origin/main
@@ -123,40 +130,90 @@ jobs:
           git config user.email "${LOGIN}@users.noreply.github.com"
           echo "✓ fork fresh at $(git rev-parse --short HEAD) · acting as @$LOGIN"
 
+      # Scripted claim — BEFORE the heavy bootstrap, so an empty backlog costs
+      # ~1-2 min instead of a 10-min install. Writes claim.json + outputs.
+      # Exit 0 + claimed=false on empty backlog; exit 1 only on a hard API
+      # error AFTER rolling back any partial claim (nothing strands).
+      - name: Claim Todo item
+        id: claim
+        if: env.ITEM_ARG == ''
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          STALE_REF_HOURS: ${{ vars.STALE_REF_HOURS || '3.5' }}
+        run: node .github/scripts/agent-board/claim-todo.mjs
+
+      # A prior interrupted run on this issue left a salvage pointer → restore
+      # its Claude session so the agent RESUMES with full context. Best-effort:
+      # an expired/missing artifact just means a fresh start from the salvage
+      # branch (the code WIP is what matters).
+      - name: Restore salvaged session
+        if: steps.claim.outputs.salvage_run_id != '' && steps.claim.outputs.session_artifact != ''
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          SALVAGE_RUN_ID: ${{ steps.claim.outputs.salvage_run_id }}
+          ARTIFACT: ${{ steps.claim.outputs.session_artifact }}
+          SESSION_ID: ${{ steps.claim.outputs.session_id }}
+        run: |
+          set +e
+          gh run download "$SALVAGE_RUN_ID" --repo "${GITHUB_REPOSITORY}" \
+            -n "$ARTIFACT" -D claude-session-restore
+          if [ ! -s "claude-session-restore/${SESSION_ID}.jsonl" ]; then
+            echo "::notice::session artifact unavailable/expired — fresh start from the salvage branch"
+            exit 0
+          fi
+          PROJECT_DIR=$(node -e "console.log(JSON.parse(require('fs').readFileSync('claude-session-restore/session-meta.json','utf8')).project_dir || '')" 2>/dev/null)
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "::notice::no project_dir in session-meta — fresh start"
+            exit 0
+          fi
+          mkdir -p "$HOME/.claude/projects/$PROJECT_DIR"
+          cp "claude-session-restore/${SESSION_ID}.jsonl" "$HOME/.claude/projects/$PROJECT_DIR/"
+          echo "RESUME_SESSION_ID=$SESSION_ID" >> "$GITHUB_ENV"
+          echo "✓ session $SESSION_ID restored for resume"
+          exit 0
+
+      # ── Heavy bootstrap — skipped entirely on an empty backlog ────────────
       - name: Install dependencies
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         uses: ./.github/actions/install
 
       # Same Chromium cache pattern as ci-checks.yml — /browse (headless) and
       # any e2e the agent runs need it.
       - name: Resolve Playwright version
         id: pw
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         run: |
           set -euo pipefail
           VER=$(node -e "console.log(require('./node_modules/@playwright/test/package.json').version)")
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
       - name: Cache Playwright browsers
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         uses: actions/cache@v5
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
 
       - name: Install Playwright Chromium
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         run: pnpm exec playwright install --with-deps chromium
 
       # Pre-warm the @playwright/mcp npx cache: .mcp.json spawns TWO servers
       # (headed + headless) concurrently at session start, and a cold npx cache
-      # races its own install (same ENOTEMPTY class as codegraph's npx note) —
-      # observed as playwright-headless:failed in a live run's init line.
+      # races its own install — observed as playwright-headless:failed.
       - name: Pre-warm playwright MCP package
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         run: npx -y @playwright/mcp --version
 
       # The codegraph MCP server serves a ~330MB gitignored SQLite index.
-      # Content-keyed cache (NOT github.sha — that would be THIS repo's sha,
-      # not the indexed checkout's): exact hit skips the build, a stale restore
-      # is reconciled by the script's fast `codegraph sync` path, a miss pays
-      # the full `init -i`.
+      # Content-keyed cache (NOT github.sha — that would be THIS repo's sha).
+      # The index BUILD happens inside worktree:init below (its mcp:codegraph
+      # step runs scripts/mcp-codegraph.sh: exact cache hit → skip, stale
+      # restore → fast `codegraph sync`, miss → full `init -i`) — there is
+      # deliberately NO separate build step (it would run the same script
+      # twice).
       - name: Cache codegraph index
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         uses: actions/cache@v5
         with:
           path: .codegraph
@@ -164,10 +221,8 @@ jobs:
           restore-keys: |
             codegraph-v1-
 
-      - name: Build codegraph index
-        run: bash scripts/mcp-codegraph.sh
-
       - name: Install Claude Code CLI
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         run: |
           set -euo pipefail
           curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
@@ -179,72 +234,99 @@ jobs:
       # the install action already ran) → db:reset (local D1 wipe +
       # migrations + demo seeds: the agent's dev:serve//browse stack needs
       # them ready instead of burning session turns seeding) → codegraph
-      # re-sync (fast skip on the cached index) → MCP wiring (sentry /
+      # build/sync (against the cache restored above) → MCP wiring (sentry /
       # playwright / databases; databases skips cleanly when uv is absent,
       # and the wrapper's later ~/.claude.json trust seed MERGES, so these
       # registrations survive). Placed AFTER the CLI install on purpose: the
       # mcp:* scripts hard-require `claude` in PATH. --verbose = plain
       # sequential output for the public job log (no spinner interleaving).
       - name: First-time setup (pnpm worktree:init)
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         run: pnpm worktree:init --verbose
 
       # The main event. GH_TOKEN = PAT_TOKEN is the gh identity for the whole
-      # session (claim refs, board GraphQL, PR create, /watch-ci across the
-      # fleet orgs). The wrapper owns workspace trust, token-pool selection and
-      # mid-run failover. No ANTHROPIC_API_KEY here — ever (it outranks the
-      # OAuth pool).
-      - name: Run /clear-todo-issue headless
+      # session (board GraphQL reads, PR create, /watch-ci across the fleet
+      # orgs). The wrapper owns workspace trust, token-pool selection,
+      # mid-run failover, mode detection (claim.json → /solve-issue; ITEM_ARG
+      # → legacy /clear-todo-issue), and the salvaged-session resume. No
+      # ANTHROPIC_API_KEY here — ever (it outranks the OAuth pool).
+      - name: Run agent
         id: run
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: bash .github/scripts/agent-claude-run.sh
 
-      # PUBLIC artifact (this is a public repo) — accepted trade-off.
-      - name: Upload transcript
-        if: always()
+      # ── Typed verdict pipeline (claim-mode runs only) ─────────────────────
+      # Parse never fails: no/invalid/mismatched verdict → verdict=NONE, which
+      # routes to salvage-or-revert below.
+      - name: Parse solve outcome
+        id: outcome
+        if: always() && steps.claim.outputs.claimed == 'true'
+        run: node .github/scripts/agent-board/parse-verdict.mjs
+
+      - name: Finalize merged
+        id: finalize
+        if: always() && steps.outcome.outputs.verdict == 'MERGED'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: node .github/scripts/agent-board/finalize-merged.mjs
+
+      - name: Execute park
+        id: park
+        if: always() && steps.outcome.outputs.verdict == 'PARK'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: node .github/scripts/agent-board/execute-park.mjs
+
+      - name: Execute split
+        id: split
+        if: always() && steps.outcome.outputs.verdict == 'SPLIT'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: node .github/scripts/agent-board/execute-split.mjs
+
+      # Backstop for a run with no executed verdict (failed / cancelled /
+      # timed out / verdict=NONE): preserve WIP on salvage/<issue>-<run_id> +
+      # draft PR (Refs, never Closes) + session artifact, then release the
+      # item back to Todo (unassign + delete claim ref). A run whose claim
+      # branch already has a real PR is left alone (auto-merge lands it).
+      # Executor failures are flag-only. Never reds the job further.
+      - name: Salvage or revert
+        id: salvage
+        if: always() && steps.claim.outputs.claimed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+          VERDICT: ${{ steps.outcome.outputs.verdict || 'NONE' }}
+          EXECUTOR_FAILED: ${{ steps.finalize.outcome == 'failure' || steps.park.outcome == 'failure' || steps.split.outcome == 'failure' }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STALE_REF_HOURS: ${{ vars.STALE_REF_HOURS || '3.5' }}
+        run: node .github/scripts/agent-board/salvage-or-revert.mjs
+
+      # PUBLIC artifact (this is a public repo) — accepted trade-off. The next
+      # claim of the same issue downloads it to resume the session.
+      - name: Upload Claude session (salvage)
+        if: always() && steps.salvage.outputs.session_artifact != ''
         uses: actions/upload-artifact@v7
         with:
-          name: agent-transcript
-          path: |
-            agent-transcript.jsonl
-            agent-result.json
-          retention-days: 7
-          if-no-files-found: ignore
+          name: ${{ steps.salvage.outputs.session_artifact }}
+          path: claude-session/
+          retention-days: 14
+          if-no-files-found: warn
 
-      - name: Job summary
-        if: always()
-        run: |
-          set -uo pipefail
-          {
-            echo "### Agent — /clear-todo-issue"
-            echo ""
-            if [ -s agent-result.json ]; then
-              SUBTYPE=$(jq -r '.subtype // "n/a"' agent-result.json)
-              TURNS=$(jq -r '.num_turns // "n/a"' agent-result.json)
-              echo "- **Result subtype:** \`$SUBTYPE\` · **turns:** $TURNS"
-              echo ""
-              echo '```'
-              jq -r '.result // "<no result text>"' agent-result.json | tail -40
-              echo '```'
-            else
-              echo "_no result event captured (see transcript artifact)_"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit 0
-
-      # Terminal-state backstop. If the run ended AFTER claiming but BEFORE a
-      # terminal checkpoint, the item is stranded In Progress/assigned with a
-      # live claim ref — flag it on the issue so a human (or the next run's
-      # returned-from-Pending path) can unstick it. Runs on always(): a
-      # silent-stop run can end with job conclusion SUCCESS (run 29733332566 /
-      # issue #1157), so failure() alone misses the exact case this exists
-      # for. The greps no-op on a genuinely terminal run. If a PR was already
-      # open with the auto-merge label, ppap's ci-pr.yml still lands it on
-      # green+clean, so this is chiefly the pre-PR window. Best-effort, never
-      # reds the job further.
-      - name: Flag stranded item
-        if: always()
+      # Legacy terminal-state backstop for WRAPPER runs (manual `item`) — the
+      # session does its own claim + board writes there, so the scripted
+      # salvage above can't cover it. A genuine terminal state is the final
+      # run-summary block the agent PRINTS as assistant TEXT — a concrete
+      # `Result:` line. A whole-file grep false-positives: the loaded command
+      # doc (user/system event) and the agent's own ScheduleWakeup nudge
+      # prompts (tool_use inputs) both quote every marker phrase as a template
+      # (run 29742534515 mis-cleared exactly so). Best-effort, never reds the
+      # job further.
+      - name: Flag stranded item (wrapper runs)
+        if: always() && env.ITEM_ARG != ''
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -252,14 +334,6 @@ jobs:
           set +e
           [ -s agent-transcript.jsonl ] || exit 0
           grep -q 'claimed + branch' agent-transcript.jsonl || exit 0
-          # A genuine terminal state is the final run-summary block the agent
-          # PRINTS as assistant TEXT — a concrete `Result:` line. A whole-file
-          # grep false-positives: the loaded command doc (user/system event) and
-          # the agent's own ScheduleWakeup nudge prompts (tool_use inputs) both
-          # quote every marker phrase as a template, so a stranded run mid-boot-
-          # wait mis-cleared here on a "parked to Pending" inside a wakeup prompt
-          # (run 29742534515). Restrict to assistant text (fromjson? skips the
-          # stderr lines tee merges in) and anchor on the emitted Result: line.
           if jq -rR 'fromjson? | select(.type=="assistant") | .message.content[]?
                        | select(.type=="text") | .text' agent-transcript.jsonl 2>/dev/null \
                | grep -qE '^Result: +(merged PR #[0-9]+|parked to Pending|split into [0-9]+ slices|abandoned \(already covered\)|BACKLOG EMPTY)'; then
@@ -273,9 +347,55 @@ jobs:
             exit 0
           fi
           gh issue comment "$ISSUE" --repo "$PRIVATE_REPO" --body \
-            "⚠️ CI agent run ended without reaching a terminal state — this item may be stranded In Progress with a live claim branch. Run: $RUN_URL (see .claude/commands/clear-todo-issue.md § Stale claim refs)." \
+            "⚠️ CI agent run ended without reaching a terminal state — this item may be stranded In Progress with a live claim branch. Run: $RUN_URL (see .claude/commands/clear-todo-issue.md § Claim the item)." \
             && echo "✓ flagged possibly-stranded issue #$ISSUE" \
             || echo "::warning::could not comment on issue #$ISSUE"
+          exit 0
+
+      # PUBLIC artifact (this is a public repo) — accepted trade-off.
+      - name: Upload transcript
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-transcript
+          path: |
+            agent-transcript.jsonl
+            agent-result.json
+            claim.json
+            solve-verdict.json
+            session-meta.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "### Agent — one iteration"
+            echo ""
+            if [ -s claim.json ]; then
+              echo "- **Claim:** $(jq -r 'if .claimed then "#\(.issue) \(.kind) → \(.branch)" else "none (\(.reason))" end' claim.json)"
+            elif [ -n "${ITEM_ARG:-}" ]; then
+              echo "- **Mode:** legacy wrapper — item \`${ITEM_ARG}\`"
+            fi
+            if [ -s solve-verdict.json ]; then
+              echo "- **Verdict:** $(jq -r '.verdict + (if .data.pr then " (PR #\(.data.pr))" else "" end)' solve-verdict.json)"
+            fi
+            echo "- **Salvaged:** ${{ steps.salvage.outputs.salvaged || 'n/a' }}"
+            echo ""
+            if [ -s agent-result.json ]; then
+              SUBTYPE=$(jq -r '.subtype // "n/a"' agent-result.json)
+              TURNS=$(jq -r '.num_turns // "n/a"' agent-result.json)
+              echo "- **Result subtype:** \`$SUBTYPE\` · **turns:** $TURNS"
+              echo ""
+              echo '```'
+              jq -r '.result // "<no result text>"' agent-result.json | tail -40
+              echo '```'
+            else
+              echo "_no result event captured (see transcript artifact)_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
       # Failure-only Telegram to the build topic — same bot/secrets/shape as
@@ -308,36 +428,34 @@ jobs:
             echo "::warning::Telegram notify failed."
           fi
 
-      # Self-perpetuation (LAST step on purpose — the job exits right after
-      # dispatching, shrinking the window where this dying lane double-counts
-      # itself in the controller's active-run tally; exclude_run_id covers the
-      # rest). Chains ONLY when: the agent step succeeded, this run was
-      # loop-spawned (client_payload.loop == 'true' — STRING compare, payload
-      # values arrive as strings), AND the transcript shows a PRODUCTIVE
-      # terminal state. BACKLOG EMPTY and failures never chain — that is the
-      # invariant that lets the loop terminate despite agent-loop.yml's
-      # over-counting backlog probe. Best-effort: a failed chain dispatch just
-      # ends this lane (agent-todo-dispatch.yml or the next BA-docs merge
-      # restarts the loop); it never reds the job. always() + outcome gate so
-      # an artifact-upload hiccup can't kill the loop.
+      # Self-perpetuation (LAST step on purpose). Chains ONLY when this
+      # loop-spawned run EXECUTED a verdict: run step green + a typed verdict
+      # (never NONE) + no executor failure. A backlog-empty claim, a salvaged
+      # run, or any failure ends its lane — that is the invariant that lets
+      # the loop terminate (and stops a broken item from spinning
+      # fail→re-claim→fail). No exclude_run_id anymore: the controller
+      # fresh-verifies every listed run id, which supersedes it.
+      # `client_payload.loop == 'true'` is a STRING compare — payload values
+      # arrive as strings; never switch the producer to -F booleans.
       - name: Continue loop
-        if: always() && steps.run.outcome == 'success' && github.event.client_payload.loop == 'true'
+        if: >-
+          always() &&
+          github.event.client_payload.loop == 'true' &&
+          steps.run.outcome == 'success' &&
+          steps.claim.outputs.claimed == 'true' &&
+          steps.outcome.outputs.verdict != 'NONE' &&
+          steps.finalize.outcome != 'failure' &&
+          steps.park.outcome != 'failure' &&
+          steps.split.outcome != 'failure'
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
         run: |
           set +e
-          [ -s agent-transcript.jsonl ] || { echo "no transcript — lane ends here"; exit 0; }
-          # has_terminal() from agent-claude-run.sh MINUS 'BACKLOG EMPTY'.
-          if ! grep -aqE 'merged PR #|PR #[0-9]+ merged|parked to Pending|split into [0-9]+ slices|abandoned \(already covered\)' agent-transcript.jsonl; then
-            echo "no productive terminal state (BACKLOG EMPTY, most likely) — lane ends here"
-            exit 0
-          fi
           if gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
             -f event_type=agent-loop \
-            -f client_payload[triggered_by]="${TRIGGERED_BY}" \
-            -f client_payload[exclude_run_id]="${GITHUB_RUN_ID}"; then
-            echo "✓ chained agent-loop (exclude_run_id=${GITHUB_RUN_ID})"
+            -f client_payload[triggered_by]="${TRIGGERED_BY}"; then
+            echo "✓ chained agent-loop"
           else
             echo "::warning::agent-loop chain dispatch failed — this lane ends; restart via agent-todo-dispatch.yml or the next BA-docs merge"
           fi
