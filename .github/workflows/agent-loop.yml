@@ -14,9 +14,10 @@ name: Agent · loop
 #   · by each agent run that EXECUTED a solve-verdict (MERGED / PARK / SPLIT /
 #     ABANDONED with green executor steps) — the "Continue loop" step in
 #     agent-clear-todo.yml. A backlog-empty claim, a NONE verdict (salvaged
-#     run), or any failure never re-triggers, so the loop always winds down
-#     even though the backlog probe over-counts (an over-counted candidate
-#     yields one cheap backlog-empty claim run, which dies pre-bootstrap);
+#     run), or any failure never re-triggers, so the loop always winds down —
+#     the probe counts exact claim eligibility (COUNT_ONLY sweep below), and
+#     the residual race (a sibling lane claiming between probe and claim)
+#     yields one cheap backlog-empty run, which dies pre-bootstrap;
 #   · by agent-rel-plan.yml after a successful planning pass — the
 #     rel-planning gate below defers lane dispatch to that chain whenever any
 #     open BA leaf still lacks the `rel-planned` marker.
@@ -67,8 +68,9 @@ jobs:
     name: Top up agent pool
     runs-on: ubuntu-latest
     # A hung API call must not wedge the loop's concurrency slot for the
-    # default 360 min — the whole job is a handful of API calls + a 20s settle.
-    timeout-minutes: 5
+    # default 360 min — the job is a sparse checkout + the eligibility sweep
+    # (a few dozen API calls on a big backlog) + a 20s settle.
+    timeout-minutes: 10
     env:
       # Both repository_dispatch client_payload values and workflow_dispatch
       # inputs arrive as STRINGS; either side may be absent per trigger.
@@ -94,32 +96,49 @@ jobs:
           fi
           echo "cap=$CAP" >> "$GITHUB_OUTPUT"
 
-      # Intentionally-over-counting probe (open + unassigned; board Status/
-      # blockers invisible): agent-clear-todo's scripted claim is the
-      # authoritative check and ends a false-positive run in ~1-2 min, before
-      # the heavy bootstrap. ba-feature is EXCLUDED on purpose — new-feature
-      # issues are manual-only (never auto-swept), so counting them would burn
-      # one empty claim run per tick forever.
-      - name: Probe private-repo backlog
-        id: probe
+      # The claim script's own eligibility sweep runs the probe (COUNT_ONLY):
+      # leaf marker + board Todo + unassigned + no open blockers — the SAME
+      # rules the claim step enforces, so K never over-provisions. The old
+      # label count treated batch mains, parked (Pending) leaves, and blocked
+      # leaves as candidates — observed 6 lanes dispatched for 2 claimable
+      # tasks, 4 dying at the claim step. It also counts genuinely-Todo
+      # ba-feature leaves now (a human promoting a feature to Todo makes it
+      # claimable — the old blanket exclusion was an artifact of the dumb
+      # count). Still racy vs in-flight sibling lanes by design: the atomic
+      # claim stays the authority; a raced candidate costs one cheap
+      # backlog-empty run.
+      - name: Checkout board scripts (sparse)
+        if: steps.cap.outputs.proceed == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 1
+          sparse-checkout: .github/scripts/agent-board
+          persist-credentials: false
+
+      - name: Count claimable candidates
+        id: count
         if: steps.cap.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          COUNT_ONLY: '1'
+        run: node .github/scripts/agent-board/claim-todo.mjs
+
+      - name: Probe private-repo backlog (exact eligibility)
+        id: probe
+        if: steps.cap.outputs.proceed == 'true'
+        env:
+          TOTAL: ${{ steps.count.outputs.eligible || '0' }}
         run: |
           set -euo pipefail
-          TOTAL=0
-          for L in ba-bug ba-change; do
-            C=$(gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
-              --search "no:assignee" --json number --limit 100 | jq 'length')
-            echo "· $L — $C open unassigned issue(s)"
-            TOTAL=$(( TOTAL + C ))
-          done
           echo "candidates=$TOTAL" >> "$GITHUB_OUTPUT"
           if [ "$TOTAL" -eq 0 ]; then
-            echo "::notice::backlog empty (no open unassigned ba-bug/ba-change issues) — dispatching nothing"
+            echo "::notice::backlog empty (no Todo · unassigned · unblocked leaf) — dispatching nothing"
             echo "proceed=false" >> "$GITHUB_OUTPUT"
           else
-            echo "✓ $TOTAL candidate issue(s)"
+            echo "✓ $TOTAL claimable candidate(s)"
             echo "proceed=true" >> "$GITHUB_OUTPUT"
           fi
 
