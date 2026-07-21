@@ -1,0 +1,237 @@
+name: Agent · rel-plan
+
+# Relationship-planning run for the agent loop: assesses ordering across all
+# open BA leaves and wires GitHub issue dependencies (blocked-by edges) BEFORE
+# any solve lane claims — the scripted claim respects blockedBy edges, but
+# planning is what SETS them. This is /clear-todo-issue's Phase 0-pre planning
+# half, running the shared /rel-plan-todo skill headless (LOCAL wrapper ticks
+# invoke the same skill — keep them in lockstep).
+#
+# Dispatched by agent-loop.yml's rel-planning gate whenever any open leaf
+# lacks the `rel-planned` label; the controller defers lane dispatch until the
+# board is fully planned. On success this job ALWAYS re-dispatches agent-loop
+# (even when it found nothing to plan — a gate/plan race must not strand the
+# deferred lanes). On failure it never chains (standard failure-never-chains
+# invariant): the loop stalls safely until the next trigger instead of
+# spinning plan→fail→plan.
+#
+# Enforcement is deterministic, not transcript-trust: the "Verify plan
+# coverage" step re-runs the SAME unplanned-leaf query after the session and
+# fails the job while any leaf is still unplanned. That query is load-bearing
+# in three places (the gate in agent-loop.yml, the skill's sweep, the recount
+# here) — change all three together or the loop ping-pongs/stalls.
+#
+# LIGHT bootstrap on purpose: checkout + gh + Claude CLI only. No pnpm
+# install, no Playwright, no codegraph — the planner reads spec files and
+# calls gh; MCP servers are stripped by the wrapper (REL_PLAN=1).
+#
+# Filename is deliberately NOT ci-*.yml → the sync mirrors it to
+# NamThuanVn/ppap only, never to the CI fleet. Transcript artifact + logs are
+# PUBLIC (accepted trade-off — see .claude/ppap.md § Agent runs).
+
+run-name: "${{ format('Agent · rel-plan · by {0}', github.event.client_payload.triggered_by || github.actor) }}"
+
+on:
+  repository_dispatch:
+    types: [agent-rel-plan]
+  workflow_dispatch:
+    inputs:
+      claude_version:
+        description: 'Claude Code CLI version to install (pin; bump deliberately).'
+        required: false
+        default: '2.1.211'
+        type: string
+      model:
+        description: 'Optional --model override for the planning session (empty = account default).'
+        required: false
+        default: ''
+        type: string
+
+permissions: read-all
+
+# One planner at a time; duplicate gate dispatches coalesce into one queued
+# run that finds everything planned, no-ops, and still chains the loop.
+# cancel-in-progress stays false: a planning session mid-edge-writing must
+# never be killed halfway.
+concurrency:
+  group: agent-rel-plan
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+  FORK_REPO: itdevnamthuan/erp-namthuan
+
+jobs:
+  plan:
+    name: Rel-plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
+      CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
+    steps:
+      # Same fork layout as agent-clear-todo.yml: the skill resolves the
+      # upstream slug from the remotes, and the freshened checkout carries the
+      # merged BA spec files the planner reads.
+      - name: Checkout agent fork
+        uses: actions/checkout@v6
+        with:
+          repository: itdevnamthuan/erp-namthuan
+          ref: main
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Freshen fork + set up remotes and identity
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh repo sync "$FORK_REPO" -b main
+          gh auth setup-git
+          gh repo set-default "$FORK_REPO"
+          git fetch origin main
+          git reset --hard origin/main
+          git remote add upstream "https://github.com/${PRIVATE_REPO}.git"
+          LOGIN=$(gh api user --jq .login)
+          git config user.name "$LOGIN"
+          git config user.email "${LOGIN}@users.noreply.github.com"
+          echo "✓ fork fresh at $(git rev-parse --short HEAD) · acting as @$LOGIN"
+
+      # The SAME query as agent-loop.yml's gate and the recount below: open
+      # leaf (by leaf marker — batch mains never plan) lacking `rel-planned`.
+      - name: Detect unplanned leaves
+        id: sweep
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          UNPLANNED=$(for L in ba-bug ba-change ba-feature; do
+            gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
+              --json number,body,labels --limit 200 \
+              --jq '.[] | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
+          done | sort -u | wc -l | tr -d ' ')
+          echo "unplanned=$UNPLANNED" >> "$GITHUB_OUTPUT"
+          if [ "$UNPLANNED" -eq 0 ]; then
+            echo "::notice::every open leaf is already rel-planned — nothing to plan (still chaining the loop)"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "✓ $UNPLANNED unplanned leaf/leaves"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Claude Code CLI
+        if: steps.sweep.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version
+
+      # REL_PLAN=1 → the wrapper runs `/rel-plan-todo` (MCP stripped, token
+      # pool probe/rotation/failover as usual). Planning writes ONLY
+      # addBlockedBy edges + the rel-planned label — no assign/board/close.
+      - name: Run planner
+        id: run
+        if: steps.sweep.outputs.proceed == 'true'
+        env:
+          REL_PLAN: '1'
+          CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: bash .github/scripts/agent-claude-run.sh
+
+      # Deterministic enforcement: any leaf still unplanned → red job → no
+      # chain (loop stalls safely; Telegram fires). Never label-backfill here —
+      # a rel-planned mark must mean a real assessment happened.
+      - name: Verify plan coverage
+        if: steps.sweep.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          LEFT=$(for L in ba-bug ba-change ba-feature; do
+            gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
+              --json number,body,labels --limit 200 \
+              --jq '.[] | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
+          done | sort -u | wc -l | tr -d ' ')
+          if [ "$LEFT" -gt 0 ]; then
+            echo "::error::$LEFT leaf/leaves still unplanned after the session — failing (the loop will not chain; re-dispatch agent-rel-plan after investigating)"
+            exit 1
+          fi
+          echo "✓ coverage complete — every open leaf is rel-planned"
+
+      # PUBLIC artifact (this is a public repo) — accepted trade-off.
+      - name: Upload transcript
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rel-plan-transcript
+          path: |
+            agent-transcript.jsonl
+            agent-result.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "### Rel-plan — one planning pass"
+            echo ""
+            echo "- **Unplanned at start:** ${{ steps.sweep.outputs.unplanned || 'n/a' }}"
+            if [ -s agent-result.json ]; then
+              echo ""
+              echo '```'
+              jq -r '.result // "<no result text>"' agent-result.json | tail -20
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      # The gate deferred lane dispatch for this planning pass — hand control
+      # back on EVERY success (planned or found-nothing), else the deferred
+      # lanes strand. Failure never chains. -f = string values, always.
+      - name: Continue loop
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
+        run: |
+          set +e
+          if gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
+            -f event_type=agent-loop \
+            -f client_payload[triggered_by]="${TRIGGERED_BY}"; then
+            echo "✓ chained agent-loop (board fully rel-planned)"
+          else
+            echo "::warning::agent-loop chain dispatch failed — restart via agent-todo-dispatch.yml or the next BA-docs merge"
+          fi
+          exit 0
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured — skipping notify."
+            exit 0
+          fi
+          TEXT="🤖🚨 <b>Agent rel-plan failed</b> — the loop will not start lanes until planning succeeds"
+          TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" \
+            -d parse_mode=HTML \
+            -d disable_web_page_preview=true; then
+            echo "✓ Telegram failure alert sent."
+          else
+            echo "::warning::Telegram notify failed."
+          fi

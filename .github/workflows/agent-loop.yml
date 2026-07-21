@@ -6,7 +6,7 @@ name: Agent · loop
 # own repo (agent-clear-todo.yml). It never carries state between invocations,
 # so a lost or coalesced trigger is harmless — the next one recounts.
 #
-# Invoked three ways (all end up here):
+# Invoked four ways (all end up here):
 #   · manually — workflow_dispatch here, or the private repo's
 #     agent-todo-dispatch.yml with an empty `item` (repository_dispatch);
 #   · by ba-to-issues.yml in the private repo after a merged BA-docs PR minted
@@ -16,7 +16,10 @@ name: Agent · loop
 #     agent-clear-todo.yml. A backlog-empty claim, a NONE verdict (salvaged
 #     run), or any failure never re-triggers, so the loop always winds down
 #     even though the backlog probe over-counts (an over-counted candidate
-#     yields one cheap backlog-empty claim run, which dies pre-bootstrap).
+#     yields one cheap backlog-empty claim run, which dies pre-bootstrap);
+#   · by agent-rel-plan.yml after a successful planning pass — the
+#     rel-planning gate below defers lane dispatch to that chain whenever any
+#     open BA leaf still lacks the `rel-planned` marker.
 #
 # Cap = repo variable AGENT_MAX_PARALLEL (unset → 6). KILL SWITCH:
 #   gh variable set AGENT_MAX_PARALLEL -R NamThuanVn/ppap --body 0
@@ -120,8 +123,42 @@ jobs:
             echo "proceed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Count active runs + dispatch top-up
+      # Rel-planning gate: lanes must not start while ANY open BA leaf lacks
+      # the `rel-planned` marker — the scripted claim respects blockedBy edges
+      # but PLANNING is what sets them (Phase 0-pre's planning half, shared
+      # skill /rel-plan-todo). Unplanned leaves → dispatch ONE agent-rel-plan
+      # run INSTEAD of lanes; on success it re-dispatches agent-loop, and this
+      # gate then passes. All three kinds are swept (a bug can be blocked by a
+      # feature) with the SAME leaf-marker query as the planner's sweep and
+      # its coverage recount — the three definitions must stay identical or
+      # the gate and the planner ping-pong. Duplicate gate dispatches coalesce
+      # in agent-rel-plan's concurrency group (the extra run no-ops + chains).
+      - name: Rel-planning gate
+        id: relplan
         if: steps.probe.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
+        run: |
+          set -euo pipefail
+          UNPLANNED=$(for L in ba-bug ba-change ba-feature; do
+            gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
+              --json number,body,labels --limit 200 \
+              --jq '.[] | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
+          done | sort -u | wc -l | tr -d ' ')
+          if [ "$UNPLANNED" -gt 0 ]; then
+            echo "::notice::$UNPLANNED unplanned leaf/leaves — dispatching agent-rel-plan, deferring lane dispatch to its chain"
+            gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
+              -f event_type=agent-rel-plan \
+              -f client_payload[triggered_by]="${TRIGGERED_BY}"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "✓ every open leaf is rel-planned"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Count active runs + dispatch top-up
+        if: steps.relplan.outputs.proceed == 'true'
         env:
           # Same-repo Actions reads: GITHUB_TOKEN suffices (read-all).
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
