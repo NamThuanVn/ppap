@@ -70,33 +70,34 @@ jobs:
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
     steps:
-      # Same fork layout as agent-clear-todo.yml: the skill resolves the
-      # upstream slug from the remotes, and the freshened checkout carries the
-      # merged BA spec files the planner reads.
-      - name: Checkout agent fork
+      # The checkout is the UPSTREAM repo — always the freshest main, so the
+      # planner reads current BA spec files (the fork's main is only as fresh
+      # as its last sync). The next step rewires remotes into the fork layout
+      # the skill expects for upstream-slug resolution. No fork sync here —
+      # planning creates no claim refs (sync-agent-fork.yml + the solve job's
+      # own freshen keep the fork current).
+      - name: Checkout upstream (freshest main)
         uses: actions/checkout@v6
         with:
-          repository: itdevnamthuan/erp-namthuan
+          repository: NamThuanVn/erp-namthuan
           ref: main
           token: ${{ secrets.PAT_TOKEN }}
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Freshen fork + set up remotes and identity
+      - name: Set up fork layout + identity
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           set -euo pipefail
-          gh repo sync "$FORK_REPO" -b main
+          git remote rename origin upstream
+          git remote add origin "https://github.com/${FORK_REPO}.git"
           gh auth setup-git
           gh repo set-default "$FORK_REPO"
-          git fetch origin main
-          git reset --hard origin/main
-          git remote add upstream "https://github.com/${PRIVATE_REPO}.git"
           LOGIN=$(gh api user --jq .login)
           git config user.name "$LOGIN"
           git config user.email "${LOGIN}@users.noreply.github.com"
-          echo "✓ fork fresh at $(git rev-parse --short HEAD) · acting as @$LOGIN"
+          echo "✓ workspace on upstream main $(git rev-parse --short HEAD) · acting as @$LOGIN"
 
       # The SAME query as agent-loop.yml's gate and the recount below: open
       # leaf (by leaf marker — batch mains never plan) lacking `rel-planned`.

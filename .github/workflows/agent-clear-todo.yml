@@ -35,9 +35,10 @@ name: Agent · clear-todo-issue
 # Claude auth is a POOL of subscription accounts (CLAUDE_CODE_OAUTH_TOKENS, one
 # newline-separated secret); .github/scripts/agent-claude-run.sh probes,
 # rotates, and fails over mid-run. GitHub identity is PAT_TOKEN (the
-# itdevnamthuan account) — the checkout targets ITS fork, so claims are atomic
-# among all CI agents. Human sessions on OTHER forks are covered by the
-# open-PR backstop.
+# itdevnamthuan account) — the checkout targets the UPSTREAM repo (freshest
+# main), while ITS fork stays the push target and the claim-lock namespace,
+# so claims are atomic among all CI agents. Human sessions on OTHER forks are
+# covered by the open-PR backstop.
 #
 # Dispatched by agent-loop.yml (repository_dispatch[agent-todo]);
 # workflow_dispatch is the manual/smoke-test entry. Filename is deliberately
@@ -96,40 +97,46 @@ jobs:
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
     steps:
-      # /solve-issue's pre-flight REQUIRES a fork layout: origin = the agent
-      # fork, upstream = the private repo. Full history (fetch-depth 0): the
-      # agent does arbitrary git ops and shallow-clone edge cases are subtle
-      # CI-only failures.
-      - name: Checkout agent fork
+      # The checkout is the UPSTREAM repo — always the freshest main. It used
+      # to target the fork, whose main is only as fresh as its last sync
+      # (observed 15+ min / several PRs behind between runs), making every
+      # workspace hang off one gh-repo-sync call. /solve-issue's pre-flight
+      # still REQUIRES the fork layout (origin = agent fork, upstream = the
+      # private repo) — the next step rewires the remotes into it. Full
+      # history (fetch-depth 0): the agent does arbitrary git ops and
+      # shallow-clone edge cases are subtle CI-only failures.
+      - name: Checkout upstream (freshest main)
         uses: actions/checkout@v6
         with:
-          repository: itdevnamthuan/erp-namthuan
+          repository: NamThuanVn/erp-namthuan
           ref: main
           token: ${{ secrets.PAT_TOKEN }}
           fetch-depth: 0
           persist-credentials: false
 
-      # Fork sync is a manual local-only step in normal dev — freshen it FIRST,
-      # then wire the dual-remote layout + git identity. `gh auth setup-git`
-      # installs a credential helper covering every github.com remote.
-      - name: Freshen fork + set up remotes and identity
+      # Rewire into the fork layout (rename checkout's origin → upstream; add
+      # the fork as origin), freshen the fork (the claim lock creates refs at
+      # upstream's tip — the fork must hold those objects; sync-agent-fork.yml
+      # in the private repo also fast-forwards it on every merge), and set
+      # identity. `gh auth setup-git` installs a credential helper covering
+      # every github.com remote.
+      - name: Set up fork layout + freshen fork + identity
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           set -euo pipefail
+          git remote rename origin upstream
+          git remote add origin "https://github.com/${FORK_REPO}.git"
           gh repo sync "$FORK_REPO" -b main
           gh auth setup-git
           # Pin gh's default repo to the fork: with origin+upstream remotes and
           # no default, bare `gh repo view` resolves ambiguously in CI.
           gh repo set-default "$FORK_REPO"
           git fetch origin main
-          git reset --hard origin/main
-          git remote add upstream "https://github.com/${PRIVATE_REPO}.git"
-          git fetch upstream main
           LOGIN=$(gh api user --jq .login)
           git config user.name "$LOGIN"
           git config user.email "${LOGIN}@users.noreply.github.com"
-          echo "✓ fork fresh at $(git rev-parse --short HEAD) · acting as @$LOGIN"
+          echo "✓ workspace on upstream main $(git rev-parse --short HEAD) · fork synced · acting as @$LOGIN"
 
       # Scripted claim — BEFORE the heavy bootstrap, so an empty backlog costs
       # ~1-2 min instead of a 10-min install. Writes claim.json + outputs.
