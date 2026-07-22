@@ -29,7 +29,7 @@ name: Agent · rel-plan
 # NamThuanVn/ppap only, never to the CI fleet. Transcript artifact + logs are
 # PUBLIC (accepted trade-off — see .claude/ppap.md § Agent runs).
 
-run-name: "${{ format('Agent · rel-plan · by {0}', github.event.client_payload.triggered_by || github.actor) }}"
+run-name: 'Agent · rel-plan'
 
 on:
   repository_dispatch:
@@ -205,7 +205,7 @@ jobs:
             -f client_payload[triggered_by]="${TRIGGERED_BY}"; then
             echo "✓ chained agent-loop (board fully rel-planned)"
           else
-            echo "::warning::agent-loop chain dispatch failed — restart via agent-todo-dispatch.yml or the next BA-docs merge"
+            echo "::warning::agent-loop chain dispatch failed — restart via 'gh workflow run agent-loop.yml -R NamThuanVn/ppap' or the next BA-docs merge"
           fi
           exit 0
 

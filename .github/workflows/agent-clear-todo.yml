@@ -46,7 +46,7 @@ name: Agent · clear-todo-issue
 # fleet. NOTE the transcript + session artifacts and logs are PUBLIC (accepted
 # trade-off — see .claude/ppap.md § Agent runs).
 
-run-name: "${{ format('Agent · todo · by {0}', github.event.client_payload.triggered_by || github.actor) }}"
+run-name: 'Agent · todo'
 
 on:
   repository_dispatch:
@@ -487,6 +487,6 @@ jobs:
             -f client_payload[triggered_by]="${TRIGGERED_BY}"; then
             echo "✓ chained agent-loop"
           else
-            echo "::warning::agent-loop chain dispatch failed — this lane ends; restart via agent-todo-dispatch.yml or the next BA-docs merge"
+            echo "::warning::agent-loop chain dispatch failed — this lane ends; restart via 'gh workflow run agent-loop.yml -R NamThuanVn/ppap' or the next BA-docs merge"
           fi
           exit 0

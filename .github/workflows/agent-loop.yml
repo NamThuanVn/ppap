@@ -7,8 +7,8 @@ name: Agent · loop
 # so a lost or coalesced trigger is harmless — the next one recounts.
 #
 # Invoked four ways (all end up here):
-#   · manually — workflow_dispatch here, or the private repo's
-#     agent-todo-dispatch.yml with an empty `item` (repository_dispatch);
+#   · manually — workflow_dispatch on this workflow (gh workflow run
+#     agent-loop.yml -R NamThuanVn/ppap);
 #   · by ba-to-issues.yml in the private repo after a merged BA-docs PR minted
 #     at least one sweepable (ba-bug/ba-change) issue;
 #   · by each agent run that EXECUTED a solve-verdict (MERGED / PARK / SPLIT /
@@ -22,7 +22,11 @@ name: Agent · loop
 #     rel-planning gate below defers lane dispatch to that chain whenever any
 #     open BA leaf still lacks the `rel-planned` marker.
 #
-# Cap = repo variable AGENT_MAX_PARALLEL (unset → 6). KILL SWITCH:
+# Cap = repo variable AGENT_MAX_PARALLEL (unset → 6). A dispatch that passes
+# max_parallel is REMEMBERED for 24h (repo variable AGENT_CAP_OVERRIDE, written
+# by Resolve cap with a "<cap>|<expiry>" TTL) so every scheduled tick + chained
+# run in that window reuses the chosen cap, then it auto-reverts to the default.
+# KILL SWITCH:
 #   gh variable set AGENT_MAX_PARALLEL -R NamThuanVn/ppap --body 0
 # → this controller dispatches nothing; in-flight agents finish their current
 # item and their lanes die (top-up yields 0). Keep the cap conservative: agent
@@ -36,13 +40,11 @@ name: Agent · loop
 # GITHUB_TOKEN-created events do not trigger workflows (same footgun class as
 # release.yml's `gh release create`).
 
-# The 15-min schedule heartbeat has no human behind it — GitHub attributes a
-# scheduled run's actor to the workflow's last committer, which reads as "by
-# <that person>" even though the tick is pure automation. Pin scheduled ticks
-# (and the automated chains they spawn, via TRIGGERED_BY below) to the bot
-# account that actually drives them; human dispatches + manual runs keep their
-# real actor.
-run-name: "${{ format('Agent · loop · by {0}', github.event_name == 'schedule' && 'itdevnamthuan' || github.event.client_payload.triggered_by || github.actor) }}"
+# No actor in the run-name: most ticks are pure automation (the 15-min schedule
+# heartbeat, or a chained dispatch), and GitHub attributes those to the
+# workflow's last committer — misleading. The native "triggered by <identity>"
+# line already shows the real dispatcher underneath.
+run-name: 'Agent · loop'
 
 on:
   # Heartbeat. The loop is otherwise edge-triggered — each productive agent run
@@ -61,7 +63,7 @@ on:
   workflow_dispatch:
     inputs:
       max_parallel:
-        description: 'Override the AGENT_MAX_PARALLEL cap for this invocation only (empty = repo variable, unset variable = 6).'
+        description: 'Set the AGENT_MAX_PARALLEL cap. A value here is REMEMBERED for 24h — every scheduled tick + chained run reuses it, then it auto-reverts to the repo variable (unset = 6). Empty = keep the current remembered/default cap.'
         required: false
         default: ''
         type: string
@@ -92,20 +94,66 @@ jobs:
       # Both repository_dispatch client_payload values and workflow_dispatch
       # inputs arrive as STRINGS; either side may be absent per trigger.
       CAP_OVERRIDE: ${{ github.event.client_payload.max_parallel || inputs.max_parallel || '' }}
+      # Sticky override remembered from a prior manual dispatch, "<cap>|<expiry-epoch>".
+      # Resolve cap writes it with a 24h TTL and clears it once expired, so every
+      # scheduled tick + chained run in that window reuses the chosen cap.
+      CAP_STICKY: ${{ vars.AGENT_CAP_OVERRIDE || '' }}
       CAP_VAR: ${{ vars.AGENT_MAX_PARALLEL || '' }}
-      TRIGGERED_BY: ${{ github.event_name == 'schedule' && 'itdevnamthuan' || github.event.client_payload.triggered_by || github.actor }}
+      TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
     steps:
       - name: Resolve cap
         id: cap
+        env:
+          # Reading/writing the sticky-override repo variable needs a token with
+          # Actions Variables write — the classic PAT_TOKEN (repo scope), not the
+          # read-all GITHUB_TOKEN.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           set -euo pipefail
-          CAP="${CAP_OVERRIDE:-${CAP_VAR:-6}}"
+          NOW=$(date +%s)
+          DEFAULT="${CAP_VAR:-6}"
+          VAR_API="repos/${GITHUB_REPOSITORY}/actions/variables"
+
+          # An explicit dispatch override "sticks" for 24h: remember it as the
+          # repo variable AGENT_CAP_OVERRIDE ("<cap>|<expiry>") so every later
+          # scheduled tick + chained run reuses it, then auto-revert to DEFAULT
+          # once the TTL lapses. Best-effort — a persist failure (missing PAT
+          # scope) just means the override applies to this run only.
+          remember() { # $1 = cap
+            local exp=$(( NOW + 86400 )) val
+            val="$1|$exp"
+            if gh api --method PATCH "$VAR_API/AGENT_CAP_OVERRIDE" -f name=AGENT_CAP_OVERRIDE -f value="$val" >/dev/null 2>&1 \
+               || gh api --method POST "$VAR_API" -f name=AGENT_CAP_OVERRIDE -f value="$val" >/dev/null 2>&1; then
+              echo "::notice::remembered cap=$1 for 24h (expires epoch $exp)"
+            else
+              echo "::warning::could not persist cap override (PAT_TOKEN missing Actions Variables write?) — applies to this run only"
+            fi
+          }
+          forget() { gh api --method DELETE "$VAR_API/AGENT_CAP_OVERRIDE" >/dev/null 2>&1 || true; }
+
+          if [ -n "$CAP_OVERRIDE" ]; then
+            CAP="$CAP_OVERRIDE"
+            remember "$CAP"
+          elif [ -n "$CAP_STICKY" ]; then
+            VAL="${CAP_STICKY%%|*}"; EXP="${CAP_STICKY##*|}"
+            if printf '%s' "$EXP" | grep -qE '^[0-9]+$' && [ "$NOW" -lt "$EXP" ]; then
+              CAP="$VAL"
+              echo "using remembered cap=$CAP (~$(( (EXP - NOW) / 3600 ))h left, then reverts to $DEFAULT)"
+            else
+              echo "::notice::remembered cap expired — reverting to default $DEFAULT"
+              forget
+              CAP="$DEFAULT"
+            fi
+          else
+            CAP="$DEFAULT"
+          fi
+
           if ! printf '%s' "$CAP" | grep -qE '^[0-9]+$'; then
-            echo "::error::cap '$CAP' is not a non-negative integer (payload/input override or AGENT_MAX_PARALLEL variable)"
+            echo "::error::cap '$CAP' is not a non-negative integer (override / sticky / AGENT_MAX_PARALLEL)"
             exit 1
           fi
           if [ "$CAP" -eq 0 ]; then
-            echo "::notice::AGENT_MAX_PARALLEL is 0 (kill switch) — dispatching nothing"
+            echo "::notice::cap is 0 (kill switch) — dispatching nothing"
             echo "proceed=false" >> "$GITHUB_OUTPUT"
           else
             echo "cap=$CAP — proceeding"
@@ -189,7 +237,7 @@ jobs:
         if: steps.probe.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-          TRIGGERED_BY: ${{ github.event_name == 'schedule' && 'itdevnamthuan' || github.event.client_payload.triggered_by || github.actor }}
+          TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
         run: |
           set -euo pipefail
           UNPLANNED=$(for L in ba-bug ba-change ba-feature; do
