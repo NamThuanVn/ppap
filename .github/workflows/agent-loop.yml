@@ -6,21 +6,26 @@ name: Agent · loop
 # own repo (agent-clear-todo.yml). It never carries state between invocations,
 # so a lost or coalesced trigger is harmless — the next one recounts.
 #
-# Invoked four ways (all end up here):
+# Invoked several ways (all end up here):
 #   · manually — workflow_dispatch on this workflow (gh workflow run
 #     agent-loop.yml -R NamThuanVn/ppap);
 #   · by ba-to-issues.yml in the private repo after a merged BA-docs PR minted
 #     at least one sweepable (ba-bug/ba-change) issue;
 #   · by each agent run that EXECUTED a solve-verdict (MERGED / PARK / SPLIT /
 #     ABANDONED with green executor steps) — the "Continue loop" step in
-#     agent-clear-todo.yml. A backlog-empty claim, a NONE verdict (salvaged
-#     run), or any failure never re-triggers, so the loop always winds down —
-#     the probe counts exact claim eligibility (COUNT_ONLY sweep below), and
-#     the residual race (a sibling lane claiming between probe and claim)
-#     yields one cheap backlog-empty run, which dies pre-bootstrap;
+#     agent-clear-todo.yml chains the next lane immediately (lowest latency);
+#   · by the `workflow_run` trigger on ANY agent-clear-todo / rel-plan
+#     completion — success, failure, cancelled, or spot-reclaimed. This is what
+#     catches a run that DIED (the "Continue loop" step never fired) and
+#     re-probes, so a failed lane no longer silently winds the loop down. It is
+#     gated to repository_dispatch-origin completions (see the controller `if:`)
+#     so a one-shot manual run doesn't auto-start the loop. Termination still
+#     holds: when the backlog drains the probe dispatches 0, so no new run is
+#     created → no new completion → nothing re-triggers;
 #   · by agent-rel-plan.yml after a successful planning pass — the
 #     rel-planning gate below defers lane dispatch to that chain whenever any
-#     open BA leaf still lacks the `rel-planned` marker.
+#     open BA leaf still lacks the `rel-planned` marker;
+#   · hourly schedule — a rare backstop for the controller-self-reclaim gap.
 #
 # Cap = repo variable AGENT_MAX_PARALLEL (unset → 6). A dispatch that passes
 # max_parallel is REMEMBERED for 24h (repo variable AGENT_CAP_OVERRIDE, written
@@ -47,17 +52,35 @@ name: Agent · loop
 run-name: 'Agent · loop'
 
 on:
-  # Heartbeat. The loop is otherwise edge-triggered — each productive agent run
-  # chains the next via agent-clear-todo.yml's "Continue loop" step. But a
-  # hosted-runner reclaim tears the job down mid-flight and skips that step
-  # (an `if: always()` step does NOT survive a runner shutdown), silently
-  # ending the lane with no re-arm. This controller is level-triggered and
-  # stateless ("the next one recounts"), so a periodic tick just re-probes live
-  # state and tops the pool back up to cap — a no-op when nothing is claimable
-  # (dispatches 0), and still fully gated by the AGENT_MAX_PARALLEL=0 kill
-  # switch (Resolve cap exits early on 0).
+  # Primary recovery trigger: re-probe after EVERY agent-clear-todo / rel-plan
+  # run completes — success, failure, cancelled, or spot-reclaimed. A productive
+  # run still chains the next lane immediately via the "Continue loop" step
+  # (lower latency than a workflow_run event); this trigger adds the cases that
+  # step can't cover — a FAILED / cancelled / runner-reclaimed run that silently
+  # ends a lane with no re-arm. That is exactly what the old */15 cron existed to
+  # catch, now event-driven instead of polled. Gated in the controller `if:`
+  # below to repository_dispatch-origin completions (loop participants) so a
+  # one-shot manual run (workflow_dispatch, e.g. a human debugging one item)
+  # never auto-starts the autonomous loop.
+  #
+  # TRADE-OFF (intentional): this relaxes the old "a failure never re-triggers"
+  # anti-spin invariant. A genuinely-broken item or a DEAD TOKEN POOL (exit 78 at
+  # probe, ~1 min) can now fail→re-dispatch→fail faster than the old 15-min cron
+  # paced it. Bounded by: failure-only Telegram alert (visible), the
+  # AGENT_MAX_PARALLEL=0 kill switch, and agent-claude-run.sh's transient-5xx
+  # retry (no longer dies on a blip). Watch the Telegram topic; flip the kill
+  # switch if a dead pool starts spinning.
+  workflow_run:
+    workflows: ["Agent · clear-todo-issue", "Agent · rel-plan"]
+    types: [completed]
+  # Rare safety net (was */15 → hourly). Covers the one gap workflow_run can't:
+  # the controller job ITSELF getting spot-reclaimed right after the last run
+  # completed, so nothing re-triggers it. Level-triggered + stateless ("the next
+  # one recounts") — a tick just re-probes and tops up (dispatches 0 when
+  # nothing is claimable), still gated by the AGENT_MAX_PARALLEL=0 kill switch
+  # (Resolve cap exits early on 0).
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '0 * * * *'
   repository_dispatch:
     types: [agent-loop]
   workflow_dispatch:
@@ -85,6 +108,14 @@ env:
 jobs:
   controller:
     name: Top up agent pool
+    # A workflow_run completion only continues the loop when the finished run
+    # was itself part of the loop (repository_dispatch-driven). A one-shot manual
+    # agent-clear-todo (workflow_dispatch — a human debugging a single item)
+    # must NOT auto-start the autonomous loop. All other triggers (schedule,
+    # repository_dispatch, workflow_dispatch on THIS workflow) always proceed.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.event == 'repository_dispatch'
     runs-on: ubuntu-latest
     # A hung API call must not wedge the loop's concurrency slot for the
     # default 360 min — the job is a sparse checkout + the eligibility sweep
