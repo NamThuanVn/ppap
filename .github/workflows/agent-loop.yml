@@ -39,6 +39,17 @@ name: Agent · loop
 run-name: "${{ format('Agent · loop · by {0}', github.event.client_payload.triggered_by || github.actor) }}"
 
 on:
+  # Heartbeat. The loop is otherwise edge-triggered — each productive agent run
+  # chains the next via agent-clear-todo.yml's "Continue loop" step. But a
+  # hosted-runner reclaim tears the job down mid-flight and skips that step
+  # (an `if: always()` step does NOT survive a runner shutdown), silently
+  # ending the lane with no re-arm. This controller is level-triggered and
+  # stateless ("the next one recounts"), so a periodic tick just re-probes live
+  # state and tops the pool back up to cap — a no-op when nothing is claimable
+  # (dispatches 0), and still fully gated by the AGENT_MAX_PARALLEL=0 kill
+  # switch (Resolve cap exits early on 0).
+  schedule:
+    - cron: '*/15 * * * *'
   repository_dispatch:
     types: [agent-loop]
   workflow_dispatch:
@@ -117,6 +128,21 @@ jobs:
           fetch-depth: 1
           sparse-checkout: .github/scripts/agent-board
           persist-credentials: false
+
+      # Stranded-claim sweep — release items whose backing run is provably dead
+      # (assigned to us + In Progress/Todo + last claimed > STRANDED_HOURS ago,
+      # which must exceed agent-clear-todo.yml's timeout-minutes). A hosted-
+      # runner reclaim skips the in-job salvage-or-revert (always() does not
+      # survive a runner shutdown), stranding the item; this is the decoupled
+      # backstop. Runs BEFORE the count so a released item is a candidate this
+      # same tick. Best-effort, never reds the controller.
+      - name: Reclaim stranded items
+        if: steps.cap.outputs.proceed == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          STRANDED_HOURS: ${{ vars.STRANDED_HOURS || '6' }}
+        run: node .github/scripts/agent-board/reclaim-stranded.mjs
 
       - name: Count claimable candidates
         id: count
