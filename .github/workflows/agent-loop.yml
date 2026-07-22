@@ -36,7 +36,13 @@ name: Agent · loop
 # GITHUB_TOKEN-created events do not trigger workflows (same footgun class as
 # release.yml's `gh release create`).
 
-run-name: "${{ format('Agent · loop · by {0}', github.event.client_payload.triggered_by || github.actor) }}"
+# The 15-min schedule heartbeat has no human behind it — GitHub attributes a
+# scheduled run's actor to the workflow's last committer, which reads as "by
+# <that person>" even though the tick is pure automation. Pin scheduled ticks
+# (and the automated chains they spawn, via TRIGGERED_BY below) to the bot
+# account that actually drives them; human dispatches + manual runs keep their
+# real actor.
+run-name: "${{ format('Agent · loop · by {0}', github.event_name == 'schedule' && 'itdevnamthuan' || github.event.client_payload.triggered_by || github.actor) }}"
 
 on:
   # Heartbeat. The loop is otherwise edge-triggered — each productive agent run
@@ -87,7 +93,7 @@ jobs:
       # inputs arrive as STRINGS; either side may be absent per trigger.
       CAP_OVERRIDE: ${{ github.event.client_payload.max_parallel || inputs.max_parallel || '' }}
       CAP_VAR: ${{ vars.AGENT_MAX_PARALLEL || '' }}
-      TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
+      TRIGGERED_BY: ${{ github.event_name == 'schedule' && 'itdevnamthuan' || github.event.client_payload.triggered_by || github.actor }}
     steps:
       - name: Resolve cap
         id: cap
@@ -183,7 +189,7 @@ jobs:
         if: steps.probe.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-          TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
+          TRIGGERED_BY: ${{ github.event_name == 'schedule' && 'itdevnamthuan' || github.event.client_payload.triggered_by || github.actor }}
         run: |
           set -euo pipefail
           UNPLANNED=$(for L in ba-bug ba-change ba-feature; do
