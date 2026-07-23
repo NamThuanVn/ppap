@@ -25,9 +25,10 @@ name: Agent · loop
 #   · by agent-rel-plan.yml after a successful planning pass — the
 #     rel-planning gate below defers lane dispatch to that chain whenever any
 #     open BA leaf still lacks the `rel-planned` marker;
-#   · repository_dispatch[agent-loop] from agent-loop-heartbeat.yml — a rare
-#     15-min backstop for the controller-self-reclaim gap, kept in its own
-#     workflow so it can be toggled on/off from the Actions UI independently.
+#   · by the `workflow_run` completion of agent-loop-heartbeat.yml (also in the
+#     workflow_run list above) — a rare 15-min backstop for the
+#     controller-self-reclaim gap, kept in its own workflow so it can be toggled
+#     on/off from the Actions UI independently.
 #
 # Cap = repo variable AGENT_MAX_PARALLEL (unset → 6). A dispatch that passes
 # max_parallel is REMEMBERED for 24h (repo variable AGENT_CAP_OVERRIDE, written
@@ -72,13 +73,17 @@ on:
   # AGENT_MAX_PARALLEL=0 kill switch, and agent-claude-run.sh's transient-5xx
   # retry (no longer dies on a blip). Watch the Telegram topic; flip the kill
   # switch if a dead pool starts spinning.
+  # "Agent · loop heartbeat" is the 15-min BACKSTOP (controller-self-reclaim
+  # gap), kept in its own workflow so it can be enabled/disabled from the Actions
+  # UI without touching this controller. It does nothing but complete on
+  # schedule — this workflow_run entry IS how its tick reaches the loop (no
+  # gh-api/dispatch on that side). Its schedule-origin completion is allowed
+  # through the controller `if:` below (unlike clear-todo/rel-plan, which are
+  # gated to repository_dispatch-origin so a one-shot manual run can't start
+  # the loop).
   workflow_run:
-    workflows: ["Agent · clear-todo-issue", "Agent · rel-plan"]
+    workflows: ["Agent · clear-todo-issue", "Agent · rel-plan", "Agent · loop heartbeat"]
     types: [completed]
-  # The 15-min BACKSTOP (for the controller-self-reclaim gap) lives in a
-  # SEPARATE workflow — agent-loop-heartbeat.yml — so it can be enabled/disabled
-  # on its own from the Actions UI without touching this controller. It fires a
-  # repository_dispatch[agent-loop], caught below.
   repository_dispatch:
     types: [agent-loop]
   workflow_dispatch:
@@ -106,13 +111,15 @@ env:
 jobs:
   controller:
     name: Top up agent pool
-    # A workflow_run completion only continues the loop when the finished run
-    # was itself part of the loop (repository_dispatch-driven). A one-shot manual
-    # agent-clear-todo (workflow_dispatch — a human debugging a single item)
-    # must NOT auto-start the autonomous loop. All other triggers (schedule,
-    # repository_dispatch, workflow_dispatch on THIS workflow) always proceed.
+    # A workflow_run completion continues the loop when EITHER the finished run
+    # is the heartbeat (the intended backstop tick, any origin) OR it was a loop
+    # participant (repository_dispatch-driven clear-todo/rel-plan). A one-shot
+    # manual agent-clear-todo (workflow_dispatch — a human debugging a single
+    # item) must NOT auto-start the loop. Non-workflow_run triggers
+    # (repository_dispatch, workflow_dispatch on THIS workflow) always proceed.
     if: >-
       github.event_name != 'workflow_run' ||
+      github.event.workflow_run.name == 'Agent · loop heartbeat' ||
       github.event.workflow_run.event == 'repository_dispatch'
     runs-on: ubuntu-latest
     # A hung API call must not wedge the loop's concurrency slot for the
