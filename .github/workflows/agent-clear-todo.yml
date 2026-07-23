@@ -430,12 +430,25 @@ jobs:
       - name: Notify Telegram on failure
         if: failure()
         env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          # Suppress false alarms: if the claimed item already SHIPPED (issue
+          # closed = its PR merged — e.g. an async auto-merge that landed after
+          # the agent's turn, or a premature-verdict finalize refusal), the run
+          # "failed" but the work is done. Don't page for it.
+          if [ -s claim.json ]; then
+            ISSUE=$(jq -r '.issue // empty' claim.json 2>/dev/null || true)
+            if [ -n "${ISSUE:-}" ] && \
+               [ "$(gh issue view "$ISSUE" --repo "$PRIVATE_REPO" --json state --jq .state 2>/dev/null)" = "CLOSED" ]; then
+              echo "::notice::claimed #$ISSUE is CLOSED (work shipped) — suppressing false-failure alert"
+              exit 0
+            fi
+          fi
           if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
             echo "Telegram not configured — skipping notify."
             exit 0
