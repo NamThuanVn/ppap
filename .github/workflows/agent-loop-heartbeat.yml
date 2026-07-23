@@ -1,0 +1,47 @@
+name: Agent · loop heartbeat
+
+# Standalone scheduled heartbeat for the agent loop, split OUT of agent-loop.yml
+# so it can be enabled/disabled on its own from the Actions UI (Actions →
+# "Agent · loop heartbeat" → ••• → Disable/Enable workflow) WITHOUT touching the
+# event-driven controller.
+#
+# The loop is normally edge-triggered: every agent-clear-todo completion
+# re-probes agent-loop via its workflow_run trigger, and a productive run chains
+# the next lane immediately. This 15-min tick is a BACKSTOP for the one gap
+# those can't cover — the controller job ITSELF getting spot-reclaimed right
+# after the last run completed, so nothing re-triggers it. It fires ONE
+# repository_dispatch[agent-loop]; the controller (stateless, level-triggered)
+# re-probes and tops up — a no-op when nothing is claimable, still gated by the
+# AGENT_MAX_PARALLEL=0 kill switch. Frequent (15 min) is fine because this
+# workflow is independently disableable — turn it off if it ever gets noisy.
+#
+# Disabling this workflow stops ONLY the periodic backstop; the event-driven
+# loop keeps running. Re-enable when you want the safety net back.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions: read-all
+
+# One heartbeat at a time; never cancel an in-flight dispatch.
+concurrency:
+  group: agent-loop-heartbeat
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: Dispatch agent-loop
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch repository_dispatch[agent-loop]
+        env:
+          # PAT_TOKEN, not GITHUB_TOKEN: a repository_dispatch created with the
+          # GITHUB_TOKEN does NOT trigger workflows, so agent-loop wouldn't fire.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/dispatches" -f event_type=agent-loop
+          echo "✓ dispatched agent-loop (15-min heartbeat backstop)"

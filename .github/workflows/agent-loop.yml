@@ -25,7 +25,9 @@ name: Agent · loop
 #   · by agent-rel-plan.yml after a successful planning pass — the
 #     rel-planning gate below defers lane dispatch to that chain whenever any
 #     open BA leaf still lacks the `rel-planned` marker;
-#   · hourly schedule — a rare backstop for the controller-self-reclaim gap.
+#   · repository_dispatch[agent-loop] from agent-loop-heartbeat.yml — a rare
+#     15-min backstop for the controller-self-reclaim gap, kept in its own
+#     workflow so it can be toggled on/off from the Actions UI independently.
 #
 # Cap = repo variable AGENT_MAX_PARALLEL (unset → 6). A dispatch that passes
 # max_parallel is REMEMBERED for 24h (repo variable AGENT_CAP_OVERRIDE, written
@@ -73,14 +75,10 @@ on:
   workflow_run:
     workflows: ["Agent · clear-todo-issue", "Agent · rel-plan"]
     types: [completed]
-  # Rare safety net (was */15 → hourly). Covers the one gap workflow_run can't:
-  # the controller job ITSELF getting spot-reclaimed right after the last run
-  # completed, so nothing re-triggers it. Level-triggered + stateless ("the next
-  # one recounts") — a tick just re-probes and tops up (dispatches 0 when
-  # nothing is claimable), still gated by the AGENT_MAX_PARALLEL=0 kill switch
-  # (Resolve cap exits early on 0).
-  schedule:
-    - cron: '0 * * * *'
+  # The 15-min BACKSTOP (for the controller-self-reclaim gap) lives in a
+  # SEPARATE workflow — agent-loop-heartbeat.yml — so it can be enabled/disabled
+  # on its own from the Actions UI without touching this controller. It fires a
+  # repository_dispatch[agent-loop], caught below.
   repository_dispatch:
     types: [agent-loop]
   workflow_dispatch:
