@@ -617,7 +617,7 @@ jobs:
           pids=""
           # The hardcoded list fixes tier membership + order; each member deploys
           # only if it's in the changed set (WORKERS). Empty set → deploys nothing.
-          for svc in hris expense utilities exms oms sourcing bom quotation procurement notifications auth assistant files; do
+          for svc in hris expense utilities exms social oms sourcing bom quotation procurement notifications auth assistant files; do
             case " $WORKERS " in *" $svc "*) ;; *) continue ;; esac
             (
               set -e
