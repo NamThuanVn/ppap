@@ -488,8 +488,28 @@ jobs:
             kill -KILL -- -"$SERVE_PID" 2>/dev/null || true
           fi
 
+      # A FLAKY test passes on retry, so the shard exits 0 and the `if: failure()`
+      # this used to carry threw its evidence away. That is why every flaky in
+      # this suite has been undiagnosable after the fact: the noise gate reports
+      # `flaky 1`, but the trace, screenshot and `error-context.md` aria snapshot
+      # naming the actual cause were dropped on the way out.
+      #
+      # Playwright still writes `test-results/` for the FAILED first attempt of a
+      # retried test, so the evidence exists on disk — detect it and upload it
+      # alongside the genuine-failure case.
+      - name: Detect retained failure artifacts (covers flaky-passed-on-retry)
+        id: pw_artifacts
+        if: always()
+        run: |
+          if [ -d test-results ] && [ -n "$(ls -A test-results 2>/dev/null)" ]; then
+            echo "present=true" >>"$GITHUB_OUTPUT"
+            echo "::notice::shard ${{ matrix.shard }} retained failure artifacts (flaky first attempt) — uploading"
+          else
+            echo "present=false" >>"$GITHUB_OUTPUT"
+          fi
+
       - name: Upload Playwright report
-        if: failure()
+        if: ${{ failure() || steps.pw_artifacts.outputs.present == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: playwright-report-shard-${{ matrix.shard }}
