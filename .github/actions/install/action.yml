@@ -20,6 +20,19 @@ runs:
       env:
         NODE_OPTIONS: --no-deprecation
 
+    # `path` MUST list every workspace root in pnpm-workspace.yaml. On a cache
+    # HIT the install step below is skipped entirely, so any root missing here
+    # simply has no node_modules for the rest of the job — and the failure is
+    # attributed to whatever runs first. `monolith/*` was missing, and
+    # `monolith/api` (which declares its own @cloudflare/workers-types) failed
+    # with a bare `error TS2688: Cannot find type definition file for
+    # '@cloudflare/workers-types'`. It hid for several PRs because the change
+    # that introduced monolith/* also touched pnpm-lock.yaml, so THAT run was a
+    # cache miss and installed normally; every later run hit the stale cache.
+    #
+    # `pnpm-workspace.yaml` is in the key for the same reason: adding a workspace
+    # root now busts the cache automatically instead of silently reusing an entry
+    # that predates it. (It also busts the bad entries that exist today.)
     - name: Restore node_modules cache
       id: cache
       uses: actions/cache@v5
@@ -30,7 +43,7 @@ runs:
           apps/*/node_modules
           packages/*/node_modules
           monolith/*/node_modules
-        key: pnpm-modules-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+        key: pnpm-modules-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml') }}
       env:
         NODE_OPTIONS: --no-deprecation
 
