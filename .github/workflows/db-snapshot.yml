@@ -1,0 +1,162 @@
+name: DB · Publish local D1 snapshot
+
+# Builds the pre-migrated local D1 state from scratch and publishes it as a
+# rolling release asset (tag `db-snapshot`) that every cold-start surface
+# restores instead of replaying all ~350 migrations:
+#
+#   local  `pnpm worktree:init` / `pnpm db:reset`  → scripts/db-reset.sh
+#   PR CI  `e2e-seed` job                          → ci-checks.yml
+#   agent  `/clear-todo-issue` runs                 → agent-clear-todo.yml
+#
+# Triggered by the private repo's main-push-dispatch.yml on every push to main
+# that touches apis/*/migrations/**. See .claude/ppap.md § DB snapshot.
+#
+# WHY a release asset and not a commit back into erp-namthuan: the state is
+# ~10MB (~3MB gzipped) and migrations are touched ~2.4x/day. Git keeps every
+# blob forever, so committing snapshots would add ~0.5-1GB/yr permanently to a
+# .git that is ~65MB today — paid by every clone and every worktree. A rolling
+# release asset replaces its previous version and costs the repo nothing. It
+# also avoids pushing to main entirely, so there is no [skip ci] marker to get
+# wrong (see .claude/ppap.md § footguns — skip markers leak through squash-merge
+# bodies and silently kill the dispatchers).
+#
+# FILENAME: must NOT start with `ci-`. sync-workflows-to-ppap.yml mirrors
+# `ci-*.yml` to every CI fleet org; this workflow belongs to the deploy repo
+# only, same reason agent-*.yml and local-stack-matrix.yml avoid the prefix.
+
+on:
+  repository_dispatch:
+    types: [db-snapshot]
+  workflow_dispatch:
+    inputs:
+      checkout_ref:
+        description: 'NamThuanVn/erp-namthuan ref to snapshot. Keep `main` — the snapshot must represent merged migrations.'
+        type: string
+        required: false
+        default: main
+
+run-name: >-
+  DB snapshot ·
+  ${{ github.event.client_payload.sha && format('{0}', github.event.client_payload.sha) || inputs.checkout_ref || 'main' }}
+
+permissions:
+  contents: write # gh release create/upload on THIS (ppap) repo
+
+# One publish at a time. Latest migration set wins; superseding an in-flight
+# build is correct because the newer main is a superset of the older one.
+concurrency:
+  group: db-snapshot
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+  RELEASE_TAG: db-snapshot
+  # Pre-seed init.defaultBranch so actions/checkout's internal `git init` stops
+  # printing the "hint: git config --global init.defaultBranch" line. Same
+  # cosmetic fix as ci-checks.yml.
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
+jobs:
+  publish:
+    name: Build + publish snapshot
+    runs-on: ubuntu-latest
+    # A cold 13-service migration run is the whole point of this job; 30 leaves
+    # generous headroom over the observed local runtime without letting a hung
+    # wrangler burn an hour.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout erp-namthuan
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          # client_payload.sha pins the exact merge commit that carried the new
+          # migrations; workflow_dispatch falls back to main.
+          ref: ${{ github.event.client_payload.sha || inputs.checkout_ref || 'main' }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      # DB_SNAPSHOT=0 is load-bearing: the producer must build from scratch and
+      # never from its own previous output, or any drift would compound forever.
+      # SEEDS=0 stops db-reset.sh right after the migrations — local-seed/*.sql
+      # are non-idempotent INSERTs and must not be baked into the artifact.
+      - name: Build migrations-only D1 state (cold)
+        run: |
+          set -euo pipefail
+          STATE_DIR=.wrangler/state-snapshot \
+          SEEDS=0 \
+          DB_SNAPSHOT=0 \
+            bash scripts/db-reset.sh
+
+      # The manifest is what makes a restore trustworthy: it records the sha256
+      # of every migration baked into the snapshot, so a consumer can detect a
+      # migration that was renamed/deleted/edited in place on its branch (which
+      # d1_migrations' filename-only tracking would silently skip) and cold-run
+      # instead. Built from the same checkout that just produced the state.
+      - name: Generate manifest
+        run: node scripts/db-snapshot-manifest.mjs > manifest.json
+
+      - name: Package snapshot
+        run: |
+          set -euo pipefail
+          # -C so the tar holds v3/d1/... relative paths, matching the
+          # D1_SUBPATH the restore script extracts. gzip (not zstd) for macOS
+          # BSD tar + Windows Git Bash compatibility.
+          tar -czf d1-snapshot.tar.gz \
+            -C .wrangler/state-snapshot \
+            v3/d1/miniflare-D1DatabaseObject
+          ls -lh d1-snapshot.tar.gz manifest.json
+          node -e 'const m=require("./manifest.json");
+            const n=Object.values(m.services).reduce((a,s)=>a+s.migrations.length,0);
+            console.log(`manifest: ${Object.keys(m.services).length} services, ${n} migrations, sha ${m.sha}`);
+            if (n === 0) { console.error("refusing to publish an empty manifest"); process.exit(1); }'
+
+      # Upload order is the publish COMMIT POINT: tarball first, manifest last.
+      # The restore script fetches the manifest first, so a consumer racing this
+      # publish can never validate a NEW manifest against an OLD tarball.
+      - name: Publish to the rolling db-snapshot release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --title "Local D1 snapshot" \
+              --notes "Rolling pre-migrated local D1 state. Replaced automatically on every migration merge — do not consume by tag+asset digest, fetch manifest.json first."
+          fi
+          gh release upload "$RELEASE_TAG" d1-snapshot.tar.gz --clobber
+          gh release upload "$RELEASE_TAG" manifest.json      --clobber
+          echo "✓ published $RELEASE_TAG"
+
+      # A dead producer is silent-by-default: consumers just keep cold-running
+      # (correct, only slower), so nothing would ever surface the breakage.
+      # Same failure-only Telegram pattern as the other ppap report jobs.
+      - name: Notify Telegram on failure
+        if: failure() && !cancelled()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured — skipping notify."
+            exit 0
+          fi
+          TEXT=$(printf '🚨 <b>D1 snapshot publish failed</b>\nThe rolling <code>db-snapshot</code> release was NOT updated; worktree:init and CI e2e-seed will keep doing full cold migration runs until this is fixed.\n<a href="%s">View run</a>' "$RUN_URL")
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" \
+            -d parse_mode=HTML \
+            -d disable_web_page_preview=true; then
+            echo "✓ Telegram failure alert sent."
+          else
+            echo "::warning::Telegram notify failed."
+          fi

@@ -192,7 +192,7 @@ jobs:
   #    ppap (not the private repo) so deploys cost zero billed minutes —
   #    same reusable workflow PR-CI uses, just with a different ref.
   #
-  #    `release.yml` is workflow_dispatch only and `deploy-staging-dispatch`
+  #    `release.yml` is workflow_dispatch only and `main-push-dispatch`
   #    can be re-fired manually; without this gate, a broken `main` (or a
   #    bad merge commit) would still reach terraform-apply. Branch
   #    protection requires the PR-CI `CI` check green on the source PR, but

@@ -213,6 +213,14 @@ jobs:
         # min instead of eating the job's whole hour: the mcp:* steps shell out
         # to `claude`, and an unexpected interactive prompt would otherwise hang.
         timeout-minutes: 25
+        env:
+          # Force the COLD migration path. This workflow exists to prove a
+          # from-scratch three-OS bootstrap still works; letting db:reset restore
+          # ppap's pre-migrated snapshot would skip the very thing under test and
+          # leave the cold path with no regression guard anywhere. The snapshot
+          # restore path gets continuous coverage instead from every PR's
+          # e2e-seed job and every agent-clear-todo run.
+          DB_SNAPSHOT: '0'
         run: pnpm worktree:init --verbose
 
       # worktree:init exits 0 on a SKIPPED mcp step (mcp-databases.sh prints a
