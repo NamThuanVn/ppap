@@ -38,12 +38,20 @@ name: Local Stack · macOS / Linux / Windows
 # environment rot nobody would otherwise notice until a developer hits it: a
 # runner-image Node bump, a new API leaf missing from monolith/api, a script
 # that grew a Linux-only assumption.
+#
+# USE `main` AS checkout_ref. It must be a ref in NamThuanVn/erp-namthuan (a
+# fork-only branch fails with `couldn't find remote ref`), and a PR merge ref is
+# a trap: this repo auto-merges agent PRs on green, and merging DELETES
+# refs/pull/<N>/merge. Three verification runs died at `actions/checkout` that
+# way — one 20s after dispatch, the PR having merged between dispatch and
+# checkout — skipping every real step while looking like a genuine failure.
+# Land the fix, then verify against main. See .claude/ppap.md § Local-stack matrix.
 
 on:
   workflow_dispatch:
     inputs:
       checkout_ref:
-        description: 'erp-namthuan ref to boot (branch, tag or sha).'
+        description: 'NamThuanVn/erp-namthuan ref to boot. Keep `main` — a fork-only branch does not resolve, and a PR merge ref is deleted the moment the PR auto-merges.'
         type: string
         required: false
         default: main
