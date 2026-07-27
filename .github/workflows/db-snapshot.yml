@@ -8,8 +8,12 @@ name: DB · Publish local D1 snapshot
 #   PR CI  `e2e-seed` job                          → ci-checks.yml
 #   agent  `/clear-todo-issue` runs                 → agent-clear-todo.yml
 #
-# Triggered by the private repo's main-push-dispatch.yml on every push to main
-# that touches apis/*/migrations/**. See .claude/ppap.md § DB snapshot.
+# Triggered by the private repo's release.yml on a PRODUCTION RELEASE (version
+# bump + tag), pinned to the released commit — NOT on every migration merge. So
+# the snapshot always corresponds to a tagged release, and between releases it
+# goes stale by design: restore-then-apply replays whatever migrations landed
+# since, which is correct, just progressively less of a speedup.
+# See .claude/ppap.md § DB snapshot.
 #
 # WHY a release asset and not a commit back into erp-namthuan: the state is
 # ~10MB (~3MB gzipped) and migrations are touched ~2.4x/day. Git keeps every
@@ -37,7 +41,7 @@ on:
 
 run-name: >-
   DB snapshot ·
-  ${{ github.event.client_payload.sha && format('{0}', github.event.client_payload.sha) || inputs.checkout_ref || 'main' }}
+  ${{ github.event.client_payload.tag || github.event.client_payload.sha || inputs.checkout_ref || 'main' }}
 
 permissions:
   contents: write # gh release create/upload on THIS (ppap) repo
@@ -120,16 +124,23 @@ jobs:
       - name: Publish to the rolling db-snapshot release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # --repo on EVERY gh release call is load-bearing, not tidiness. This job
+          # checks erp-namthuan out INTO the workspace, so `gh` infers the repo from
+          # that git remote and targets the private repo — with ppap's GITHUB_TOKEN,
+          # which has no access there. That is a 404 on
+          # api.github.com/repos/NamThuanVn/erp-namthuan/releases, not a permissions
+          # error, so it reads like a missing release rather than a wrong target.
+          TARGET_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" \
+          if ! gh release view "$RELEASE_TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$TARGET_REPO" \
               --title "Local D1 snapshot" \
-              --notes "Rolling pre-migrated local D1 state. Replaced automatically on every migration merge — do not consume by tag+asset digest, fetch manifest.json first."
+              --notes "Rolling pre-migrated local D1 state, rebuilt on each production release (release.yml). Do not consume by tag+asset digest — fetch manifest.json first; it carries the producing sha and a sha256 per migration."
           fi
-          gh release upload "$RELEASE_TAG" d1-snapshot.tar.gz --clobber
-          gh release upload "$RELEASE_TAG" manifest.json      --clobber
-          echo "✓ published $RELEASE_TAG"
+          gh release upload "$RELEASE_TAG" d1-snapshot.tar.gz --clobber --repo "$TARGET_REPO"
+          gh release upload "$RELEASE_TAG" manifest.json      --clobber --repo "$TARGET_REPO"
+          echo "✓ published $RELEASE_TAG to $TARGET_REPO"
 
       # A dead producer is silent-by-default: consumers just keep cold-running
       # (correct, only slower), so nothing would ever surface the breakage.
