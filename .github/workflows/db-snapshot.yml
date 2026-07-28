@@ -44,7 +44,9 @@ run-name: >-
   ${{ github.event.client_payload.tag || github.event.client_payload.sha || inputs.checkout_ref || 'main' }}
 
 permissions:
-  contents: write # gh release create/upload on THIS (ppap) repo
+  # Nothing is written to ppap any more — the release lives on the private repo
+  # and is reached with PAT_TOKEN, not with this workflow's own GITHUB_TOKEN.
+  contents: read
 
 # One publish at a time. Latest migration set wins; superseding an in-flight
 # build is correct because the newer main is a superset of the older one.
@@ -155,14 +157,15 @@ jobs:
       # publish can never validate a NEW manifest against an OLD tarball.
       - name: Publish to the rolling db-snapshot release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # --repo on EVERY gh release call is load-bearing, not tidiness. This job
-          # checks erp-namthuan out INTO the workspace, so `gh` infers the repo from
-          # that git remote and targets the private repo — with ppap's GITHUB_TOKEN,
-          # which has no access there. That is a 404 on
-          # api.github.com/repos/NamThuanVn/erp-namthuan/releases, not a permissions
-          # error, so it reads like a missing release rather than a wrong target.
-          TARGET_REPO: ${{ github.repository }}
+          # PAT_TOKEN, not ppap's GITHUB_TOKEN: the release lives on the PRIVATE
+          # repo (Contents R/W is in PAT_TOKEN's scope) and ppap's own token has no
+          # access there.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          # --repo stays explicit on EVERY gh release call. The target happens to
+          # match the checkout now, but relying on `gh`'s remote inference is how
+          # this broke before: it silently aimed at whatever the workspace remote
+          # was and 404'd in a way that read like a missing release.
+          TARGET_REPO: ${{ env.PRIVATE_REPO }}
           # What this snapshot was built from, for the release title. A production
           # release passes its tag; a manual run only knows the ref it was aimed at.
           SNAP_TAG: ${{ github.event.client_payload.tag }}
@@ -213,11 +216,18 @@ jobs:
 
           Do not pin to an asset digest — fetch \`manifest.json\` first; it carries the producing sha and a sha256 per migration, which is what lets a consumer detect a migration edited in place and fall back to a cold run.
 
-          _The two "Source code" assets are attached automatically by GitHub for the \`$RELEASE_TAG\` tag and have nothing to do with the snapshot — ignore them._
+          **Contains real seeded company data** — the BA-seeded org lives in the migrations themselves, so this artifact holds ~188 employee records, ~188 accounts and ~2,900 budget rows. It must stay on this private repo; it was briefly published to the public ppap repo and had to be pulled.
+
+          _Marked pre-release so it never takes the "Latest" badge from a real vX.Y.Z release. The two "Source code" assets are attached automatically by GitHub for the \`$RELEASE_TAG\` tag and have nothing to do with the snapshot — ignore them._
           EOF
 
           if ! gh release view "$RELEASE_TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            # --target main pins the tag this creates on the private repo to a
+            # sensible commit. --prerelease keeps it OFF the "Latest" badge: this
+            # release now lives beside the real vX.Y.Z releases, and a build
+            # artifact must never displace the newest product release there.
             gh release create "$RELEASE_TAG" --repo "$TARGET_REPO" \
+              --target main --prerelease \
               --title "$TITLE" --notes-file release-notes.md
           fi
           gh release upload "$RELEASE_TAG" d1-snapshot.tar.gz --clobber --repo "$TARGET_REPO"
@@ -226,7 +236,8 @@ jobs:
           # Re-apply title + notes on EVERY run. `gh release create` only fires the
           # first time, so without this the label freezes at whatever the very first
           # build happened to be and the UI silently misreports every rebuild after.
-          gh release edit "$RELEASE_TAG" --repo "$TARGET_REPO" \
+          # --prerelease is re-asserted for the same reason.
+          gh release edit "$RELEASE_TAG" --repo "$TARGET_REPO" --prerelease \
             --title "$TITLE" --notes-file release-notes.md
 
           echo "✓ published $RELEASE_TAG to $TARGET_REPO — $TITLE"

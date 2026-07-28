@@ -295,6 +295,13 @@ jobs:
       - uses: ./.github/actions/install
 
       - name: Seed e2e database (once)
+        env:
+          # db-reset.sh restores the pre-migrated D1 snapshot, which lives on a
+          # release in the PRIVATE repo (it contains real seeded employee/budget
+          # data and must not be public). Without a token `gh` cannot read it and
+          # this job silently falls back to a full cold migration run — correct,
+          # just slower — so the seed step would quietly lose its speedup.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: STATE_DIR=.wrangler/state-e2e bash scripts/db-reset.sh
 
       # Mostly-incompressible sqlite — skip artifact gzip.

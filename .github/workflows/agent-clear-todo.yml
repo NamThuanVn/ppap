@@ -250,6 +250,12 @@ jobs:
       # sequential output for the public job log (no spinner interleaving).
       - name: First-time setup (pnpm worktree:init)
         if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        env:
+          # worktree:init runs db:reset, which restores the pre-migrated D1
+          # snapshot from a release on the PRIVATE repo (it holds real seeded
+          # employee/budget data). Without a token `gh` cannot read it and this
+          # silently does a full cold migration run instead — correct, just slower.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: pnpm worktree:init --verbose
 
       # The main event. GH_TOKEN = PAT_TOKEN is the gh identity for the whole
