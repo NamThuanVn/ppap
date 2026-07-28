@@ -81,6 +81,38 @@ jobs:
           ref: ${{ github.event.client_payload.sha || inputs.checkout_ref || 'main' }}
           persist-credentials: false
 
+      # The checkout above is the TARGET REF, and this job runs THAT ref's copy of
+      # the snapshot tooling — not main's. A ref from before the tooling landed
+      # therefore fails in a genuinely dangerous way: `SEEDS=0` is just an unknown
+      # env var to an older db-reset.sh, so it silently applies the local-seed
+      # files and builds a SEEDED state. Publishing that would be actively harmful,
+      # because local-seed/*.sql are non-idempotent INSERTs — every consumer would
+      # restore the seeded rows and then insert them again.
+      #
+      # Observed on run 30321264026 (checkout_ref=v1.0.10): the build applied
+      # "Procurement demo data" and only escaped publishing because the manifest
+      # script was missing too and crashed the job. Do not rely on that accident —
+      # fail loudly, before the build, with a message that names the fix.
+      - name: Verify this ref supports snapshot builds
+        run: |
+          set -euo pipefail
+          fail=0
+          if [ ! -f scripts/db-snapshot-manifest.mjs ]; then
+            echo "::error::scripts/db-snapshot-manifest.mjs is missing at this ref."
+            fail=1
+          fi
+          # The load-bearing check: without SEEDS support the build silently
+          # produces a seeded snapshot instead of a migrations-only one.
+          if ! grep -q 'SEEDS' scripts/db-reset.sh; then
+            echo "::error::scripts/db-reset.sh at this ref has no SEEDS support, so SEEDS=0 would be ignored and the snapshot would contain non-idempotent local-seed rows."
+            fail=1
+          fi
+          if [ "$fail" != 0 ]; then
+            echo "::error::This ref predates the D1 snapshot tooling. Re-run against 'main' or any tag cut after it landed."
+            exit 1
+          fi
+          echo "✓ ref carries the snapshot tooling"
+
       - uses: ./.github/actions/install
 
       # DB_SNAPSHOT=0 is load-bearing: the producer must build from scratch and
