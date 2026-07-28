@@ -131,16 +131,73 @@ jobs:
           # api.github.com/repos/NamThuanVn/erp-namthuan/releases, not a permissions
           # error, so it reads like a missing release rather than a wrong target.
           TARGET_REPO: ${{ github.repository }}
+          # What this snapshot was built from, for the release title. A production
+          # release passes its tag; a manual run only knows the ref it was aimed at.
+          SNAP_TAG: ${{ github.event.client_payload.tag }}
+          SNAP_REF: ${{ inputs.checkout_ref }}
         run: |
           set -euo pipefail
+
+          # HEAD of the erp-namthuan checkout in the workspace — the actual content
+          # of this snapshot, and NOT what GitHub shows beside the tag (that is
+          # ppap's own commit, which says nothing about what is inside).
+          SHA="$(git rev-parse HEAD)"
+          SHORT="${SHA:0:7}"
+
+          # The tag is rolling, so the title is the only place the UI can show
+          # provenance. Release builds get their version; manual builds get the ref
+          # plus a short sha, which still distinguishes two runs off the same branch.
+          if [ -n "${SNAP_TAG:-}" ]; then
+            LABEL="$SNAP_TAG"
+          else
+            LABEL="${SNAP_REF:-main}@${SHORT}"
+          fi
+          TITLE="Local D1 snapshot · $LABEL"
+
+          COUNT=$(node -e 'const m=require("./manifest.json");console.log(Object.values(m.services).reduce((a,s)=>a+s.migrations.length,0))')
+          SVCS=$(node -e 'const m=require("./manifest.json");console.log(Object.keys(m.services).length)')
+          BUILT=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          # Notes are written to a FILE and passed with --notes-file, never built
+          # with NOTES=$(cat <<EOF ...). Inside a command substitution bash keeps
+          # tracking quotes while it hunts the closing paren, so one apostrophe in
+          # ordinary prose ("CI's") swallows the rest of the script and it dies with
+          # "unexpected EOF while looking for matching `'`". A plain heredoc to a
+          # file has no such trap and lets the prose read naturally.
+          cat > release-notes.md <<EOF
+          Pre-migrated local D1 state, restored by \`pnpm db:reset\`, \`pnpm worktree:init\`, CI's \`e2e-seed\` job and ppap agent runs so they apply only new migrations instead of replaying every one.
+
+          |  |  |
+          | --- | --- |
+          | Built from | \`erp-namthuan\` **$LABEL** — commit \`$SHA\` |
+          | Contents | $COUNT migrations across $SVCS services |
+          | Built at | $BUILT |
+
+          **Rolling release.** The tag and the asset URLs never change; each rebuild replaces the bytes. Rebuilt automatically on every production release (\`release.yml\`), or on demand:
+
+          \`\`\`
+          gh workflow run db-snapshot.yml -R $TARGET_REPO -f checkout_ref=main
+          \`\`\`
+
+          Do not pin to an asset digest — fetch \`manifest.json\` first; it carries the producing sha and a sha256 per migration, which is what lets a consumer detect a migration edited in place and fall back to a cold run.
+
+          _The two "Source code" assets are attached automatically by GitHub for the \`$RELEASE_TAG\` tag and have nothing to do with the snapshot — ignore them._
+          EOF
+
           if ! gh release view "$RELEASE_TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --repo "$TARGET_REPO" \
-              --title "Local D1 snapshot" \
-              --notes "Rolling pre-migrated local D1 state, rebuilt on each production release (release.yml). Do not consume by tag+asset digest — fetch manifest.json first; it carries the producing sha and a sha256 per migration."
+              --title "$TITLE" --notes-file release-notes.md
           fi
           gh release upload "$RELEASE_TAG" d1-snapshot.tar.gz --clobber --repo "$TARGET_REPO"
           gh release upload "$RELEASE_TAG" manifest.json      --clobber --repo "$TARGET_REPO"
-          echo "✓ published $RELEASE_TAG to $TARGET_REPO"
+
+          # Re-apply title + notes on EVERY run. `gh release create` only fires the
+          # first time, so without this the label freezes at whatever the very first
+          # build happened to be and the UI silently misreports every rebuild after.
+          gh release edit "$RELEASE_TAG" --repo "$TARGET_REPO" \
+            --title "$TITLE" --notes-file release-notes.md
+
+          echo "✓ published $RELEASE_TAG to $TARGET_REPO — $TITLE"
 
       # A dead producer is silent-by-default: consumers just keep cold-running
       # (correct, only slower), so nothing would ever surface the breakage.
