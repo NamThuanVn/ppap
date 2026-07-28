@@ -120,6 +120,14 @@ jobs:
   #    all fall back to the FULL canonical lists — so the build matrices + deploy
   #    tiers behave exactly as before. Pure git + bash (no install); runs in
   #    parallel with the CI gate. See .github/scripts/compute-deploy-targets.sh.
+  #
+  #    When the diff selects nothing at all (a tooling / docs / test-only merge)
+  #    it emits nothing_to_deploy=true and the rest of the graph short-circuits:
+  #    terraform-apply, the build matrices and the deploy job are all skipped and
+  #    report-deployment pings SUCCESS, because staging already matches this
+  #    commit. Most such merges never even reach here — main-push-dispatch.yml
+  #    only dispatches on an allowlist of deployable paths — but a change the
+  #    filter cannot resolve (e.g. tests under apis/**) lands here.
   # ───────────────────────────────────────────────────────────────────────────
   changes:
     name: 0 · Plan · changed workers + zones
@@ -131,6 +139,7 @@ jobs:
       zones_list: ${{ steps.plan.outputs.zones_list }}
       deploy_dispatcher: ${{ steps.plan.outputs.deploy_dispatcher }}
       deploy_all: ${{ steps.plan.outputs.deploy_all }}
+      nothing_to_deploy: ${{ steps.plan.outputs.nothing_to_deploy }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -186,6 +195,34 @@ jobs:
           BASE_SHA: ${{ steps.baseline.outputs.base_sha || inputs.base_sha }}
         run: .github/scripts/compute-deploy-targets.sh
 
+      # A merge that deploys nothing skips terraform-apply + the whole deploy job,
+      # which reads as a silent no-op in the Actions UI unless we say why.
+      - name: Record the plan in the run summary
+        env:
+          WORKERS: ${{ steps.plan.outputs.workers_list }}
+          ZONES: ${{ steps.plan.outputs.zones_list }}
+          DISPATCHER: ${{ steps.plan.outputs.deploy_dispatcher }}
+          ALL: ${{ steps.plan.outputs.deploy_all }}
+          NOTHING: ${{ steps.plan.outputs.nothing_to_deploy }}
+        run: |
+          {
+            if [ "$NOTHING" = "true" ]; then
+              echo "### Nothing to deploy"
+              echo
+              echo "No worker, zone or dispatcher change in this diff (tooling / docs / tests only)."
+              echo "Terraform apply and the deploy job are skipped; staging is already current."
+            else
+              echo "### Deploy plan"
+              echo
+              echo "| | |"
+              echo "|---|---|"
+              echo "| Full deploy | \`$ALL\` |"
+              echo "| Workers | \`${WORKERS:-none}\` |"
+              echo "| Zones | \`${ZONES:-none}\` |"
+              echo "| Dispatcher | \`$DISPATCHER\` |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ───────────────────────────────────────────────────────────────────────────
   # 1. CI gate. Runs biome / typecheck / lint / vitest in parallel against
   #    the deploy ref BEFORE any infra touches Cloudflare or HCP. Lives in
@@ -230,11 +267,22 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   terraform-apply:
     name: 2 · Infra · Terraform apply
-    needs: [ci-gate]
+    needs: [ci-gate, changes]
     # Run when the gate PASSED or was SKIPPED (staging, run_ci_gate=false); only a
     # genuine gate FAILURE (or cancel) blocks the deploy. Without `always()` a
     # skipped `needs` would skip this job too.
-    if: ${{ always() && needs.ci-gate.result != 'failure' && needs.ci-gate.result != 'cancelled' }}
+    #
+    # Skipped entirely when the plan selected nothing (tooling/docs/test-only
+    # merge): there is no artifact to deploy, so there is nothing to provision
+    # for. A terraform-only change forces deploy_all, so infra changes always
+    # reach apply. `changes.result == 'success'` is explicit because under
+    # `always()` a FAILED plan job yields an empty output string, which would
+    # sail through a bare `!= 'true'` test and apply off a broken plan.
+    if: >-
+      ${{ always()
+          && needs.ci-gate.result != 'failure' && needs.ci-gate.result != 'cancelled'
+          && needs.changes.result == 'success'
+          && needs.changes.outputs.nothing_to_deploy != 'true' }}
     runs-on: ubuntu-latest
     concurrency:
       group: tf-${{ inputs.environment }}
@@ -514,7 +562,9 @@ jobs:
     # which includes the (skipped-on-staging) ci-gate — so a skipped gate would
     # skip this job too. `!cancelled() && !failure()` runs on success-OR-skipped
     # ancestors while still blocking on a genuine upstream failure/cancel.
-    if: ${{ !cancelled() && !failure() }}
+    # `nothing_to_deploy` skips the job outright: every tier's own gate would
+    # no-op anyway, so this just avoids the checkout + install to do nothing.
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.nothing_to_deploy != 'true' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -724,19 +774,28 @@ jobs:
     # (superseded staging deploy — expected, not an error) skips reporting
     # entirely — no Telegram alert, and its pending GitHub Deployment is
     # auto-marked inactive when the superseding deploy posts `success`.
-    needs: [ci-gate, build-workers, build-zones, deploy]
+    needs: [changes, ci-gate, build-workers, build-zones, deploy]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Compute outcome
         id: outcome
+        env:
+          NOTHING: ${{ needs.changes.outputs.nothing_to_deploy }}
         run: |
+          # A plan that selected nothing skips the deploy job by design — staging
+          # already matches this commit, so that is a SUCCESS. Without this branch
+          # the `deploy.result = success` test below would read the deliberate
+          # skip as a failed deploy and fire the Telegram alert.
+          if [ "$NOTHING" = "true" ]; then
+            echo "state=success" >> "$GITHUB_OUTPUT"
+            echo "nothing=true" >> "$GITHUB_OUTPUT"
           # ci-gate is `success` when it ran (production) or `skipped` when the
           # environment opted out (staging, run_ci_gate=false) — both are OK; only
           # a `failure`/`cancelled` gate counts against the deploy.
-          if [ "${{ needs.ci-gate.result }}" != "failure" ] && \
-             [ "${{ needs.ci-gate.result }}" != "cancelled" ] && \
-             [ "${{ needs.deploy.result }}" = "success" ]; then
+          elif [ "${{ needs.ci-gate.result }}" != "failure" ] && \
+               [ "${{ needs.ci-gate.result }}" != "cancelled" ] && \
+               [ "${{ needs.deploy.result }}" = "success" ]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
           else
             echo "state=failure" >> "$GITHUB_OUTPUT"
@@ -748,12 +807,13 @@ jobs:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           STATE: ${{ steps.outcome.outputs.state }}
           TAG_SUFFIX: ${{ inputs.release_tag && format(' ({0})', inputs.release_tag) || '' }}
+          NOTE: ${{ steps.outcome.outputs.nothing == 'true' && ' — no deployable change' || '' }}
         run: |
           gh api repos/${{ env.PRIVATE_REPO }}/deployments/${{ inputs.deployment_id }}/statuses \
             -f state="$STATE" \
             -f environment_url="https://${{ inputs.domain }}" \
             -f log_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            -f description="ppap run #${{ github.run_id }}${TAG_SUFFIX}"
+            -f description="ppap run #${{ github.run_id }}${TAG_SUFFIX}${NOTE}"
 
       - name: Ping commit status on private repo
         if: inputs.commit_sha != ''
@@ -761,12 +821,13 @@ jobs:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           STATE: ${{ steps.outcome.outputs.state }}
           TAG_SUFFIX: ${{ inputs.release_tag && format(' ({0})', inputs.release_tag) || '' }}
+          NOTE: ${{ steps.outcome.outputs.nothing == 'true' && ' — no deployable change' || '' }}
         run: |
           gh api repos/${{ env.PRIVATE_REPO }}/statuses/${{ inputs.commit_sha }} \
             -f state="$STATE" \
             -f context=${{ inputs.status_context }} \
             -f target_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            -f description="ppap deploy $STATE${TAG_SUFFIX}"
+            -f description="ppap deploy $STATE${TAG_SUFFIX}${NOTE}"
 
       - name: Summary
         run: |
