@@ -3,11 +3,11 @@ name: Deploy · Reusable
 # Reusable workflow shared by deploy-staging.yml and deploy-production.yml.
 # Those wrappers handle the trigger surface (event types, concurrency,
 # environment-specific run-name) and pass per-env inputs in here. This file
-# owns the actual deploy graph: terraform apply → build everything in parallel
-# (worker bundles + zone OpenNext outputs) → one ordered deploy job that uploads
-# the prebuilt artifacts (monitor → leaves → tier-1.5 → gateway → zones →
-# dispatcher) → status pingback. See .claude/ppap.md in the private repo for the
-# full architecture.
+# owns the actual deploy graph: read the current Terraform outputs → build
+# everything in parallel (worker bundles + zone OpenNext outputs) → one ordered
+# deploy job that applies Terraform and then uploads the prebuilt artifacts
+# (monitor → leaves → tier-1.5 → gateway → zones → dispatcher) → status
+# pingback. See .claude/ppap.md in the private repo for the full architecture.
 #
 # Why build/deploy are split: builds have no inter-worker dependencies — only
 # DEPLOYS must be ordered (a worker's service/tail bindings require the target
@@ -15,6 +15,16 @@ name: Deploy · Reusable
 # up front and ship their outputs as artifacts; the deploy job then just
 # uploads them in dependency order, skipping the per-tier bundle + the repeated
 # checkout/install that the old build-and-deploy-per-tier graph paid.
+#
+# Why `terraform apply` lives INSIDE the deploy job: it used to be its own job
+# ahead of the build matrices, which left Cloudflare provisioned 5–7 minutes
+# (the zone builds) before a single worker was uploaded — new/changed infra
+# (queues, secrets, D1) sat live against the OLD deployed code for that whole
+# window. Applying as the first step of the ordered deploy shrinks that gap to
+# seconds. The builds only need binding IDs to satisfy wrangler's config parse
+# (the emitted JS bundle is binding-ID-agnostic — the deploy job re-resolves
+# the config it actually uploads), so they read the PREVIOUS state's outputs
+# from the cheap read-only `tf-outputs` job instead.
 
 on:
   workflow_call:
@@ -123,9 +133,9 @@ jobs:
   #
   #    When the diff selects nothing at all (a tooling / docs / test-only merge)
   #    it emits nothing_to_deploy=true and the rest of the graph short-circuits:
-  #    terraform-apply, the build matrices and the deploy job are all skipped and
-  #    report-deployment pings SUCCESS, because staging already matches this
-  #    commit. Most such merges never even reach here — main-push-dispatch.yml
+  #    tf-outputs, the build matrices and the deploy job (which owns the terraform
+  #    apply) are all skipped and report-deployment pings SUCCESS, because staging
+  #    already matches this commit. Most such merges never reach here — main-push-dispatch.yml
   #    only dispatches on an allowlist of deployable paths — but a change the
   #    filter cannot resolve (e.g. tests under apis/**) lands here.
   # ───────────────────────────────────────────────────────────────────────────
@@ -195,8 +205,9 @@ jobs:
           BASE_SHA: ${{ steps.baseline.outputs.base_sha || inputs.base_sha }}
         run: .github/scripts/compute-deploy-targets.sh
 
-      # A merge that deploys nothing skips terraform-apply + the whole deploy job,
-      # which reads as a silent no-op in the Actions UI unless we say why.
+      # A merge that deploys nothing skips tf-outputs + the whole deploy job
+      # (terraform apply included), which reads as a silent no-op in the Actions
+      # UI unless we say why.
       - name: Record the plan in the run summary
         env:
           WORKERS: ${{ steps.plan.outputs.workers_list }}
@@ -231,7 +242,7 @@ jobs:
   #
   #    `release.yml` is workflow_dispatch only and `main-push-dispatch`
   #    can be re-fired manually; without this gate, a broken `main` (or a
-  #    bad merge commit) would still reach terraform-apply. Branch
+  #    bad merge commit) would still reach the build/deploy graph. Branch
   #    protection requires the PR-CI `CI` check green on the source PR, but
   #    this gate re-validates on the actual deploy ref to catch admin
   #    bypasses + post-merge drift.
@@ -240,9 +251,9 @@ jobs:
     name: 1 · CI gate
     # Per-environment: staging passes run_ci_gate=false (the source PR already ran
     # full CI on refs/pull/N/merge before merge — re-checking the same code on the
-    # auto-deploy is redundant), so staging goes straight to terraform-apply.
+    # auto-deploy is redundant), so staging goes straight to the build stage.
     # Production keeps it true to re-validate on the release tag. When skipped,
-    # terraform-apply still proceeds (its `if` treats a skipped gate as pass).
+    # tf-outputs still proceeds (its `if` treats a skipped gate as pass).
     if: ${{ inputs.run_ci_gate }}
     uses: ./.github/workflows/ci-checks.yml
     with:
@@ -255,18 +266,34 @@ jobs:
       # on the actual deploy ref (sha for staging, refs/tags/<tag> for
       # production) to catch admin-bypassed merges + post-merge drift before
       # infra touches Cloudflare. A failing job fails ci-gate, which blocks
-      # terraform-apply (needs: [ci-gate]).
+      # tf-outputs — and with it the builds + deploy (needs: [ci-gate]).
       run_e2e: ${{ inputs.run_e2e_gate }}
     secrets:
       PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 1. Provision Cloudflare resources (KV, D1, Queues, Pages, Vectorize
-  #    placeholders). Must run before worker deploy — workers bind to these
-  #    IDs.
+  # 1. Read the CURRENT Terraform outputs (no apply — that happens as the first
+  #    step of the deploy job, right before the uploads). The build matrices
+  #    need them for two things only:
+  #      • worker builds — real binding IDs so `wrangler deploy --dry-run` gets
+  #        past config parsing. The emitted bundle does NOT embed them (the
+  #        deploy job re-resolves the config it uploads), so the previous
+  #        state's values are sufficient; a binding created by THIS commit is
+  #        simply absent and resolves to a placeholder (TF_OUTPUTS_LENIENT).
+  #      • zone builds — the VAPID public key + Sentry config baked into the
+  #        browser bundle. Both come from HCP workspace variables, so they are
+  #        already in the previous state's outputs.
+  #    Cheap (init + `terraform output`, no plan/apply), so it barely delays the
+  #    build fan-out.
+  #
+  #    Fresh workspace (no state → no outputs at all): fall back to a full apply
+  #    here, otherwise the build stage has no VAPID key / credentials to read.
+  #    That is the documented production cold-start path (see
+  #    .claude/infrastructure.md § Production cold-start bootstrap); the deploy
+  #    job's own apply is then a no-op second pass.
   # ───────────────────────────────────────────────────────────────────────────
-  terraform-apply:
-    name: 2 · Infra · Terraform apply
+  tf-outputs:
+    name: 2 · Infra · Terraform outputs (read)
     needs: [ci-gate, changes]
     # Run when the gate PASSED or was SKIPPED (staging, run_ci_gate=false); only a
     # genuine gate FAILURE (or cancel) blocks the deploy. Without `always()` a
@@ -277,16 +304,17 @@ jobs:
     # for. A terraform-only change forces deploy_all, so infra changes always
     # reach apply. `changes.result == 'success'` is explicit because under
     # `always()` a FAILED plan job yields an empty output string, which would
-    # sail through a bare `!= 'true'` test and apply off a broken plan.
+    # sail through a bare `!= 'true'` test and build off a broken plan.
     if: >-
       ${{ always()
           && needs.ci-gate.result != 'failure' && needs.ci-gate.result != 'cancelled'
           && needs.changes.result == 'success'
           && needs.changes.outputs.nothing_to_deploy != 'true' }}
     runs-on: ubuntu-latest
-    concurrency:
-      group: tf-${{ inputs.environment }}
-      cancel-in-progress: false
+    # No `tf-<env>` concurrency group here — this job only READS state. The
+    # group lives on the deploy job, which owns the apply. (The cold-start
+    # fallback below can apply, but only on a state-less workspace, and HCP
+    # serializes runs per workspace anyway.)
     env:
       TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
       TF_WORKSPACE: ${{ inputs.tf_workspace }}
@@ -307,55 +335,20 @@ jobs:
         working-directory: terraform
         run: terraform init
 
-      # `cloudflare_workers_secret` can only attach to a Worker script that
-      # already exists on the account, but new workers deploy via wrangler
-      # AFTER terraform in this graph — so the first deploy of a brand-new
-      # secret-bearing service dies with Cloudflare error 10007 ("This Worker
-      # does not exist on your account"; first hit: exms, PR #261). Upload a
-      # trivial placeholder for any missing script_name referenced by the
-      # terraform modules; the real wrangler deploy overwrites it later in
-      # this same run. Idempotent — a no-op GET per worker once they exist.
-      # Credentials come from the PREVIOUS state's outputs (readable after
-      # init, before apply); on a completely fresh workspace there are none,
-      # so the step skips and the documented two-pass HCP bootstrap applies
-      # (see .claude/infrastructure.md § Production cold-start bootstrap).
-      - name: Bootstrap missing Workers (secrets cold-start)
+      # Read-only: the apply runs in the deploy job. `|| echo '{}'` covers a
+      # workspace with no state yet (`terraform output` exits non-zero), which
+      # the cold-start branch below then resolves.
+      - name: Export Terraform outputs (current state)
         working-directory: terraform
         run: |
-          terraform output -json > /tmp/pre-outputs.json 2>/dev/null || echo '{}' > /tmp/pre-outputs.json
-          ACC="$(jq -r '.cloudflare_account_id.value // empty' /tmp/pre-outputs.json)"
-          TOKEN="$(jq -r '.cloudflare_api_token.value // empty' /tmp/pre-outputs.json)"
-          rm -f /tmp/pre-outputs.json
-          if [[ -z "$ACC" || -z "$TOKEN" ]]; then
-            echo "no prior terraform outputs (fresh workspace) — skipping bootstrap"
-            exit 0
+          set -euo pipefail
+          terraform output -json > tf-outputs.json 2>/dev/null || echo '{}' > tf-outputs.json
+          if [[ "$(jq -r 'keys | length' tf-outputs.json)" -eq 0 ]]; then
+            echo "::notice::fresh workspace (no outputs yet) — applying here so the build stage has binding IDs; the deploy job's apply becomes a second pass"
+            terraform apply -auto-approve -no-color
+            terraform output -json > tf-outputs.json
           fi
-          echo "::add-mask::$ACC"
-          echo "::add-mask::$TOKEN"
-          printf 'export default { fetch() { return new Response("bootstrapping", { status: 503 }); } };\n' > /tmp/placeholder.mjs
-          for name in $(grep -rho 'script_name *= *"[^"]*"' apis/ | sed 's/.*"\(.*\)"/\1/' | sort -u); do
-            code="$(curl -s -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer $TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/services/$name")"
-            if [[ "$code" == "404" ]]; then
-              echo "worker '$name' missing — uploading placeholder so its secret can attach"
-              curl -sf -X PUT \
-                -H "Authorization: Bearer $TOKEN" \
-                -F 'metadata={"main_module":"placeholder.mjs","compatibility_date":"2024-11-01"};type=application/json' \
-                -F 'placeholder.mjs=@/tmp/placeholder.mjs;type=application/javascript+module' \
-                "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/scripts/$name" > /dev/null
-            else
-              echo "worker '$name' exists (HTTP $code)"
-            fi
-          done
-
-      - name: Terraform Apply
-        working-directory: terraform
-        run: terraform apply -auto-approve -no-color
-
-      - name: Export Terraform outputs
-        working-directory: terraform
-        run: terraform output -json > tf-outputs.json
+          echo "$(jq -r 'keys | length' tf-outputs.json) terraform outputs available to the build stage"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -370,14 +363,17 @@ jobs:
   #    `--no-bundle`. Binding IDs are NOT baked into the JS bundle (they're
   #    applied from wrangler.jsonc at upload), but we still run
   #    resolve-wrangler-bindings here so `--dry-run` doesn't choke on the
-  #    `${...}` placeholder IDs in the committed config.
+  #    `${...}` placeholder IDs in the committed config. It runs in LENIENT mode:
+  #    Terraform hasn't applied yet at this point in the graph, so a resource
+  #    this commit introduces isn't in the outputs — a placeholder ID keeps the
+  #    bundle building, and the deploy job resolves the real one post-apply.
   #
   #    Short matrix → gates the (short) front of the deploy job; runs in
   #    parallel with the slow build-zones matrix.
   # ───────────────────────────────────────────────────────────────────────────
   build-workers:
     name: 3 · Build · ${{ matrix.service }} (worker bundle)
-    needs: [terraform-apply, changes]
+    needs: [tf-outputs, changes]
     # See deploy job below — tolerate the skipped ci-gate in the transitive
     # closure. Skip entirely when no worker changed (empty selection).
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.workers != '[]' }}
@@ -408,11 +404,14 @@ jobs:
 
       # Resolve so `wrangler deploy --dry-run` sees valid binding IDs instead of
       # `${...}` placeholders. The resulting JS bundle is binding-ID-agnostic —
-      # the deploy job re-resolves the config it actually uploads with.
+      # the deploy job re-resolves the config it actually uploads with, against
+      # POST-apply outputs. Hence LENIENT: any output missing from the current
+      # state (a resource this commit adds) becomes a dummy ID here.
       - name: Resolve wrangler bindings
         run: .github/scripts/resolve-wrangler-bindings.sh ${{ matrix.service }} ${{ inputs.environment }}
         env:
           TF_OUTPUTS_JSON: /tmp/tf-outputs.json
+          TF_OUTPUTS_LENIENT: '1'
 
       # Call wrangler directly (mirrors each worker's `build` script + --outdir)
       # rather than `pnpm run build -- --outdir dist`: pnpm forwards the extra
@@ -444,7 +443,7 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   build-zones:
     name: 4 · Build · ${{ matrix.zone.name }} (Next.js zone)
-    needs: [terraform-apply, changes]
+    needs: [tf-outputs, changes]
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.zones != '[]' }}
     runs-on: ubuntu-latest
     strategy:
@@ -532,10 +531,11 @@ jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
   # 4. ONE ordered deploy job. Downloads every prebuilt artifact (worker
-  #    bundles + zone OpenNext outputs), resolves bindings, then uploads in
-  #    strict dependency order within this single job — so the expensive
-  #    checkout + pnpm install happens ONCE for the whole deploy phase instead
-  #    of once per tier:
+  #    bundles + zone OpenNext outputs), APPLIES Terraform (KV, D1, Queues,
+  #    Workers secrets — every binding target must exist before the uploads),
+  #    resolves bindings, then uploads in strict dependency order within this
+  #    single job — so the expensive checkout + pnpm install happens ONCE for
+  #    the whole deploy phase instead of once per tier:
   #
   #      monitor  →  leaves  →  tier-1.5  →  gateway  →  zones  →  dispatcher
   #
@@ -554,18 +554,33 @@ jobs:
   #    --no-bundle`. Zones run their `deploy:<env>` script on the prebuilt
   #    .open-next (no rebuild). The dispatcher is a tiny plain Worker — it
   #    bundles inline at deploy (no prebuilt artifact).
+  #
+  #    Terraform applies HERE (not in its own job ahead of the builds) so the
+  #    window between provisioning Cloudflare and shipping the code that uses it
+  #    is seconds instead of the 5–7 minutes the zone builds take. Everything
+  #    that does not depend on the apply (checkout, install, artifact download)
+  #    runs BEFORE it, so the apply is the last thing before the first upload.
   # ───────────────────────────────────────────────────────────────────────────
   deploy:
-    name: 5 · Deploy · all workers + zones (ordered)
-    needs: [changes, terraform-apply, build-workers, build-zones]
+    name: 5 · Deploy · Terraform apply + all workers + zones (ordered)
+    needs: [changes, tf-outputs, build-workers, build-zones]
     # The implicit `success()` check spans the whole transitive `needs` closure,
     # which includes the (skipped-on-staging) ci-gate — so a skipped gate would
     # skip this job too. `!cancelled() && !failure()` runs on success-OR-skipped
     # ancestors while still blocking on a genuine upstream failure/cancel.
     # `nothing_to_deploy` skips the job outright: every tier's own gate would
-    # no-op anyway, so this just avoids the checkout + install to do nothing.
+    # no-op anyway, so this just avoids the checkout + install to do nothing —
+    # and there is nothing to provision for either (a terraform-only change
+    # forces deploy_all, so infra changes always reach the apply below).
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.nothing_to_deploy != 'true' }}
     runs-on: ubuntu-latest
+    # Serializes the apply per environment across runs (moved here with it).
+    concurrency:
+      group: tf-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+      TF_WORKSPACE: ${{ inputs.tf_workspace }}
 
     steps:
       - uses: actions/checkout@v6
@@ -580,11 +595,6 @@ jobs:
         run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/install
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: tf-outputs
-          path: /tmp
 
       # Pull every prebuilt bundle/zone artifact into one dir, then untar from
       # the repo root so each tar's `apis/<svc>/dist` and `apps/<zone>/.open-next`
@@ -602,6 +612,70 @@ jobs:
         run: |
           shopt -s nullglob
           for t in /tmp/bundles/*.tar; do tar -xf "$t"; done
+
+      # ── Infra ─────────────────────────────────────────────────────────────
+      # Everything above is apply-independent, so the apply lands as late as
+      # possible: from here to the first `wrangler deploy` is seconds.
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: '1.9.0'
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      # `cloudflare_workers_secret` can only attach to a Worker script that
+      # already exists on the account, but new workers deploy via wrangler
+      # AFTER terraform in this graph — so the first deploy of a brand-new
+      # secret-bearing service dies with Cloudflare error 10007 ("This Worker
+      # does not exist on your account"; first hit: exms, PR #261). Upload a
+      # trivial placeholder for any missing script_name referenced by the
+      # terraform modules; the real wrangler deploy overwrites it later in
+      # this same job. Idempotent — a no-op GET per worker once they exist.
+      # Credentials come from the PREVIOUS state's outputs (readable after
+      # init, before apply); on a completely fresh workspace there are none,
+      # so the step skips and the documented two-pass HCP bootstrap applies
+      # (see .claude/infrastructure.md § Production cold-start bootstrap).
+      - name: Bootstrap missing Workers (secrets cold-start)
+        working-directory: terraform
+        run: |
+          terraform output -json > /tmp/pre-outputs.json 2>/dev/null || echo '{}' > /tmp/pre-outputs.json
+          ACC="$(jq -r '.cloudflare_account_id.value // empty' /tmp/pre-outputs.json)"
+          TOKEN="$(jq -r '.cloudflare_api_token.value // empty' /tmp/pre-outputs.json)"
+          rm -f /tmp/pre-outputs.json
+          if [[ -z "$ACC" || -z "$TOKEN" ]]; then
+            echo "no prior terraform outputs (fresh workspace) — skipping bootstrap"
+            exit 0
+          fi
+          echo "::add-mask::$ACC"
+          echo "::add-mask::$TOKEN"
+          printf 'export default { fetch() { return new Response("bootstrapping", { status: 503 }); } };\n' > /tmp/placeholder.mjs
+          for name in $(grep -rho 'script_name *= *"[^"]*"' apis/ | sed 's/.*"\(.*\)"/\1/' | sort -u); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/services/$name")"
+            if [[ "$code" == "404" ]]; then
+              echo "worker '$name' missing — uploading placeholder so its secret can attach"
+              curl -sf -X PUT \
+                -H "Authorization: Bearer $TOKEN" \
+                -F 'metadata={"main_module":"placeholder.mjs","compatibility_date":"2024-11-01"};type=application/json' \
+                -F 'placeholder.mjs=@/tmp/placeholder.mjs;type=application/javascript+module' \
+                "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/scripts/$name" > /dev/null
+            else
+              echo "worker '$name' exists (HTTP $code)"
+            fi
+          done
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve -no-color
+
+      # POST-apply outputs — this file (not the build stage's read-only copy) is
+      # what every resolve/bake step below reads, so a resource created by the
+      # apply above resolves to its real ID.
+      - name: Export Terraform outputs
+        working-directory: terraform
+        run: terraform output -json > /tmp/tf-outputs.json
 
       # Resolve config for each SELECTED API worker (substitutes binding IDs into
       # apis/<svc>/wrangler.jsonc) AND export the shared Cloudflare credentials to
