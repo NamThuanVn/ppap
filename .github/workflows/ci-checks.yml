@@ -85,6 +85,23 @@ jobs:
       # (.claude/rules.md § "Never skip checks, never suppress").
       - run: bash scripts/check-no-suppressions.sh
 
+      # Email-authentication gate for the OTP sender domains: DKIM at
+      # cf-bounce._domainkey, SPF at cf-bounce, bounce MX, exactly one DMARC
+      # record. Live DNS only — no Cloudflare credentials. Lives here rather
+      # than in a job of its own because it takes seconds and needs no build;
+      # grouped with the other repo-wide gates on this job.
+      #
+      # `dig` is installed if absent rather than assumed: the script treats a
+      # missing resolver as a hard failure under CI (see its NO_RESOLVER note),
+      # because a gate that silently skips itself is worth no more than no gate.
+      - name: Assert sender-domain email DNS
+        run: |
+          command -v dig >/dev/null 2>&1 || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq dnsutils
+          }
+          bash scripts/check-email-dns.sh
+
   typecheck:
     name: 1 · CI · Typecheck
     runs-on: ubuntu-latest
