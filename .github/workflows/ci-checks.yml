@@ -74,6 +74,9 @@ jobs:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
           ref: ${{ inputs.checkout_ref }}
+          # Full history so HEAD^1 (the PR's base parent on the merge ref) is
+          # available for the demo-migration-guard diff below.
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: ./.github/actions/install
@@ -84,6 +87,15 @@ jobs:
       # @ts-ignore and no test skip in ANY form may exist in the codebase
       # (.claude/rules.md § "Never skip checks, never suppress").
       - run: bash scripts/check-no-suppressions.sh
+
+      # Demo/test fixtures must never ship as a schema migration under
+      # apis/*/migrations/ — they apply to Staging AND Production with no
+      # environment filter (this has recurred twice; see
+      # docs/ba/scnpms/bug/cross-module/2026-08-04-demo-fixture-data-live-in-staging-and-production.md).
+      # Diff-scoped to files ADDED by this PR (HEAD^1 = the base parent on
+      # refs/pull/N/merge, same convention as scripts/e2e-plan.sh) — the 22
+      # already-shipped demo migrations stay in place and must not retrigger.
+      - run: bash scripts/check-demo-migrations.sh
 
       # Email-authentication gate for the OTP sender domains: DKIM at
       # cf-bounce._domainkey, SPF at cf-bounce, bounce MX, exactly one DMARC
