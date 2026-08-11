@@ -7,9 +7,9 @@ name: Agent · clear-todo-issue
 #   1. SCRIPTED CLAIM (agent-board/claim-todo.mjs, BEFORE the heavy bootstrap):
 #      picks an eligible Project #1 Todo leaf, wins the atomic create-ref lock,
 #      assigns + flips the board — deterministically (stale claim refs are
-#      auto-cleaned age-gated via STALE_REF_HOURS; slice branches carry the
-#      canonical -s<issue> suffix). Empty backlog → the job ends GREEN here in
-#      ~1-2 min (bootstrap skipped) and never chains the loop.
+#      auto-cleaned age-gated via STALE_REF_HOURS / BARE_REF_MINUTES; slice
+#      branches carry the canonical -s<issue> suffix). Empty backlog → the job
+#      ends GREEN here in ~1-2 min (bootstrap skipped) and never chains the loop.
 #   2. /solve-issue (Claude Code CLI, installed directly — NOT
 #      claude-code-action — so CLAUDE.md, slash commands, Stop hooks, .mcp.json
 #      MCP servers and subagents all load): solves the pre-claimed item to a
@@ -148,6 +148,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           STALE_REF_HOURS: ${{ vars.STALE_REF_HOURS || '3.5' }}
+          BARE_REF_MINUTES: ${{ vars.BARE_REF_MINUTES || '15' }}
         run: node .github/scripts/agent-board/claim-todo.mjs
 
       # A prior interrupted run on this issue left a salvage pointer → restore
