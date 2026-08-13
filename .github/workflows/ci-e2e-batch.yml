@@ -18,7 +18,7 @@ name: CI · E2E batch (fan-out worker)
 # It never posts a status, never touches the PR, and needs no secret beyond the
 # PAT_TOKEN every fleet repo already has.
 
-run-name: "E2E · ${{ github.event.client_payload.pr_number && format('PR #{0}', github.event.client_payload.pr_number) || 'manual' }} · batch ${{ github.event.client_payload.batch }}/${{ github.event.client_payload.batch_count }} · ${{ github.event.client_payload.correlation }}"
+run-name: "E2E · ${{ github.event.client_payload.ctx.pr_number && format('PR #{0}', github.event.client_payload.ctx.pr_number) || 'manual' }} · batch ${{ github.event.client_payload.batch }}/${{ github.event.client_payload.batch_count }} · ${{ github.event.client_payload.correlation }}"
 
 on:
   repository_dispatch:
@@ -63,8 +63,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           SHARDS: ${{ github.event.client_payload.shards }}
-          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
-          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          PR_NUMBER: ${{ github.event.client_payload.ctx.pr_number }}
+          HEAD_SHA: ${{ github.event.client_payload.ctx.head_sha }}
         run: |
           set -euo pipefail
           if [ -z "${SHARDS// /}" ]; then
@@ -109,7 +109,7 @@ jobs:
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
-          ref: ${{ github.event.client_payload.checkout_ref }}
+          ref: ${{ github.event.client_payload.ctx.checkout_ref }}
           persist-credentials: false
 
       - uses: ./.github/actions/install
@@ -123,8 +123,8 @@ jobs:
         with:
           pattern: e2e-*
           merge-multiple: true
-          repository: ${{ github.event.client_payload.artifact_repo }}
-          run-id: ${{ github.event.client_payload.artifact_run_id }}
+          repository: ${{ github.event.client_payload.ctx.artifact_repo }}
+          run-id: ${{ github.event.client_payload.ctx.artifact_run_id }}
           github-token: ${{ secrets.PAT_TOKEN }}
 
       - name: Unpack e2e build + seed
@@ -133,7 +133,7 @@ jobs:
           shopt -s nullglob
           tars=(*.tar)
           if [ ${#tars[@]} -eq 0 ]; then
-            echo "::error::no artifacts restored from ${{ github.event.client_payload.artifact_repo }} run ${{ github.event.client_payload.artifact_run_id }} — cannot run this batch"
+            echo "::error::no artifacts restored from ${{ github.event.client_payload.ctx.artifact_repo }} run ${{ github.event.client_payload.ctx.artifact_run_id }} — cannot run this batch"
             exit 1
           fi
           for f in "${tars[@]}"; do tar -xf "$f"; done
@@ -165,7 +165,7 @@ jobs:
           PLAYWRIGHT_NO_WEB_SERVER: '1'
           SHARD: ${{ matrix.shard }}
           TOTAL: ${{ github.event.client_payload.total }}
-          E2E_TARGETS: ${{ github.event.client_payload.targets }}
+          E2E_TARGETS: ${{ github.event.client_payload.ctx.targets }}
           NODE_OPTIONS: --dns-result-order=ipv4first
         run: |
           set -uo pipefail
