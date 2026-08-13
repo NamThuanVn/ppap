@@ -106,7 +106,7 @@ jobs:
       # history (fetch-depth 0): the agent does arbitrary git ops and
       # shallow-clone edge cases are subtle CI-only failures.
       - name: Checkout upstream (freshest main)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: NamThuanVn/erp-namthuan
           ref: main
@@ -198,7 +198,7 @@ jobs:
 
       - name: Cache Playwright browsers
         if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
@@ -223,7 +223,7 @@ jobs:
       # twice).
       - name: Cache codegraph index
         if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: .codegraph
           key: codegraph-v1-${{ hashFiles('apps/**', 'apis/**', 'packages/**') }}

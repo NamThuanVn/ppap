@@ -151,7 +151,7 @@ jobs:
       deploy_all: ${{ steps.plan.outputs.deploy_all }}
       nothing_to_deploy: ${{ steps.plan.outputs.nothing_to_deploy }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -320,7 +320,7 @@ jobs:
       TF_WORKSPACE: ${{ inputs.tf_workspace }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -388,7 +388,7 @@ jobs:
         service: ${{ fromJSON(needs.changes.outputs.workers) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -454,7 +454,7 @@ jobs:
         zone: ${{ fromJSON(needs.changes.outputs.zones) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -477,7 +477,7 @@ jobs:
       # compilation work. Keyed per-zone so the matrix legs don't clobber one
       # another's cache.
       - name: Cache Next build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: apps/${{ matrix.zone.name }}/.next/cache
           key: next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/**', 'packages/**') }}
@@ -583,7 +583,7 @@ jobs:
       TF_WORKSPACE: ${{ inputs.tf_workspace }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}

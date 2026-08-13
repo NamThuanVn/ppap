@@ -77,7 +77,7 @@ jobs:
       # planning creates no claim refs (sync-agent-fork.yml + the solve job's
       # own freshen keep the fork current).
       - name: Checkout upstream (freshest main)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: NamThuanVn/erp-namthuan
           ref: main

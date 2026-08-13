@@ -105,7 +105,7 @@ jobs:
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -128,7 +128,7 @@ jobs:
       # job, and the retry re-runs the identical download.
       - name: Restore e2e build + seed from coordinator
         id: restore
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           pattern: e2e-*
@@ -139,7 +139,7 @@ jobs:
 
       - name: Restore e2e build + seed (retry)
         if: steps.restore.outcome == 'failure'
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: e2e-*
           merge-multiple: true
@@ -167,7 +167,7 @@ jobs:
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
       - name: Cache Playwright browsers
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         id: pw-cache
         with:
           path: ~/.cache/ms-playwright

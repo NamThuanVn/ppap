@@ -9,11 +9,11 @@ runs:
   # CI-log noise we can't fix at the source. Scoped to setup only, so genuine
   # deprecations in our own build / test / e2e steps still surface.
   steps:
-    - uses: pnpm/action-setup@v5
+    - uses: pnpm/action-setup@v6
       env:
         NODE_OPTIONS: --no-deprecation
 
-    - uses: actions/setup-node@v6
+    - uses: actions/setup-node@v7
       with:
         node-version: '22'
         cache: pnpm
@@ -35,7 +35,7 @@ runs:
     # that predates it. (It also busts the bad entries that exist today.)
     - name: Restore node_modules cache
       id: cache
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: |
           node_modules

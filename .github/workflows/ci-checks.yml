@@ -81,7 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -201,7 +201,7 @@ jobs:
           - name: rest   # 76
             pkgs: ''   # catch-all — everything not in BINNED_PKGS
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -237,7 +237,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -310,7 +310,7 @@ jobs:
           - name: rest        # 32
             pkgs: ''   # catch-all — everything not in BINNED_PKGS
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -364,7 +364,7 @@ jobs:
       shards: ${{ steps.plan.outputs.shards }}
       total: ${{ steps.plan.outputs.total }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -466,7 +466,7 @@ jobs:
           - { name: hris, pkg: '@namthuanvn/zone-hris' }
           - { name: utilities, pkg: '@namthuanvn/zone-utilities' }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -492,7 +492,7 @@ jobs:
       # rebuilds quotation and restores the other nine.
       - name: Cache zone bundle
         id: zonetar
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: zone-${{ matrix.zone.name }}.tar
           key: zonetar-v1-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'packages/**') }}
@@ -512,7 +512,7 @@ jobs:
       # compiler cache is only a slower build, never a wrong one.
       - name: Cache Next build
         if: steps.zonetar.outputs.cache-hit != 'true'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: apps/${{ matrix.zone.name }}/.next/cache
           key: next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('apps/{0}/**', matrix.zone.name), 'packages/**') }}
@@ -559,7 +559,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
@@ -648,7 +648,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "▶ e2e gate: run_e2e=$RUN_E2E plan=$PLAN_RESULT/$PLAN_RUN build=$BUILD_RESULT seed=$SEED_RESULT → proceed=$PROCEED" >&2
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: ${{ steps.gate.outputs.proceed == 'true' }}
         with:
           repository: ${{ env.PRIVATE_REPO }}
