@@ -101,6 +101,11 @@ jobs:
 
       # The SAME query as agent-loop.yml's gate and the recount below: open
       # leaf (by leaf marker — batch mains never plan) lacking `rel-planned`.
+      # The batch exclusion runs FIRST and is not optional: a batch main can
+      # QUOTE a leaf marker in its body (e.g. #2252 pasting the re-mint guard
+      # marker into its PR description), which matches the leaf regex and
+      # would make this query see a leaf the planner correctly refuses to plan
+      # — gate says 1, planner says 0, recount fails forever.
       - name: Detect unplanned leaves
         id: sweep
         env:
@@ -110,7 +115,7 @@ jobs:
           UNPLANNED=$(for L in ba-bug ba-change ba-feature; do
             gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
               --json number,body,labels --limit 200 \
-              --jq '.[] | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
+              --jq '.[] | select(.body | test("<!--\\s*ba-(bugs|change-packages|features)-batch:") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
           done | sort -u | wc -l | tr -d ' ')
           echo "unplanned=$UNPLANNED" >> "$GITHUB_OUTPUT"
           if [ "$UNPLANNED" -eq 0 ]; then
@@ -153,7 +158,7 @@ jobs:
           LEFT=$(for L in ba-bug ba-change ba-feature; do
             gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
               --json number,body,labels --limit 200 \
-              --jq '.[] | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
+              --jq '.[] | select(.body | test("<!--\\s*ba-(bugs|change-packages|features)-batch:") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
           done | sort -u | wc -l | tr -d ' ')
           if [ "$LEFT" -gt 0 ]; then
             echo "::error::$LEFT leaf/leaves still unplanned after the session — failing (the loop will not chain; re-dispatch agent-rel-plan after investigating)"

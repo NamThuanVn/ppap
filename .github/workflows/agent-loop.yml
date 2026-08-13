@@ -266,7 +266,12 @@ jobs:
       # gate then passes. All three kinds are swept (a bug can be blocked by a
       # feature) with the SAME leaf-marker query as the planner's sweep and
       # its coverage recount — the three definitions must stay identical or
-      # the gate and the planner ping-pong. Duplicate gate dispatches coalesce
+      # the gate and the planner ping-pong. Batch mains are excluded FIRST,
+      # before the leaf test: a batch main can QUOTE a leaf marker in its body
+      # (#2252 pasted the re-mint guard marker into its PR description), and
+      # without that exclusion this gate counts a "leaf" the planner refuses
+      # to plan — dispatch → plan nothing → recount fails, forever.
+      # Duplicate gate dispatches coalesce
       # in agent-rel-plan's concurrency group (the extra run no-ops + chains).
       - name: Rel-planning gate
         id: relplan
@@ -279,7 +284,7 @@ jobs:
           UNPLANNED=$(for L in ba-bug ba-change ba-feature; do
             gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
               --json number,body,labels --limit 200 \
-              --jq '.[] | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
+              --jq '.[] | select(.body | test("<!--\\s*ba-(bugs|change-packages|features)-batch:") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
           done | sort -u | wc -l | tr -d ' ')
           if [ "$UNPLANNED" -gt 0 ]; then
             echo "::notice::$UNPLANNED unplanned leaf/leaves — dispatching agent-rel-plan, deferring lane dispatch to its chain"
