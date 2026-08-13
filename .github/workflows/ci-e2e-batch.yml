@@ -1,0 +1,235 @@
+name: CI · E2E batch (fan-out worker)
+
+# One BATCH of another repo's Playwright shards.
+#
+# GitHub Free allows ~20 concurrent jobs per org, which caps how wide a single
+# CI run's e2e matrix can go. `ci-checks.yml`'s `e2e-fanout` job splits the
+# shard set across idle fleet repos and dispatches a batch to each; this
+# workflow runs one. The dispatching repo remains the COORDINATOR — it owns the
+# checkout ref, the zone builds, the DB seed, the commit Status and every PR
+# write. A batch does exactly one thing: run its shard indices and conclude.
+# The coordinator reads that conclusion (ci-fanout.mjs collect).
+#
+# This file MUST keep its `ci-` prefix: sync-workflows-to-ppap.yml mirrors only
+# `ci-*.yml` to the CI fleet, and a fleet repo without this workflow is skipped
+# by the fan-out's dispatchability guard (so a missed sync degrades to fewer
+# shards, never to a silently untested one).
+#
+# It never posts a status, never touches the PR, and needs no secret beyond the
+# PAT_TOKEN every fleet repo already has.
+
+run-name: "E2E · ${{ github.event.client_payload.pr_number && format('PR #{0}', github.event.client_payload.pr_number) || 'manual' }} · batch ${{ github.event.client_payload.batch }}/${{ github.event.client_payload.batch_count }} · ${{ github.event.client_payload.correlation }}"
+
+on:
+  repository_dispatch:
+    types: [e2e-batch]
+
+permissions: read-all
+
+# Keyed on the correlation token (coordinator head sha + run id + attempt) plus
+# the batch index, so a re-dispatched attempt supersedes its predecessor while
+# leaving other PRs' batches — and this PR's OTHER batches — alone.
+concurrency:
+  group: e2e-batch-${{ github.event.client_payload.correlation }}-${{ github.event.client_payload.batch }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
+jobs:
+  # Cheap gate in front of the expensive matrix. Two jobs in one:
+  #   1. Turn the space-separated shard list into the JSON array the matrix
+  #      needs (`fromJSON`).
+  #   2. STALE CHECK — re-read the PR's live head. The coordinator's own
+  #      concurrency cancels its run when a new commit lands, but that cancel
+  #      does NOT reach across repos, and an orphan batch here does not merely
+  #      waste free minutes: it holds JOB SLOTS in this org, which is the exact
+  #      resource the fan-out exists to conserve. Bailing here (rather than
+  #      after a 2-minute stack boot) returns the slots almost immediately.
+  #      Fails OPEN: if the head cannot be read we still run, because skipping
+  #      shards would let the coordinator conclude green on an untested slice.
+  plan:
+    name: E2E batch ${{ github.event.client_payload.batch }} · plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      run: ${{ steps.plan.outputs.run }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          SHARDS: ${{ github.event.client_payload.shards }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SHARDS// /}" ]; then
+            echo "::error::empty shard list in client_payload"
+            exit 1
+          fi
+          # Explicit array read rather than an unquoted expansion: the split is
+          # intentional, but doing it this way keeps shellcheck satisfied
+          # without a suppression.
+          read -r -a SHARD_ARR <<< "$SHARDS"
+          JSON=$(printf '%s\n' "${SHARD_ARR[@]}" | jq -R 'tonumber' | jq -cs '.')
+          echo "shards=$JSON" >> "$GITHUB_OUTPUT"
+
+          RUN=true
+          if [ -n "${PR_NUMBER:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+            CURRENT=$(gh api "repos/${PRIVATE_REPO}/pulls/${PR_NUMBER}" --jq '.head.sha // ""' 2>/dev/null || true)
+            if [ -n "$CURRENT" ] && [ "$CURRENT" != "$HEAD_SHA" ]; then
+              echo "::notice::stale batch — coordinator tested $HEAD_SHA but PR #$PR_NUMBER is now $CURRENT; skipping."
+              RUN=false
+            fi
+          fi
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+          echo "▶ batch shards=$JSON run=$RUN" >&2
+
+  # Identical to ci-checks.yml's `e2e` job, except the build/seed artifacts are
+  # pulled from the COORDINATOR's run in another repo. Keep the two in step:
+  # a change to the boot/run contract in one must land in the other.
+  e2e:
+    name: E2E (shard ${{ matrix.shard }})
+    needs: plan
+    if: ${{ needs.plan.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Within a batch this mirrors the coordinator's matrix. Across batches,
+      # ci-fanout.mjs collect plays the same role by cancelling siblings.
+      fail-fast: true
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ github.event.client_payload.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      # CROSS-REPO artifact download — the zone bundles and the seeded DB were
+      # built once, by the coordinator, in a different org. download-artifact
+      # supports this via `repository` + `run-id`; PAT_TOKEN already carries
+      # actions:read on every fleet repo, so no new secret is involved.
+      - name: Restore e2e build + seed from coordinator
+        uses: actions/download-artifact@v7
+        with:
+          pattern: e2e-*
+          merge-multiple: true
+          repository: ${{ github.event.client_payload.artifact_repo }}
+          run-id: ${{ github.event.client_payload.artifact_run_id }}
+          github-token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Unpack e2e build + seed
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tars=(*.tar)
+          if [ ${#tars[@]} -eq 0 ]; then
+            echo "::error::no artifacts restored from ${{ github.event.client_payload.artifact_repo }} run ${{ github.event.client_payload.artifact_run_id }} — cannot run this batch"
+            exit 1
+          fi
+          for f in "${tars[@]}"; do tar -xf "$f"; done
+          echo "▶ unpacked ${#tars[@]} artifact tar(s)"
+
+      - name: Resolve Playwright version
+        id: pw
+        run: |
+          set -euo pipefail
+          VER=$(node -e "console.log(require('./node_modules/@playwright/test/package.json').version)")
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v5
+        id: pw-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      # Same boot + reboot-once-on-infra-failure contract as the coordinator's
+      # shard job. A batch checkout always postdates scripts/ci-boot-e2e.sh
+      # (this workflow is newer), so there is no legacy inline-boot fallback —
+      # a missing script is a hard, clearly-labelled error instead.
+      - name: Boot e2e stack + run Playwright shard ${{ matrix.shard }}/${{ github.event.client_payload.total }}
+        env:
+          PLAYWRIGHT_NO_WEB_SERVER: '1'
+          SHARD: ${{ matrix.shard }}
+          TOTAL: ${{ github.event.client_payload.total }}
+          E2E_TARGETS: ${{ github.event.client_payload.targets }}
+          NODE_OPTIONS: --dns-result-order=ipv4first
+        run: |
+          set -uo pipefail
+          if [ ! -f scripts/ci-boot-e2e.sh ]; then
+            echo "::error::scripts/ci-boot-e2e.sh is missing on this ref — rebase the PR onto main."
+            exit 1
+          fi
+          serve_alive() { local p; p="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+          teardown_serve() {
+            local p; p="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"
+            [ -n "$p" ] || return 0
+            kill -TERM -- -"$p" 2>/dev/null || true; sleep 2; kill -KILL -- -"$p" 2>/dev/null || true
+          }
+          attempt() {
+            bash scripts/ci-boot-e2e.sh || return 70
+            # shellcheck disable=SC2086  # E2E_TARGETS is an intentional path list
+            PLAYWRIGHT_BASE_URL="http://localhost:$(cat .wrangler/e2e-port)" \
+              pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL" $E2E_TARGETS
+          }
+          attempt
+          rc=$?
+          [ "$rc" -eq 0 ] && exit 0
+          if [ "$rc" -ne 70 ] && serve_alive; then
+            echo "::error::shard $SHARD/$TOTAL failed with the stack still alive — a genuine test failure, not retrying"
+            teardown_serve
+            exit "$rc"
+          fi
+          echo "::warning::infra failure on shard $SHARD/$TOTAL (rc=$rc) — rebooting the stack and re-running this shard once"
+          teardown_serve
+          mv e2e-serve.log e2e-serve.attempt1.log 2>/dev/null || true
+          attempt
+
+      - name: Tear down e2e stack
+        if: always()
+        run: |
+          SERVE_PID="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"
+          if [ -n "$SERVE_PID" ]; then
+            kill -TERM -- -"$SERVE_PID" 2>/dev/null || true
+            sleep 2
+            kill -KILL -- -"$SERVE_PID" 2>/dev/null || true
+          fi
+
+      # Flaky-passed-on-retry still leaves evidence in test-results/; upload it
+      # alongside genuine failures so the coordinator's noise scan and /fix-ci
+      # can see it. See the same step in ci-checks.yml for the full rationale.
+      - name: Detect retained failure artifacts (covers flaky-passed-on-retry)
+        id: pw_artifacts
+        if: always()
+        run: |
+          if [ -d test-results ] && [ -n "$(ls -A test-results 2>/dev/null)" ]; then
+            echo "present=true" >>"$GITHUB_OUTPUT"
+            echo "::notice::shard ${{ matrix.shard }} retained failure artifacts (flaky first attempt) — uploading"
+          else
+            echo "present=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Playwright report
+        if: ${{ failure() || steps.pw_artifacts.outputs.present == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-shard-${{ matrix.shard }}
+          path: |
+            playwright-report/
+            test-results/
+            e2e-serve*.log
+          retention-days: 7
+          if-no-files-found: ignore

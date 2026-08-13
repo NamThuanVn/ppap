@@ -13,9 +13,21 @@ on:
         type: string
         required: true
       e2e_shards:
-        description: 'Number of parallel Playwright shards. Tune up/down here; both PR CI and the deploy gate inherit it.'
+        description: 'DESIRED number of parallel Playwright shards. The effective count is min(this, available capacity) — see the e2e-fanout job. Both PR CI and the deploy gate inherit it.'
         type: number
-        default: 12
+        default: 36
+      fleet:
+        description: 'Comma-separated owner/repo list of ppap CI repos this run may borrow idle e2e capacity from (the erp-namthuan variable PPAP_CI_REPOS). Empty ⇒ no fan-out; every shard runs on this repo.'
+        type: string
+        default: ''
+      pr_number:
+        description: 'Source PR number, forwarded to e2e batches so they can detect a moved head and bail early.'
+        type: string
+        default: ''
+      head_sha:
+        description: 'Head SHA under test, forwarded to e2e batches for the same stale check.'
+        type: string
+        default: ''
       run_e2e:
         description: 'Whether to run the e2e matrix. PR CI keeps the default (true); the deploy gate passes false so staging/production builds are not blocked on dashboard e2e.'
         type: boolean
@@ -29,14 +41,14 @@ on:
         description: 'Result of the biome job'
         value: ${{ jobs.biome.result }}
       typecheck:
-        description: 'Result of the typecheck job'
-        value: ${{ jobs.typecheck.result }}
+        description: 'Aggregated result of the sharded typecheck matrix.'
+        value: ${{ jobs.typecheck-aggregate.outputs.result }}
       lint:
         description: 'Result of the lint job'
         value: ${{ jobs.lint.result }}
       test:
-        description: 'Result of the test job'
-        value: ${{ jobs.test.result }}
+        description: 'Aggregated result of the sharded Vitest matrix.'
+        value: ${{ jobs.test-aggregate.outputs.result }}
       e2e:
         description: 'Aggregated e2e result: success when all shards pass OR when a change-scoped run had nothing relevant to test (skip); failure if any shard failed.'
         value: ${{ jobs.e2e-aggregate.outputs.result }}
@@ -114,10 +126,45 @@ jobs:
           }
           bash scripts/check-email-dns.sh
 
+  # Typecheck, split across parallel legs — same reasoning as the Vitest matrix
+  # above (389s as one job, and the dominant cost on any PR whose e2e is
+  # skipped).
+  #
+  # The legs are INDEPENDENT: every workspace package resolves its siblings to
+  # raw TypeScript (`packages/api-types` exports `./src/index.ts`,
+  # `packages/dashboard-shell` exports `./src/*`), so no leg needs another
+  # leg's emitted `.d.ts` and there is no build ordering to preserve. If a
+  # package is ever changed to publish `dist/`, that assumption breaks and the
+  # legs must gain a `needs:` on whichever leg builds it.
+  #
+  # Three legs, for the same 20-job concurrency reason as the Vitest matrix.
+  # Weights from measured per-package runtime (local seconds), 223s over 34
+  # packages:
+  #   a 71 · b 76 · rest 76
+  # `api-monolith` (27s) and `shell` (26s) are the outliers; they anchor
+  # separate legs, so ~27 is this branch's floor at any leg count.
+  #
+  # BINNED_PKGS / `rest` catch-all: see the note on the Vitest matrix.
   typecheck:
-    name: 1 · CI · Typecheck
+    name: 1 · CI · Typecheck (${{ matrix.leg.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      BINNED_PKGS: >-
+        @namthuanvn/api-monolith @namthuanvn/oms @namthuanvn/assistant @namthuanvn/exms
+        @namthuanvn/procurement @namthuanvn/sourcing @namthuanvn/zone-bom
+        @namthuanvn/shell @namthuanvn/zone-expense @namthuanvn/zone-oms @namthuanvn/zone-sourcing
+        @namthuanvn/auth @namthuanvn/bom @namthuanvn/expense @namthuanvn/social @namthuanvn/audit
+    strategy:
+      fail-fast: false
+      matrix:
+        leg:
+          - name: a      # 71
+            pkgs: '@namthuanvn/api-monolith @namthuanvn/oms @namthuanvn/assistant @namthuanvn/exms @namthuanvn/procurement @namthuanvn/sourcing @namthuanvn/zone-bom'
+          - name: b      # 76
+            pkgs: '@namthuanvn/shell @namthuanvn/zone-expense @namthuanvn/zone-oms @namthuanvn/zone-sourcing @namthuanvn/auth @namthuanvn/bom @namthuanvn/expense @namthuanvn/social @namthuanvn/audit'
+          - name: rest   # 76
+            pkgs: ''   # catch-all — everything not in BINNED_PKGS
     steps:
       - uses: actions/checkout@v6
         with:
@@ -128,7 +175,44 @@ jobs:
 
       - uses: ./.github/actions/install
 
-      - run: pnpm typecheck
+      - name: Run typecheck leg
+        env:
+          LEG: ${{ matrix.leg.name }}
+          PKGS: ${{ matrix.leg.pkgs }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ -z "$PKGS" ]; then
+            for p in $BINNED_PKGS; do ARGS+=(--filter "!$p"); done
+          else
+            for p in $PKGS; do
+              case " $BINNED_PKGS " in
+                *" $p "*) ;;
+                *) echo "::error::typecheck leg '$LEG' runs $p but BINNED_PKGS does not list it — the 'rest' leg would run it a second time. Add it to BINNED_PKGS."; exit 1 ;;
+              esac
+              ARGS+=(--filter "$p")
+            done
+          fi
+          echo "▶ typecheck leg '$LEG': pnpm -r ${ARGS[*]} typecheck"
+          pnpm -r "${ARGS[@]}" typecheck
+
+  # Collapse the typecheck matrix into the single `typecheck` workflow output.
+  typecheck-aggregate:
+    name: 1 · CI · Typecheck (result)
+    needs: typecheck
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      result: ${{ steps.agg.outputs.result }}
+    steps:
+      - id: agg
+        env:
+          TC_RESULT: ${{ needs.typecheck.result }}
+        run: |
+          set -euo pipefail
+          echo "result=$TC_RESULT" >> "$GITHUB_OUTPUT"
+          echo "▶ typecheck aggregate: $TC_RESULT" >&2
 
   lint:
     name: 1 · CI · Lint workspaces (ESLint)
@@ -146,10 +230,67 @@ jobs:
 
       - run: pnpm lint:js:packages
 
+  # Vitest, split across parallel legs. `pnpm test:ci` (= `pnpm -r test --
+  # --run`) as ONE job was 474s and the second-longest branch in the graph —
+  # long enough that it becomes the critical path the moment the e2e matrix is
+  # widened, so sharding e2e without sharding this buys nothing past ~28
+  # shards. It is also the WHOLE cost of a PR whose e2e plan says `skip`: run
+  # 31667489668 (a .github/-only change) took 7.3 min with no e2e at all.
+  #
+  # Two effects, both wins. The obvious one is parallelism. The subtler one is
+  # that `pnpm -r` defaults to a workspace concurrency of ~4 while each vitest
+  # then spawns its own worker pool — on a 4-vCPU runner that is ~16 test
+  # processes fighting over 4 cores. Measured locally the same 32 packages take
+  # ~93s wall-clock; CI spends 474s. Fewer packages per leg means far less
+  # oversubscription, so the legs should beat a naive 474/6.
+  #
+  # LEG COUNT IS CAPPED BY THE ORG'S CONCURRENCY BUDGET, not by how finely the
+  # suite splits. A coordinator run must fit GitHub Free's 20 concurrent jobs:
+  # biome 1 + lint 1 + e2e-plan 1 + zone builds 10 + seed 1 = 14 are fixed and
+  # the zone builds sit on the critical path, so typecheck + vitest legs must
+  # total at most 6 or the scheduler queues something — quite possibly a zone
+  # build, which would cost more wall-clock than the extra legs save. Hence 3
+  # here and 3 for typecheck: peak lands exactly on 20 with nothing queued.
+  #
+  # Leg weights come from measured per-package runtime (local seconds, used as
+  # a relative proxy — CI is uniformly slower). Total 93s over 32 packages:
+  #   app-shell 30 · shell-ui 31 · rest 32
+  # `shell` (17) and `dashboard-shell` (15) are single packages too big to
+  # split, so each anchors a leg and is topped up with small ones.
+  #
+  # COVERAGE IS BY CONSTRUCTION, not by review: the `rest` leg is a catch-all
+  # that EXCLUDES the explicitly-binned packages instead of listing its own, so
+  # a newly added workspace package automatically runs there. The dangerous
+  # failure (a package silently tested by NO leg) is therefore unreachable.
+  # `pnpm -r` skips packages with no `test` script, so the 4 script-less
+  # packages are free no-ops.
+  #
+  # BINNED_PKGS must list exactly the packages named in the five explicit legs
+  # — it is what `rest` subtracts. Each named leg asserts its own packages
+  # appear here, so the two drift loudly rather than silently. Worst case if
+  # they do drift, a package runs in two legs: wasteful, never unsafe.
   test:
-    name: 1 · CI · Unit tests (Vitest)
+    name: 1 · CI · Unit tests (Vitest · ${{ matrix.leg.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      BINNED_PKGS: >-
+        @namthuanvn/shell @namthuanvn/oms @namthuanvn/procurement @namthuanvn/notifications
+        @namthuanvn/dashboard-shell @namthuanvn/sourcing @namthuanvn/hris @namthuanvn/exms
+        @namthuanvn/zone-oms @namthuanvn/api-types @namthuanvn/auth
+    strategy:
+      # Report every leg's failures in one run — unlike the e2e matrix these
+      # are cheap, and a single aggregated red is more useful than the first
+      # leg cancelling its siblings.
+      fail-fast: false
+      matrix:
+        leg:
+          - name: app-shell   # 30
+            pkgs: '@namthuanvn/shell @namthuanvn/oms @namthuanvn/procurement @namthuanvn/notifications'
+          - name: shell-ui    # 31
+            pkgs: '@namthuanvn/dashboard-shell @namthuanvn/sourcing @namthuanvn/hris @namthuanvn/exms @namthuanvn/zone-oms @namthuanvn/api-types @namthuanvn/auth'
+          - name: rest        # 32
+            pkgs: ''   # catch-all — everything not in BINNED_PKGS
     steps:
       - uses: actions/checkout@v6
         with:
@@ -160,7 +301,50 @@ jobs:
 
       - uses: ./.github/actions/install
 
-      - run: pnpm test:ci
+      - name: Run vitest leg
+        env:
+          LEG: ${{ matrix.leg.name }}
+          PKGS: ${{ matrix.leg.pkgs }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ -z "$PKGS" ]; then
+            # Catch-all leg: start from every workspace package and subtract the
+            # binned ones. pnpm treats a filter set containing only negations as
+            # "all packages except these".
+            for p in $BINNED_PKGS; do ARGS+=(--filter "!$p"); done
+          else
+            for p in $PKGS; do
+              # Drift guard — see the BINNED_PKGS note above.
+              case " $BINNED_PKGS " in
+                *" $p "*) ;;
+                *) echo "::error::leg '$LEG' runs $p but BINNED_PKGS does not list it — the 'rest' leg would run it a second time. Add it to BINNED_PKGS."; exit 1 ;;
+              esac
+              ARGS+=(--filter "$p")
+            done
+          fi
+          echo "▶ vitest leg '$LEG': pnpm -r ${ARGS[*]} test -- --run"
+          pnpm -r "${ARGS[@]}" test -- --run
+
+  # Collapse the vitest matrix into the single `test` workflow output the
+  # callers consume, so ci-pr.yml's `report` keeps posting one `vitest ✓`.
+  # Same shape as e2e-aggregate below.
+  test-aggregate:
+    name: 1 · CI · Unit tests (result)
+    needs: test
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      result: ${{ steps.agg.outputs.result }}
+    steps:
+      - id: agg
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          set -euo pipefail
+          echo "result=$TEST_RESULT" >> "$GITHUB_OUTPUT"
+          echo "▶ vitest aggregate: $TEST_RESULT" >&2
 
   # Plan the e2e run. Two responsibilities:
   #   1. Decide SCOPE — when e2e_changed_only is true (PR CI), diff the PR
@@ -213,9 +397,36 @@ jobs:
               echo "shards=[]"  >> "$GITHUB_OUTPUT"
               echo "total=0"    >> "$GITHUB_OUTPUT" ;;
             scoped)
-              echo "run=true"   >> "$GITHUB_OUTPUT"
-              echo "shards=[1]" >> "$GITHUB_OUTPUT"
-              echo "total=1"    >> "$GITHUB_OUTPUT" ;;
+              # A scoped run USED to be pinned to exactly one shard, on the
+              # assumption that "a handful of specs doesn't need 12 stacks".
+              # That assumption does not hold: e2e-plan.sh emits spec
+              # DIRECTORIES as well as files, and the groups are wildly uneven
+              # — `sourcing`/`apis/sourcing` map to apps/shell/e2e/scpms, which
+              # is 199 of the suite's 327 spec files. Those all ran serially in
+              # ONE job, so the most common kind of PR in this repo got the
+              # slowest possible e2e.
+              #
+              # Size the matrix to the number of specs actually selected, at
+              # the same ~25-specs-per-shard density the full run uses (327
+              # specs / 12 shards). Capped at 8 so a scoped run still leaves
+              # room in the org's 20-job budget for the rest of the graph.
+              SPEC_COUNT=0
+              for t in $TARGETS; do
+                if [ -d "$t" ]; then
+                  n=$(find "$t" -name '*.spec.ts' -type f | wc -l)
+                else
+                  n=1
+                fi
+                SPEC_COUNT=$(( SPEC_COUNT + n ))
+              done
+              N=$(( (SPEC_COUNT + 24) / 25 ))
+              [ "$N" -lt 1 ] && N=1
+              [ "$N" -gt 8 ] && N=8
+              SHARDS=$(seq 1 "$N" | jq -R 'tonumber' | jq -cs '.')
+              echo "run=true"      >> "$GITHUB_OUTPUT"
+              echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
+              echo "total=$N"       >> "$GITHUB_OUTPUT"
+              echo "▶ scoped: $SPEC_COUNT spec files → $N shard(s)" >&2 ;;
             *)
               SHARDS=$(seq 1 "$TOTAL" | jq -R 'tonumber' | jq -cs '.')
               echo "run=true"       >> "$GITHUB_OUTPUT"
@@ -264,18 +475,49 @@ jobs:
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
+      # OUTPUT cache — the packaged bundle itself, not just the compiler cache.
+      # On a hit this job does checkout → restore → upload (~10s) and skips
+      # install AND the build entirely; the ~103–166s build is the single
+      # largest item on the e2e critical path, so this is the cheapest minute
+      # in the graph to buy back.
+      #
+      # The key must name EVERYTHING that can change the emitted bundle, and
+      # nothing that can't — a false hit ships a stale bundle into e2e, which
+      # is far worse than a miss. A zone depends on its own source, the shared
+      # packages it transpiles (`transpilePackages: api-types, utils,
+      # dashboard-shell` — see apps/<zone>/next.config.ts) and the root
+      # compile/dependency config. Zones are mutually independent (no
+      # cross-zone imports; they share code only through packages/*), which is
+      # what makes the PER-ZONE scope sound — and it matters: keying on the
+      # whole of `apps/**` busts all ten zones whenever any one app changes,
+      # i.e. on almost every PR. Scoped this way, a PR touching apps/quotation
+      # rebuilds quotation and restores the other nine.
+      - name: Cache zone bundle
+        id: zonetar
+        uses: actions/cache@v5
+        with:
+          path: zone-${{ matrix.zone.name }}.tar
+          key: zonetar-v1-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'packages/**') }}
+          # No restore-keys ON PURPOSE: a partial-match restore would hand back
+          # a bundle built from different source. Exact key or rebuild.
+
       - uses: ./.github/actions/install
+        if: steps.zonetar.outputs.cache-hit != 'true'
 
       # Warm THIS zone's Next compiler cache across runs. build:pages still runs
       # (so it always re-evaluates source — no stale-build risk) but reuses prior
       # compilation work, cutting a cold ~60–120s build to ~20–40s on unchanged
       # source. Keyed per-zone so the matrix legs don't clobber one another's
-      # cache. Invalidates on lockfile + dashboard/packages source changes.
+      # cache. Scoped to this zone's own inputs for the same reason as the
+      # bundle cache above — an `apps/**` key made every zone miss on any app
+      # change. Unlike the bundle cache this one KEEPS restore-keys: a stale
+      # compiler cache is only a slower build, never a wrong one.
       - name: Cache Next build
+        if: steps.zonetar.outputs.cache-hit != 'true'
         uses: actions/cache@v5
         with:
           path: apps/${{ matrix.zone.name }}/.next/cache
-          key: next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/**', 'packages/**') }}
+          key: next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('apps/{0}/**', matrix.zone.name), 'packages/**') }}
           restore-keys: |
             next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-
             next-${{ runner.os }}-${{ matrix.zone.name }}-
@@ -283,6 +525,7 @@ jobs:
       # Generic relative `/api` build — no host/port baked, so the same bundle
       # boots on every shard's free port.
       - name: Build zone (OpenNext)
+        if: steps.zonetar.outputs.cache-hit != 'true'
         run: pnpm --filter ${{ matrix.zone.pkg }} run build:pages
 
       # tar (not a raw many-small-files upload) so the .open-next file count
@@ -290,8 +533,12 @@ jobs:
       # skip artifact gzip. tar preserves the `apps/<zone>/.open-next` path so
       # the shard reassembles the tree verbatim by untarring every zone tar.
       - name: Package zone build
+        if: steps.zonetar.outputs.cache-hit != 'true'
         run: tar -cf zone-${{ matrix.zone.name }}.tar apps/${{ matrix.zone.name }}/.open-next
 
+      # Runs on hit AND miss — on a hit the tar came from the cache, on a miss
+      # from the step above. Either way the shards' `pattern: e2e-*` download
+      # must find it.
       - name: Upload zone build
         uses: actions/upload-artifact@v7
         with:
@@ -360,16 +607,129 @@ jobs:
   # flaky retry — only a genuine failure. The aggregated `jobs.e2e.result` still
   # flips to `failure` if any shard fails. Trade-off vs the old `false`: you see
   # one failure at a time (fix, re-run) rather than the full failure set at once.
-  e2e:
-    name: 1 · CI · E2E (shard ${{ matrix.shard }})
+  # Decide how wide the e2e matrix can actually go, and borrow capacity from
+  # idle fleet repos for the surplus.
+  #
+  # WHY THIS EXISTS: GitHub Free caps an org at ~20 concurrent jobs, so a
+  # single ppap repo can host roughly 14 e2e shards once the rest of this graph
+  # is accounted for. `ci-fanout.mjs dispatch` probes the other fleet repos,
+  # keeps the ones that are idle RIGHT NOW, and splits the shard indices across
+  # coordinator + workers, dispatching one `ci-e2e-batch` per worker.
+  #
+  # ADAPTIVE ON PURPOSE. A PR borrows only idle repos, so when the fleet is
+  # busy (several agent lanes, say) this degrades to exactly the old
+  # single-repo behaviour rather than starving the other PRs. That means the
+  # shard count — and so the wall-clock — legitimately varies between runs of
+  # the same PR. `total` is always logged.
+  #
+  # It runs AFTER the builds because capacity is only meaningfully knowable at
+  # the moment the shards are about to start; probing at plan time would read a
+  # fleet state that is ~3 minutes stale.
+  e2e-fanout:
+    name: 1 · CI · E2E (fan-out)
     needs: [e2e-plan, e2e-build-zones, e2e-seed]
     if: ${{ inputs.run_e2e && needs.e2e-plan.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      total: ${{ steps.fan.outputs.total }}
+      local_shards: ${{ steps.fan.outputs.local_shards }}
+      has_batches: ${{ steps.fan.outputs.has_batches }}
+      fanout: ${{ steps.fan.outputs.fanout }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - id: fan
+        env:
+          # PAT_TOKEN, not GITHUB_TOKEN: the probe and the dispatch both cross
+          # org boundaries, and events created with GITHUB_TOKEN do not trigger
+          # workflows at all.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          SELF: ${{ github.repository }}
+          FLEET: ${{ inputs.fleet }}
+          MODE: ${{ needs.e2e-plan.outputs.mode }}
+          PLAN_SHARDS: ${{ needs.e2e-plan.outputs.shards }}
+          PLAN_TOTAL: ${{ needs.e2e-plan.outputs.total }}
+          DESIRED_TOTAL: ${{ inputs.e2e_shards }}
+          TARGETS: ${{ needs.e2e-plan.outputs.targets }}
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          COORD_RUN_ID: ${{ github.run_id }}
+          # Unique per coordinator run+attempt — this is what a batch's
+          # run-name embeds and what `collect` matches on.
+          CORRELATION: ${{ github.run_id }}-${{ github.run_attempt }}
+          # Coordinator keeps 14 of its 20 slots for shards; the remainder
+          # covers e2e-collect plus any lint/typecheck/vitest leg still
+          # finishing. A worker repo runs nothing else, so it takes 18 of 20.
+          COORD_SLOTS: '14'
+          WORKER_SLOTS: '18'
+        run: |
+          set -euo pipefail
+          # Backward-compat, and it is load-bearing on the day this merges.
+          # The fleet repos get this workflow the moment the sync runs, but a
+          # PR opened BEFORE that merge is checked out at its own merge ref —
+          # and if GitHub has not yet recomputed that ref against the new main,
+          # `.github/scripts/ci-fanout.mjs` is simply absent. Calling node on a
+          # missing file would fail e2e-fanout, and e2e-aggregate turns that
+          # into a red `e2e` for a PR that changed nothing e2e-related.
+          #
+          # Degrade to "no fan-out, run locally" instead — the same shape as
+          # the ci-boot-e2e.sh fallback in the shard job below. Remove once
+          # every open PR has rebased past this commit.
+          if [ ! -f .github/scripts/ci-fanout.mjs ]; then
+            # Clamp to the coordinator's slot budget: the plan asked for
+            # `e2e_shards` (36) on the assumption the fan-out would place the
+            # surplus elsewhere. Running all 36 on one repo would blow the
+            # 20-job cap and queue, which is slower than the 12 shards this
+            # PR would have had before the change.
+            # Written as `if` rather than `[ … ] && N=…`: that terser form
+            # evaluates to non-zero when the test is false, which is harmless
+            # here only because another statement follows it. This block runs
+            # in a narrow window on merge day, so it must not depend on that.
+            N="$PLAN_TOTAL"
+            if [ "$N" -gt "$COORD_SLOTS" ]; then N="$COORD_SLOTS"; fi
+            if [ "$N" -lt 1 ]; then N=1; fi
+            SHARDS=$(seq 1 "$N" | jq -R 'tonumber' | jq -cs '.')
+            echo "::warning::ci-fanout.mjs is absent on this ref — running $N shard(s) locally with no fan-out. Rebase the PR onto main to enable it."
+            {
+              echo "total=$N"
+              echo "local_shards=$SHARDS"
+              echo "has_batches=false"
+              echo "fanout={}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          node .github/scripts/ci-fanout.mjs dispatch
+
+      # Consumed by /watch-ci and /fix-ci (via scripts/ppap-ci-repo.sh
+      # --fanout) to find the shard logs that live in other repos.
+      - name: Upload fan-out map
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-fanout
+          path: ci-fanout.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  e2e:
+    name: 1 · CI · E2E (shard ${{ matrix.shard }})
+    needs: [e2e-plan, e2e-build-zones, e2e-seed, e2e-fanout]
+    # `local_shards` is '[]' when every shard was fanned out to workers — an
+    # empty matrix skips the job, which e2e-aggregate maps correctly.
+    if: ${{ inputs.run_e2e && needs.e2e-plan.outputs.run == 'true' && needs.e2e-fanout.outputs.local_shards != '[]' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: true
       matrix:
-        shard: ${{ fromJSON(needs.e2e-plan.outputs.shards) }}
+        shard: ${{ fromJSON(needs.e2e-fanout.outputs.local_shards) }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -431,11 +791,14 @@ jobs:
       # died mid-run (a workerd crash → ECONNREFUSED cascade Playwright's own
       # retries can't recover, since the server is gone). A test failure with the
       # stack still ALIVE is genuine red — never retried, so we don't mask it.
-      - name: Boot e2e stack + run Playwright shard ${{ matrix.shard }}/${{ needs.e2e-plan.outputs.total }}
+      # TOTAL comes from e2e-fanout, NOT e2e-plan: the effective shard count is
+      # capacity-dependent, and `--shard=i/N` is only coherent if every host —
+      # this repo and every fan-out batch — uses the SAME N.
+      - name: Boot e2e stack + run Playwright shard ${{ matrix.shard }}/${{ needs.e2e-fanout.outputs.total }}
         env:
           PLAYWRIGHT_NO_WEB_SERVER: '1'
           SHARD: ${{ matrix.shard }}
-          TOTAL: ${{ needs.e2e-plan.outputs.total }}
+          TOTAL: ${{ needs.e2e-fanout.outputs.total }}
           # Space-separated spec paths on a change-scoped run; empty on a full
           # run (Playwright then runs every spec). Word-split intentionally.
           E2E_TARGETS: ${{ needs.e2e-plan.outputs.targets }}
@@ -562,9 +925,52 @@ jobs:
   # skipped job reports `skipped`, and ci-pr.yml's report flips CI red on
   # anything other than `success`. Mapping skip → success keeps that contract
   # intact. Runs always() so it reports even when the matrix skipped/failed.
+  # Wait for the fanned-out batches running in other repos and fold their
+  # verdict back in. This job is what makes a cross-repo matrix behave like one
+  # matrix: it also provides the cross-org equivalent of `fail-fast: true` by
+  # cancelling sibling batches once one genuinely fails, and it FAILS CLOSED on
+  # a batch it cannot resolve — a shard whose result is unknown must never be
+  # reported as green.
+  e2e-collect:
+    name: 1 · CI · E2E (collect batches)
+    needs: [e2e-plan, e2e-fanout]
+    if: ${{ always() && inputs.run_e2e && needs.e2e-fanout.outputs.has_batches == 'true' }}
+    runs-on: ubuntu-latest
+    # Generous: it is bounded by the slowest remote shard, and the shard jobs
+    # themselves cap at 30 min.
+    timeout-minutes: 45
+    outputs:
+      result: ${{ steps.collect.outputs.result }}
+      runs: ${{ steps.collect.outputs.runs }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - id: collect
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          FANOUT: ${{ needs.e2e-fanout.outputs.fanout }}
+          TIMEOUT_S: '2400'
+        run: node .github/scripts/ci-fanout.mjs collect
+
+      # Republished with each batch's resolved run id — this is the version
+      # /fix-ci reads to locate remote shard logs.
+      - name: Upload fan-out map (resolved)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-fanout-resolved
+          path: ci-fanout.json
+          retention-days: 7
+          if-no-files-found: ignore
+
   e2e-aggregate:
     name: 1 · CI · E2E (result)
-    needs: [e2e-plan, e2e]
+    needs: [e2e-plan, e2e-fanout, e2e, e2e-collect]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -575,7 +981,11 @@ jobs:
         env:
           PLAN_RESULT: ${{ needs.e2e-plan.result }}
           PLAN_RUN: ${{ needs.e2e-plan.outputs.run }}
+          FANOUT_RESULT: ${{ needs.e2e-fanout.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
+          HAS_BATCHES: ${{ needs.e2e-fanout.outputs.has_batches }}
+          COLLECT_RESULT: ${{ needs.e2e-collect.result }}
+          COLLECT_VERDICT: ${{ needs.e2e-collect.outputs.result }}
         run: |
           set -euo pipefail
           if [ "$PLAN_RESULT" = "skipped" ]; then
@@ -585,11 +995,28 @@ jobs:
           elif [ "$PLAN_RUN" != "true" ]; then
             # Change-scoped plan found nothing e2e-relevant → treat as pass.
             RESULT=success
+          elif [ "$FANOUT_RESULT" != "success" ]; then
+            # The fan-out step itself failed, so the shard split is unknown and
+            # no shard set can be trusted to be complete.
+            RESULT=failure
           else
-            RESULT="$E2E_RESULT"
+            # Local shards. `skipped` is legitimate here and ONLY here: it means
+            # every shard was fanned out to workers, so the local matrix was
+            # empty. Any other non-success is a real failure.
+            case "$E2E_RESULT" in
+              success|skipped) RESULT=success ;;
+              *)               RESULT="$E2E_RESULT" ;;
+            esac
+            # Remote batches, if any. Fail closed: the collect job must have
+            # run AND returned success.
+            if [ "$HAS_BATCHES" = "true" ]; then
+              if [ "$COLLECT_RESULT" != "success" ] || [ "$COLLECT_VERDICT" != "success" ]; then
+                RESULT=failure
+              fi
+            fi
           fi
           echo "result=$RESULT" >> "$GITHUB_OUTPUT"
-          echo "▶ e2e aggregate: plan=$PLAN_RESULT run=$PLAN_RUN e2e=$E2E_RESULT → $RESULT" >&2
+          echo "▶ e2e aggregate: plan=$PLAN_RESULT run=$PLAN_RUN local=$E2E_RESULT batches=$HAS_BATCHES collect=$COLLECT_RESULT/$COLLECT_VERDICT → $RESULT" >&2
 
   # Precompute the "green-but-noisy" signals ONCE, server-side, into a tiny
   # `ci-noise-report` artifact so /watch-ci and /fix-ci read ONE small file
@@ -618,7 +1045,7 @@ jobs:
   # artifact are written (that was the original failure: run 29478177936).
   noise-report:
     name: 1 · CI · Noise report
-    needs: [biome, test, e2e-aggregate]
+    needs: [biome, test-aggregate, e2e-aggregate, e2e-collect]
     # PR CI only (run_e2e=true) — the deploy gate (run_e2e=false) has no
     # /watch-ci consumer, so keep this off the deploy critical path entirely.
     if: ${{ always() && inputs.run_e2e }}
@@ -632,28 +1059,47 @@ jobs:
       - name: Scan this run's logs for noise
         id: scan
         env:
-          GH_TOKEN: ${{ github.token }}
+          # PAT_TOKEN rather than the default GITHUB_TOKEN: with e2e fanned out,
+          # some shard logs live in OTHER repos, which GITHUB_TOKEN cannot read.
+          # Reading a fanned-out run's logs with the default token silently
+          # yielded zero e2e lines — i.e. "flaky 0", clean, auto-merge — which
+          # is the one failure mode this gate must not have.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           RUN_ID: ${{ github.run_id }}
+          BATCH_RUNS: ${{ needs.e2e-collect.outputs.runs }}
         run: |
           set +e -uo pipefail   # errexit OFF — zero-match greps below exit non-zero by design
           tmp="$(mktemp -d)"
           : > "$tmp/e2e.log"; : > "$tmp/biome.log"; : > "$tmp/test.log"
-          # Map every job in THIS run to (id, name); pull each relevant job's log
+          # Every run whose job logs belong to THIS logical CI run: this
+          # coordinator run, plus one per fanned-out e2e batch.
+          : > "$tmp/runs.tsv"
+          printf '%s\t%s\n' "$GITHUB_REPOSITORY" "$RUN_ID" >> "$tmp/runs.tsv"
+          if [ -n "${BATCH_RUNS:-}" ] && [ "$BATCH_RUNS" != "[]" ]; then
+            printf '%s' "$BATCH_RUNS" \
+              | jq -r '.[]? | [.repo, (.run_id|tostring)] | @tsv' 2>/dev/null >> "$tmp/runs.tsv"
+          fi
+          echo "▶ noise: scanning $(wc -l < "$tmp/runs.tsv") run(s)"
+          # Map every job in each run to (id, name); pull each relevant job's log
           # once. Job names carry the reusable-workflow prefix ("checks / 1 · CI
-          # · E2E (shard 3)") — substring match still finds them.
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" --paginate \
-            --jq '.jobs[]? | [(.id|tostring), .name] | @tsv' 2>/dev/null \
-            | while IFS="$(printf '\t')" read -r id name; do
-                [ -n "$id" ] || continue
-                case "$name" in
-                  *"E2E (shard"*)  dest="$tmp/e2e.log" ;;
-                  *"Biome"*)       dest="$tmp/biome.log" ;;
-                  *"Unit tests"*)  dest="$tmp/test.log" ;;
-                  *)               continue ;;
-                esac
-                gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${id}/logs" 2>/dev/null \
-                  | sed -E 's/\x1b\[[0-9;]*m//g' >> "$dest"
-              done
+          # · E2E (shard 3)") on the coordinator and a bare "E2E (shard 3)" in a
+          # batch repo — the substring match finds both.
+          while IFS="$(printf '\t')" read -r repo run; do
+            [ -n "$repo" ] && [ -n "$run" ] || continue
+            gh api "repos/${repo}/actions/runs/${run}/jobs" --paginate \
+              --jq '.jobs[]? | [(.id|tostring), .name] | @tsv' 2>/dev/null \
+              | while IFS="$(printf '\t')" read -r id name; do
+                  [ -n "$id" ] || continue
+                  case "$name" in
+                    *"E2E (shard"*)  dest="$tmp/e2e.log" ;;
+                    *"Biome"*)       dest="$tmp/biome.log" ;;
+                    *"Unit tests"*)  dest="$tmp/test.log" ;;
+                    *)               continue ;;
+                  esac
+                  gh api "repos/${repo}/actions/jobs/${id}/logs" 2>/dev/null \
+                    | sed -E 's/\x1b\[[0-9;]*m//g' >> "$dest"
+                done
+          done < "$tmp/runs.tsv"
           # grep exits non-zero on no-match; with errexit OFF that's fine — awk
           # always prints a number, and grep -c always prints its count.
           num() { grep -oiE "$1" "$2" 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}'; }

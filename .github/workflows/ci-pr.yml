@@ -96,7 +96,17 @@ jobs:
     uses: ./.github/workflows/ci-checks.yml
     with:
       checkout_ref: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('refs/pull/{0}/merge', github.event.client_payload.pr_number || inputs.pr_number) || 'main' }}
-      e2e_shards: ${{ fromJSON(inputs.e2e_shards || '12') }}
+      # DESIRED shard count. The effective count is min(this, capacity) —
+      # ci-checks.yml's e2e-fanout job borrows idle fleet repos for the surplus,
+      # so this can exceed one org's ~14-shard ceiling. Empty ⇒ ci-checks.yml's
+      # own default.
+      e2e_shards: ${{ fromJSON(inputs.e2e_shards || '36') }}
+      # The fleet this run may borrow e2e capacity from, forwarded by the
+      # private dispatcher (which owns PPAP_CI_REPOS). Absent on a manual
+      # workflow_dispatch → no fan-out, every shard stays here.
+      fleet: ${{ github.event.client_payload.fleet }}
+      pr_number: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
+      head_sha: ${{ github.event.client_payload.head_sha }}
       # PR CI runs only the changed service's e2e specs (broad/shared change →
       # full; nothing relevant → skip; see scripts/e2e-plan.sh). A manual main
       # run has no PR diff to scope against → run the full suite.
