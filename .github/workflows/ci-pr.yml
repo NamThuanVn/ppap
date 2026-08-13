@@ -234,6 +234,13 @@ jobs:
               *)       echo "✗" ;;
             esac
           }
+          # EVERY job in the ci-checks graph must be named in this AND. A job that
+          # runs but is missing from it is a job whose failure the PR reports as
+          # green. Conversely, naming an output that ci-checks.yml does NOT expose
+          # resolves to an empty string and pins STATE to failure forever — so a
+          # gate folded into an existing job (the hook + terraform gates live on
+          # `biome`, with the other repo-wide checks) must NOT get an R_* of its
+          # own; it is covered by its host job's result.
           if [ "$R_BIOME" = "success" ] && [ "$R_TYPE" = "success" ] && [ "$R_LINT" = "success" ] && [ "$R_TEST" = "success" ] && [ "$R_E2E" = "success" ]; then
             STATE="success"
           else

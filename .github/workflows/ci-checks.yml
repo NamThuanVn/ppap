@@ -126,6 +126,41 @@ jobs:
           }
           bash scripts/check-email-dns.sh
 
+      # The .claude/hooks/** gates run on every Claude turn, so a regression is
+      # expensive in BOTH directions — a false positive wedges real work, a false
+      # negative lets through exactly what the hook exists to catch. They are
+      # shell/node processes driven by exit codes and stderr, so Vitest cannot
+      # reach them; run-all.sh is their harness.
+      #
+      # It runs in CI and not only via lefthook because `require-tests.sh` carves
+      # out `.claude/`, so a hook change is never in `test:changed`'s scope and
+      # the pre-commit gate never reaches this suite. Before this step existed the
+      # suite had gone red unnoticed (remind-audit-vocab.sh had no test file, and
+      # run-all.sh's own completeness check was flagging it into an empty room).
+      #
+      # Shallow-clone safe: scripts/local-base.sh falls back to HEAD when no
+      # upstream/main, origin/main or main exists, so the change-set-driven tests
+      # see the same uncommitted+untracked scope here as they do locally. (This
+      # job checks out fetch-depth 0 anyway, for the demo-migration guard.)
+      - run: pnpm test:hooks
+
+      # terraform/ used to be executed for the FIRST time at deploy, inside the
+      # deploy job's `terraform apply`. A bad module reference or undeclared
+      # variable therefore surfaced mid-deploy, after CI was green and the release
+      # was already rolling — the one thing the ci-gate comment in
+      # deploy-reusable.yml calls out as "before infra touches Cloudflare".
+      # `-backend=false` inside the script keeps it credential-free: no HCP token,
+      # no remote state, nothing to leak into a public CI runner.
+      #
+      # Pinned to the version the deploy job uses, so this validates against the
+      # binary that will later run `apply`.
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: '1.9.0'
+          terraform_wrapper: false
+
+      - run: bash scripts/check-terraform.sh
+
   # Typecheck, split across parallel legs — same reasoning as the Vitest matrix
   # above (389s as one job, and the dominant cost on any PR whose e2e is
   # skipped).
@@ -308,7 +343,6 @@ jobs:
           fi
           echo "▶ vitest leg '$LEG': pnpm -r ${ARGS[*]} test -- --run"
           pnpm -r "${ARGS[@]}" test -- --run
-
 
   # Plan the e2e run. Two responsibilities:
   #   1. Decide SCOPE — when e2e_changed_only is true (PR CI), diff the PR
