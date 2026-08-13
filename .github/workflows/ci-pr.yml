@@ -97,7 +97,7 @@ jobs:
     with:
       checkout_ref: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('refs/pull/{0}/merge', github.event.client_payload.pr_number || inputs.pr_number) || 'main' }}
       # DESIRED shard count. The effective count is min(this, capacity) —
-      # ci-checks.yml's e2e-fanout job borrows idle fleet repos for the surplus,
+      # ci-checks.yml's e2e job borrows idle fleet repos for the surplus,
       # so this can exceed one org's ~14-shard ceiling. Empty ⇒ ci-checks.yml's
       # own default.
       e2e_shards: ${{ fromJSON(inputs.e2e_shards || '32') }}
@@ -131,6 +131,90 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
+      # The "green is not clean" scan, folded into this job rather than a
+      # separate one in ci-checks.yml. It was its own job only because that is
+      # where the e2e shards used to live; it reads everything through the API
+      # by run id, so it can run anywhere — and its sole consumer is the status
+      # + comment steps right below it. One report job instead of two.
+      #
+      # Reusable-workflow jobs share THIS run, so `github.run_id` covers every
+      # coordinator job; the fanned-out batches live in other repos and come
+      # from the `e2e_runs` output.
+      #
+      # `continue-on-error` + `set +e`: a scan hiccup must never red a run whose
+      # actual checks passed. When it cannot run, `clean` stays empty, which the
+      # steps below treat as "not clean" — so the failure mode is a missed
+      # auto-merge, never a wrongly-permitted one.
+      - name: Scan this run's logs for noise
+        id: noise
+        continue-on-error: true
+        env:
+          # PAT_TOKEN, not the default token: some shard logs live in other
+          # repos, which GITHUB_TOKEN cannot read. With it the scan silently
+          # returned zero e2e lines — i.e. "clean" — on every fanned-out run.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          BATCH_RUNS: ${{ needs.checks.outputs.e2e_runs }}
+        run: |
+          set +e -uo pipefail   # errexit OFF — zero-match greps below exit non-zero by design
+          tmp="$(mktemp -d)"
+          : > "$tmp/e2e.log"; : > "$tmp/biome.log"; : > "$tmp/test.log"
+          : > "$tmp/runs.tsv"
+          printf '%s\t%s\n' "$GITHUB_REPOSITORY" "$RUN_ID" >> "$tmp/runs.tsv"
+          if [ -n "${BATCH_RUNS:-}" ] && [ "$BATCH_RUNS" != "[]" ]; then
+            printf '%s' "$BATCH_RUNS" \
+              | jq -r '.[]? | [.repo, (.run_id|tostring)] | @tsv' 2>/dev/null >> "$tmp/runs.tsv"
+          fi
+          echo "▶ noise: scanning $(wc -l < "$tmp/runs.tsv") run(s)"
+          while IFS="$(printf '\t')" read -r repo run; do
+            [ -n "$repo" ] && [ -n "$run" ] || continue
+            gh api "repos/${repo}/actions/runs/${run}/jobs" --paginate \
+              --jq '.jobs[]? | [(.id|tostring), .name] | @tsv' 2>/dev/null \
+              | while IFS="$(printf '\t')" read -r id name; do
+                  [ -n "$id" ] || continue
+                  case "$name" in
+                    *"E2E (shard"*)  dest="$tmp/e2e.log" ;;
+                    *"Biome"*)       dest="$tmp/biome.log" ;;
+                    *"Unit tests"*)  dest="$tmp/test.log" ;;
+                    *)               continue ;;
+                  esac
+                  gh api "repos/${repo}/actions/jobs/${id}/logs" 2>/dev/null \
+                    | sed -E 's/\x1b\[[0-9;]*m//g' >> "$dest"
+                done
+          done < "$tmp/runs.tsv"
+          num() { grep -oiE "$1" "$2" 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}'; }
+          cnt() { grep -acE "$1" "$2" 2>/dev/null | head -1; }
+          flaky=$(num '([0-9]+) flaky' "$tmp/e2e.log"); flaky=${flaky:-0}
+          dup=$(cnt '\[dup-testid\]' "$tmp/e2e.log"); dup=${dup:-0}
+          hyd=$(cnt '\[hydration-error\]' "$tmp/e2e.log"); hyd=${hyd:-0}
+          i18n=$(cnt '\[i18n-missing\]' "$tmp/e2e.log"); i18n=${i18n:-0}
+          font=$(cnt '\[font-preload\]' "$tmp/e2e.log"); font=${font:-0}
+          http404=$(cnt '\[http-404\]' "$tmp/e2e.log"); http404=${http404:-0}
+          biomew=$(num 'Found ([0-9]+) warning' "$tmp/biome.log"); biomew=${biomew:-0}
+          vitest=$(cnt 'stderr \||not wrapped in act' "$tmp/test.log"); vitest=${vitest:-0}
+          total=$(( flaky + dup + hyd + i18n + font + http404 + biomew + vitest ))
+          clean=true; [ "$total" -gt 0 ] && clean=false
+          summary=$(printf 'flaky %s · dup %s · hyd %s · i18n %s · font %s · 404 %s · biome %s · vitest %s' "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest")
+          {
+            echo "clean=$clean"
+            echo "summary=$summary"
+          } >> "$GITHUB_OUTPUT"
+          mkdir -p ci-noise
+          printf '{"flaky":%s,"dup_testid":%s,"hydration":%s,"i18n_missing":%s,"font_preload":%s,"http_4xx":%s,"biome_warnings":%s,"vitest_stderr":%s,"clean":%s}\n' \
+            "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest" "$clean" | tee ci-noise/ci-noise-report.json
+          echo "▶ noise: $summary → clean=$clean"
+          exit 0
+
+      - name: Upload noise report
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-noise-report
+          path: ci-noise/ci-noise-report.json
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: Update CI commit status on erp-namthuan
         id: status
         env:
@@ -192,8 +276,8 @@ jobs:
           PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
           HEAD_SHA: ${{ github.event.client_payload.head_sha }}
           STATE: ${{ steps.status.outputs.state }}
-          NOISE_CLEAN: ${{ needs.checks.outputs.noise_clean }}
-          NOISE_SUMMARY: ${{ needs.checks.outputs.noise_summary }}
+          NOISE_CLEAN: ${{ steps.noise.outputs.clean }}
+          NOISE_SUMMARY: ${{ steps.noise.outputs.summary }}
           DESC: ${{ steps.status.outputs.desc }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |

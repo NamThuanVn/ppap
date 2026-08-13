@@ -13,7 +13,7 @@ on:
         type: string
         required: true
       e2e_shards:
-        description: 'DESIRED number of parallel Playwright shards. The effective count is min(this, available capacity) — see the e2e-fanout job. 32 = 4 workers x 8 shards at the default WORKER_SLOTS. Both PR CI and the deploy gate inherit it.'
+        description: 'DESIRED number of parallel Playwright shards. The effective count is min(this, available capacity) — see the e2e job. 32 = 4 workers x 8 shards at the default WORKER_SLOTS. Both PR CI and the deploy gate inherit it.'
         type: number
         default: 32
       fleet:
@@ -41,23 +41,23 @@ on:
         description: 'Result of the biome job'
         value: ${{ jobs.biome.result }}
       typecheck:
+        # `result` on a MATRIX job is already the aggregate — success only when
+        # every leg succeeded — so the former typecheck-aggregate job existed
+        # purely to copy that value into an output. Same for `test` below.
         description: 'Aggregated result of the sharded typecheck matrix.'
-        value: ${{ jobs.typecheck-aggregate.outputs.result }}
+        value: ${{ jobs.typecheck.result }}
       lint:
         description: 'Result of the lint job'
         value: ${{ jobs.lint.result }}
       test:
         description: 'Aggregated result of the sharded Vitest matrix.'
-        value: ${{ jobs.test-aggregate.outputs.result }}
+        value: ${{ jobs.test.result }}
       e2e:
-        description: 'Aggregated e2e result: success when all shards pass OR when a change-scoped run had nothing relevant to test (skip); failure if any shard failed.'
-        value: ${{ jobs.e2e-aggregate.outputs.result }}
-      noise_clean:
-        description: '"true" when the run has zero flaky / dup-testid / hydration / i18n-missing / font-preload / http-404 / biome-warning / vitest-stderr; "false" otherwise. Empty if the noise scan did not run.'
-        value: ${{ jobs.noise-report.outputs.clean }}
-      noise_summary:
-        description: 'Compact per-signal noise counts, e.g. "flaky 0 · dup 0 · hyd 0 · i18n 0 · font 0 · 404 0 · biome 0 · vitest 0".'
-        value: ${{ jobs.noise-report.outputs.summary }}
+        description: 'e2e verdict: success when every batch passed OR the plan had nothing relevant to test; failure otherwise. Empty (⇒ red) if the job itself died.'
+        value: ${{ jobs.e2e.outputs.result }}
+      e2e_runs:
+        description: 'JSON array of the fanned-out batch runs ([{repo, batch, run_id, conclusion}]) so the caller can scan their logs. Empty when nothing was dispatched.'
+        value: ${{ jobs.e2e.outputs.runs }}
     secrets:
       PAT_TOKEN:
         required: true
@@ -196,23 +196,6 @@ jobs:
           echo "▶ typecheck leg '$LEG': pnpm -r ${ARGS[*]} typecheck"
           pnpm -r "${ARGS[@]}" typecheck
 
-  # Collapse the typecheck matrix into the single `typecheck` workflow output.
-  typecheck-aggregate:
-    name: 1 · CI · Typecheck (result)
-    needs: typecheck
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    outputs:
-      result: ${{ steps.agg.outputs.result }}
-    steps:
-      - id: agg
-        env:
-          TC_RESULT: ${{ needs.typecheck.result }}
-        run: |
-          set -euo pipefail
-          echo "result=$TC_RESULT" >> "$GITHUB_OUTPUT"
-          echo "▶ typecheck aggregate: $TC_RESULT" >&2
 
   lint:
     name: 1 · CI · Lint workspaces (ESLint)
@@ -326,25 +309,6 @@ jobs:
           echo "▶ vitest leg '$LEG': pnpm -r ${ARGS[*]} test -- --run"
           pnpm -r "${ARGS[@]}" test -- --run
 
-  # Collapse the vitest matrix into the single `test` workflow output the
-  # callers consume, so ci-pr.yml's `report` keeps posting one `vitest ✓`.
-  # Same shape as e2e-aggregate below.
-  test-aggregate:
-    name: 1 · CI · Unit tests (result)
-    needs: test
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    outputs:
-      result: ${{ steps.agg.outputs.result }}
-    steps:
-      - id: agg
-        env:
-          TEST_RESULT: ${{ needs.test.result }}
-        run: |
-          set -euo pipefail
-          echo "result=$TEST_RESULT" >> "$GITHUB_OUTPUT"
-          echo "▶ vitest aggregate: $TEST_RESULT" >&2
 
   # Plan the e2e run. Two responsibilities:
   #   1. Decide SCOPE — when e2e_changed_only is true (PR CI), diff the PR
@@ -591,59 +555,76 @@ jobs:
           path: e2e-seed.tar
           retention-days: 1
           compression-level: 0
-
-  # Playwright e2e. Each shard restores the prebuilt zone bundles + seeded DB
-  # from the e2e-build-zones matrix + e2e-seed artifacts, then boots ONE wrangler
-  # session via `pnpm e2e:serve` with BUILD=0 RESEED=0 (dashboard worker primary,
-  # gateway & leaves as portless auxiliaries — on a free port, with NO proxy and
-  # NO assistant) and runs its slice of specs against http://localhost:<port> via
-  # PLAYWRIGHT_NO_WEB_SERVER=1 so Playwright doesn't spawn its own server. Because
-  # build + seed already ran in parallel upstream, the per-shard boot is just the
-  # wrangler cold start.
-  # `fail-fast: true`: the first shard to hard-fail cancels the others so the
-  # run stops fast instead of grinding through all shards (paired with
-  # Playwright `maxFailures: 1`, which stops a shard at its first hard failure).
-  # Flaky tests pass on retry and never hard-fail, so this does NOT cancel on a
-  # flaky retry — only a genuine failure. The aggregated `jobs.e2e.result` still
-  # flips to `failure` if any shard fails. Trade-off vs the old `false`: you see
-  # one failure at a time (fix, re-run) rather than the full failure set at once.
-  # Decide how wide the e2e matrix can actually go, and borrow capacity from
-  # idle fleet repos for the surplus.
+  # ONE job for the whole e2e stage: work out where the shards go, dispatch
+  # them, wait for them, and emit the single verdict the caller reads.
   #
-  # WHY THIS EXISTS: GitHub Free caps an org at ~20 concurrent jobs, so a
-  # single ppap repo can host roughly 14 e2e shards once the rest of this graph
-  # is accounted for. `ci-fanout.mjs dispatch` probes the other fleet repos,
-  # keeps the ones that are idle RIGHT NOW, and splits the shard indices across
-  # coordinator + workers, dispatching one `ci-e2e-batch` per worker.
+  # This used to be three jobs (fan-out → collect → result). They were always
+  # sequential and always all-or-nothing, so the split bought nothing but three
+  # nodes in the run graph and two sets of job plumbing. The `result` job
+  # existed only because a workflow output must be produced even when the stage
+  # is skipped — handled here by `if: always()` plus an explicit precondition
+  # gate, which is also the one place that has to get "did the stage actually
+  # run?" right.
   #
-  # ADAPTIVE ON PURPOSE. A PR borrows only idle repos, so when the fleet is
-  # busy (several agent lanes, say) this degrades to exactly the old
-  # single-repo behaviour rather than starving the other PRs. That means the
-  # shard count — and so the wall-clock — legitimately varies between runs of
-  # the same PR. `total` is always logged.
-  #
-  # It runs AFTER the builds because capacity is only meaningfully knowable at
-  # the moment the shards are about to start; probing at plan time would read a
-  # fleet state that is ~3 minutes stale.
-  e2e-fanout:
-    name: 1 · CI · E2E (fan-out)
+  # FAILS CLOSED by construction: `result` is the workflow's `e2e` output and
+  # the caller treats anything other than the literal `success` as red, so a
+  # crashed job (empty output) is a red run, never a silent pass.
+  e2e:
+    name: 1 · CI · E2E
     needs: [e2e-plan, e2e-build-zones, e2e-seed]
-    if: ${{ inputs.run_e2e && needs.e2e-plan.outputs.run == 'true' }}
+    if: ${{ always() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Bounded by the slowest remote shard; the batch jobs cap at 30 min each.
+    timeout-minutes: 60
     outputs:
-      total: ${{ steps.fan.outputs.total }}
-      has_batches: ${{ steps.fan.outputs.has_batches }}
-      fanout: ${{ steps.fan.outputs.fanout }}
+      result: ${{ steps.verdict.outputs.result }}
+      runs: ${{ steps.collect.outputs.runs }}
     steps:
+      # The whole "should this stage run, and did its inputs survive?" decision
+      # in one place. Previously spread across three `if:` expressions and the
+      # aggregate's shell.
+      - name: Resolve stage preconditions
+        id: gate
+        env:
+          RUN_E2E: ${{ inputs.run_e2e }}
+          PLAN_RESULT: ${{ needs.e2e-plan.result }}
+          PLAN_RUN: ${{ needs.e2e-plan.outputs.run }}
+          BUILD_RESULT: ${{ needs.e2e-build-zones.result }}
+          SEED_RESULT: ${{ needs.e2e-seed.result }}
+        run: |
+          set -euo pipefail
+          PROCEED=false
+          RESULT=failure
+          if [ "$RUN_E2E" != "true" ]; then
+            # e2e disabled for this caller (the staging deploy gate).
+            RESULT=skipped
+          elif [ "$PLAN_RESULT" != "success" ]; then
+            echo "::error::e2e-plan did not succeed ($PLAN_RESULT) — cannot tell which specs to run."
+          elif [ "$PLAN_RUN" != "true" ]; then
+            # Change-scoped plan found nothing e2e-relevant.
+            RESULT=success
+          elif [ "$BUILD_RESULT" != "success" ] || [ "$SEED_RESULT" != "success" ]; then
+            echo "::error::zone builds ($BUILD_RESULT) or seed ($SEED_RESULT) failed — no artifacts to test against."
+          else
+            PROCEED=true
+          fi
+          {
+            echo "proceed=$PROCEED"
+            echo "result=$RESULT"
+          } >> "$GITHUB_OUTPUT"
+          echo "▶ e2e gate: run_e2e=$RUN_E2E plan=$PLAN_RESULT/$PLAN_RUN build=$BUILD_RESULT seed=$SEED_RESULT → proceed=$PROCEED" >&2
+
       - uses: actions/checkout@v6
+        if: ${{ steps.gate.outputs.proceed == 'true' }}
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ secrets.PAT_TOKEN }}
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
-      - id: fan
+      - name: Dispatch e2e batches
+        id: dispatch
+        if: ${{ steps.gate.outputs.proceed == 'true' }}
         env:
           # PAT_TOKEN, not GITHUB_TOKEN: the probe and the dispatch both cross
           # org boundaries, and events created with GITHUB_TOKEN do not trigger
@@ -663,40 +644,36 @@ jobs:
           # Unique per coordinator run+attempt — this is what a batch's
           # run-name embeds and what `collect` matches on.
           CORRELATION: ${{ github.run_id }}-${{ github.run_attempt }}
-          # The coordinator keeps NO shards of its own: every shard runs in a
-          # batch repo. Splitting them — some inline here, some remote — made
-          # this run's page show a partial "Matrix: checks / e2e · 8/12 jobs"
-          # that reads like the whole suite but is a fraction of it, with no
-          # link to the rest. One kind of shard job, in one kind of place.
-          #
-          # COORD_FALLBACK_SLOTS is the escape hatch: with no recruitable
-          # worker, 0 local slots would mean no e2e at all, so the coordinator
-          # carries the run itself. That is the ONLY case that still produces a
-          # local shard matrix, and it is warned about in the log + summary.
-          # 8 shards per worker. A worker also runs its own `plan` job, so
-          # this sits at 9 of the org's 20 concurrent jobs — deliberately loose,
-          # leaving each org room for a second PR's batch instead of one PR
-          # monopolising it. Paired with the 32-shard default this fans out over
-          # exactly FOUR workers (32 / 8), and wall-clock is unchanged by the
-          # split: the shards run in parallel either way, so per-worker width
-          # only decides how close each org sits to its cap.
+          # With no recruitable worker the coordinator dispatches to its OWN
+          # repo rather than running inline, so there is never a local matrix.
           COORD_FALLBACK_SLOTS: '14'
+          # 8 per worker: a worker also runs its own `plan` job, so this sits at
+          # 9 of the org's 20 concurrent jobs — loose enough to leave room for a
+          # second PR's batch. Paired with the 32-shard default it fans out over
+          # exactly four workers.
           WORKER_SLOTS: '8'
         run: |
           set -euo pipefail
-          # There is no local shard matrix any more, so an absent script has
-          # nowhere to degrade TO — every shard is dispatched as a batch. Fail
-          # with a sentence instead of letting node die on a missing module.
           if [ ! -f .github/scripts/ci-fanout.mjs ]; then
             echo "::error::.github/scripts/ci-fanout.mjs is missing on this ref — rebase the PR onto main."
             exit 1
           fi
           node .github/scripts/ci-fanout.mjs dispatch
 
+      - name: Wait for e2e batches
+        id: collect
+        if: ${{ steps.gate.outputs.proceed == 'true' && steps.dispatch.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          FANOUT: ${{ steps.dispatch.outputs.fanout }}
+          TIMEOUT_S: '2400'
+        run: node .github/scripts/ci-fanout.mjs collect
+
       # Consumed by /watch-ci and /fix-ci (via scripts/ppap-ci-repo.sh
-      # --fanout) to find the shard logs that live in other repos.
+      # --fanout) to find the shard logs that live in other repos. Uploaded
+      # after collect so it carries the resolved run ids.
       - name: Upload fan-out map
-        if: ${{ always() }}
+        if: ${{ always() && steps.gate.outputs.proceed == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: ci-fanout
@@ -704,209 +681,27 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # Wait for the fanned-out batches running in other repos and fold their
-  # verdict back in. This job is what makes a cross-repo matrix behave like one
-  # matrix: it also provides the cross-org equivalent of `fail-fast: true` by
-  # cancelling sibling batches once one genuinely fails, and it FAILS CLOSED on
-  # a batch it cannot resolve — a shard whose result is unknown must never be
-  # reported as green.
-  e2e-collect:
-    name: 1 · CI · E2E (collect batches)
-    needs: [e2e-plan, e2e-fanout]
-    if: ${{ always() && inputs.run_e2e && needs.e2e-fanout.outputs.has_batches == 'true' }}
-    runs-on: ubuntu-latest
-    # Generous: it is bounded by the slowest remote shard, and the shard jobs
-    # themselves cap at 30 min.
-    timeout-minutes: 45
-    outputs:
-      result: ${{ steps.collect.outputs.result }}
-      runs: ${{ steps.collect.outputs.runs }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
-          ref: ${{ inputs.checkout_ref }}
-          persist-credentials: false
-
-      - id: collect
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-          FANOUT: ${{ needs.e2e-fanout.outputs.fanout }}
-          TIMEOUT_S: '2400'
-        run: node .github/scripts/ci-fanout.mjs collect
-
-      # Republished with each batch's resolved run id — this is the version
-      # /fix-ci reads to locate remote shard logs.
-      - name: Upload fan-out map (resolved)
+      - name: Emit e2e verdict
+        id: verdict
         if: ${{ always() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: ci-fanout-resolved
-          path: ci-fanout.json
-          retention-days: 7
-          if-no-files-found: ignore
-
-  e2e-aggregate:
-    name: 1 · CI · E2E (result)
-    needs: [e2e-plan, e2e-fanout, e2e-collect]
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    outputs:
-      result: ${{ steps.agg.outputs.result }}
-    steps:
-      - id: agg
         env:
-          PLAN_RESULT: ${{ needs.e2e-plan.result }}
-          PLAN_RUN: ${{ needs.e2e-plan.outputs.run }}
-          FANOUT_RESULT: ${{ needs.e2e-fanout.result }}
-          HAS_BATCHES: ${{ needs.e2e-fanout.outputs.has_batches }}
-          COLLECT_RESULT: ${{ needs.e2e-collect.result }}
-          COLLECT_VERDICT: ${{ needs.e2e-collect.outputs.result }}
+          PROCEED: ${{ steps.gate.outputs.proceed }}
+          GATE_RESULT: ${{ steps.gate.outputs.result }}
+          DISPATCH: ${{ steps.dispatch.outcome }}
+          COLLECT: ${{ steps.collect.outcome }}
+          COLLECT_RESULT: ${{ steps.collect.outputs.result }}
         run: |
           set -euo pipefail
-          if [ "$PLAN_RESULT" = "skipped" ]; then
-            # e2e disabled for this caller (run_e2e=false) — mirror the old
-            # `jobs.e2e.result` (skipped) so nothing downstream changes.
-            RESULT=skipped
-          elif [ "$PLAN_RUN" != "true" ]; then
-            # Change-scoped plan found nothing e2e-relevant → treat as pass.
-            RESULT=success
-          elif [ "$FANOUT_RESULT" != "success" ]; then
-            # The fan-out step itself failed, so the shard split is unknown and
-            # no shard set can be trusted to be complete.
+          if [ "$PROCEED" != "true" ]; then
+            RESULT="$GATE_RESULT"
+          elif [ "$DISPATCH" != "success" ]; then
+            # ci-fanout.mjs throws rather than dispatch a partial set, so a
+            # failed dispatch means an unknown share of the suite never ran.
             RESULT=failure
-          elif [ "$HAS_BATCHES" != "true" ]; then
-            # run==true but nothing was dispatched. Unreachable by design —
-            # ci-fanout.mjs throws rather than dispatch nothing — so treat it
-            # as a bug, not as a pass. With no local matrix left, `collect` is
-            # the SOLE source of the verdict and this is the only guard against
-            # reporting a suite that never ran.
-            echo "::error::e2e planned to run but no batch was dispatched — refusing to report success."
-            RESULT=failure
-          elif [ "$COLLECT_RESULT" != "success" ] || [ "$COLLECT_VERDICT" != "success" ]; then
+          elif [ "$COLLECT" != "success" ] || [ "$COLLECT_RESULT" != "success" ]; then
             RESULT=failure
           else
             RESULT=success
           fi
           echo "result=$RESULT" >> "$GITHUB_OUTPUT"
-          echo "▶ e2e aggregate: plan=$PLAN_RESULT run=$PLAN_RUN batches=$HAS_BATCHES collect=$COLLECT_RESULT/$COLLECT_VERDICT → $RESULT" >&2
-
-  # Precompute the "green-but-noisy" signals ONCE, server-side, into a tiny
-  # `ci-noise-report` artifact so /watch-ci and /fix-ci read ONE small file
-  # instead of downloading every e2e shard log over the network. It captures the
-  # masks a green run hides (see .claude/commands/fix-ci.md): flaky retries,
-  # report-only dup-testid / hydration-error annotations, the browser-only
-  # i18n-missing / font-preload / http-404 signals the e2e fixtures tag, biome
-  # warnings, and vitest stderr — same signals, a fraction of the client's time.
-  #
-  # SAFE BY CONSTRUCTION: this job only READS this run's own job logs (default
-  # GITHUB_TOKEN, actions:read via the workflow's read-all). It publishes:
-  #   • a tiny `ci-noise-report` artifact — /watch-ci and /fix-ci read ONE file
-  #     instead of downloading every shard log;
-  #   • `clean` + `summary` job outputs — ci-pr.yml's `report` job reads these to
-  #     gate the labeled auto-merge and to post the PR CI comment.
-  # `continue-on-error: true` PLUS `set +e` means it can NEVER red the run or
-  # affect the CI status the `report` job posts (that status is computed only
-  # from the biome/typecheck/lint/test/e2e outputs above). If it can't run or
-  # the artifact is absent (a PR whose CI predates this job), the client falls
-  # back to its own per-shard log grep and `report` treats noise as unknown
-  # (→ not clean → no auto-merge).
-  #
-  # NOTE: GitHub runs `run:` steps as `bash -e {0}` (errexit ON). The scan is a
-  # pipeline of greps that legitimately exit non-zero on "no match", so we MUST
-  # `set +e` — otherwise a zero-match grep aborts the step before the outputs /
-  # artifact are written (that was the original failure: run 29478177936).
-  noise-report:
-    name: 1 · CI · Noise report
-    needs: [biome, test-aggregate, e2e-aggregate, e2e-collect]
-    # PR CI only (run_e2e=true) — the deploy gate (run_e2e=false) has no
-    # /watch-ci consumer, so keep this off the deploy critical path entirely.
-    if: ${{ always() && inputs.run_e2e }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    continue-on-error: true
-    outputs:
-      clean: ${{ steps.scan.outputs.clean }}
-      summary: ${{ steps.scan.outputs.summary }}
-    steps:
-      - name: Scan this run's logs for noise
-        id: scan
-        env:
-          # PAT_TOKEN rather than the default GITHUB_TOKEN: with e2e fanned out,
-          # some shard logs live in OTHER repos, which GITHUB_TOKEN cannot read.
-          # Reading a fanned-out run's logs with the default token silently
-          # yielded zero e2e lines — i.e. "flaky 0", clean, auto-merge — which
-          # is the one failure mode this gate must not have.
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-          RUN_ID: ${{ github.run_id }}
-          BATCH_RUNS: ${{ needs.e2e-collect.outputs.runs }}
-        run: |
-          set +e -uo pipefail   # errexit OFF — zero-match greps below exit non-zero by design
-          tmp="$(mktemp -d)"
-          : > "$tmp/e2e.log"; : > "$tmp/biome.log"; : > "$tmp/test.log"
-          # Every run whose job logs belong to THIS logical CI run: this
-          # coordinator run, plus one per fanned-out e2e batch.
-          : > "$tmp/runs.tsv"
-          printf '%s\t%s\n' "$GITHUB_REPOSITORY" "$RUN_ID" >> "$tmp/runs.tsv"
-          if [ -n "${BATCH_RUNS:-}" ] && [ "$BATCH_RUNS" != "[]" ]; then
-            printf '%s' "$BATCH_RUNS" \
-              | jq -r '.[]? | [.repo, (.run_id|tostring)] | @tsv' 2>/dev/null >> "$tmp/runs.tsv"
-          fi
-          echo "▶ noise: scanning $(wc -l < "$tmp/runs.tsv") run(s)"
-          # Map every job in each run to (id, name); pull each relevant job's log
-          # once. Job names carry the reusable-workflow prefix ("checks / 1 · CI
-          # · E2E (shard 3)") on the coordinator and a bare "E2E (shard 3)" in a
-          # batch repo — the substring match finds both.
-          while IFS="$(printf '\t')" read -r repo run; do
-            [ -n "$repo" ] && [ -n "$run" ] || continue
-            gh api "repos/${repo}/actions/runs/${run}/jobs" --paginate \
-              --jq '.jobs[]? | [(.id|tostring), .name] | @tsv' 2>/dev/null \
-              | while IFS="$(printf '\t')" read -r id name; do
-                  [ -n "$id" ] || continue
-                  case "$name" in
-                    *"E2E (shard"*)  dest="$tmp/e2e.log" ;;
-                    *"Biome"*)       dest="$tmp/biome.log" ;;
-                    *"Unit tests"*)  dest="$tmp/test.log" ;;
-                    *)               continue ;;
-                  esac
-                  gh api "repos/${repo}/actions/jobs/${id}/logs" 2>/dev/null \
-                    | sed -E 's/\x1b\[[0-9;]*m//g' >> "$dest"
-                done
-          done < "$tmp/runs.tsv"
-          # grep exits non-zero on no-match; with errexit OFF that's fine — awk
-          # always prints a number, and grep -c always prints its count.
-          num() { grep -oiE "$1" "$2" 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}'; }
-          cnt() { grep -acE "$1" "$2" 2>/dev/null | head -1; }
-          flaky=$(num '([0-9]+) flaky' "$tmp/e2e.log"); flaky=${flaky:-0}
-          dup=$(cnt '\[dup-testid\]' "$tmp/e2e.log"); dup=${dup:-0}
-          hyd=$(cnt '\[hydration-error\]' "$tmp/e2e.log"); hyd=${hyd:-0}
-          # Browser-only signals the e2e fixtures tag per test (apps/shell/e2e/fixtures.ts):
-          # missing i18n keys, unused next/font preloads, 4xx/404 resource loads.
-          i18n=$(cnt '\[i18n-missing\]' "$tmp/e2e.log"); i18n=${i18n:-0}
-          font=$(cnt '\[font-preload\]' "$tmp/e2e.log"); font=${font:-0}
-          http404=$(cnt '\[http-404\]' "$tmp/e2e.log"); http404=${http404:-0}
-          biomew=$(num 'Found ([0-9]+) warning' "$tmp/biome.log"); biomew=${biomew:-0}
-          vitest=$(cnt 'stderr \||not wrapped in act' "$tmp/test.log"); vitest=${vitest:-0}
-          total=$(( flaky + dup + hyd + i18n + font + http404 + biomew + vitest ))
-          clean=true; [ "$total" -gt 0 ] && clean=false
-          summary=$(printf 'flaky %s · dup %s · hyd %s · i18n %s · font %s · 404 %s · biome %s · vitest %s' "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest")
-          {
-            echo "clean=$clean"
-            echo "summary=$summary"
-          } >> "$GITHUB_OUTPUT"
-          mkdir -p ci-noise
-          printf '{"flaky":%s,"dup_testid":%s,"hydration":%s,"i18n_missing":%s,"font_preload":%s,"http_4xx":%s,"biome_warnings":%s,"vitest_stderr":%s,"clean":%s}\n' \
-            "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest" "$clean" | tee ci-noise/ci-noise-report.json
-          echo "▶ noise: $summary → clean=$clean"
-          exit 0
-
-      - name: Upload noise report
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: ci-noise-report
-          path: ci-noise/ci-noise-report.json
-          retention-days: 7
-          if-no-files-found: ignore
+          echo "▶ e2e verdict: proceed=$PROCEED dispatch=$DISPATCH collect=$COLLECT/$COLLECT_RESULT → $RESULT" >&2
