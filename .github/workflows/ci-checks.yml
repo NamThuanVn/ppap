@@ -633,7 +633,6 @@ jobs:
     timeout-minutes: 10
     outputs:
       total: ${{ steps.fan.outputs.total }}
-      local_shards: ${{ steps.fan.outputs.local_shards }}
       has_batches: ${{ steps.fan.outputs.has_batches }}
       fanout: ${{ steps.fan.outputs.fanout }}
     steps:
@@ -681,44 +680,16 @@ jobs:
           # exactly FOUR workers (32 / 8), and wall-clock is unchanged by the
           # split: the shards run in parallel either way, so per-worker width
           # only decides how close each org sits to its cap.
-          COORD_SLOTS: '0'
           COORD_FALLBACK_SLOTS: '14'
           WORKER_SLOTS: '8'
         run: |
           set -euo pipefail
-          # Backward-compat, and it is load-bearing on the day this merges.
-          # The fleet repos get this workflow the moment the sync runs, but a
-          # PR opened BEFORE that merge is checked out at its own merge ref —
-          # and if GitHub has not yet recomputed that ref against the new main,
-          # `.github/scripts/ci-fanout.mjs` is simply absent. Calling node on a
-          # missing file would fail e2e-fanout, and e2e-aggregate turns that
-          # into a red `e2e` for a PR that changed nothing e2e-related.
-          #
-          # Degrade to "no fan-out, run locally" instead — the same shape as
-          # the ci-boot-e2e.sh fallback in the shard job below. Remove once
-          # every open PR has rebased past this commit.
+          # There is no local shard matrix any more, so an absent script has
+          # nowhere to degrade TO — every shard is dispatched as a batch. Fail
+          # with a sentence instead of letting node die on a missing module.
           if [ ! -f .github/scripts/ci-fanout.mjs ]; then
-            # Clamp to the coordinator's slot budget: the plan asked for
-            # `e2e_shards` (36) on the assumption the fan-out would place the
-            # surplus elsewhere. Running all 36 on one repo would blow the
-            # 20-job cap and queue, which is slower than the 12 shards this
-            # PR would have had before the change.
-            # Written as `if` rather than `[ … ] && N=…`: that terser form
-            # evaluates to non-zero when the test is false, which is harmless
-            # here only because another statement follows it. This block runs
-            # in a narrow window on merge day, so it must not depend on that.
-            N="$PLAN_TOTAL"
-            if [ "$N" -gt "$COORD_SLOTS" ]; then N="$COORD_SLOTS"; fi
-            if [ "$N" -lt 1 ]; then N=1; fi
-            SHARDS=$(seq 1 "$N" | jq -R 'tonumber' | jq -cs '.')
-            echo "::warning::ci-fanout.mjs is absent on this ref — running $N shard(s) locally with no fan-out. Rebase the PR onto main to enable it."
-            {
-              echo "total=$N"
-              echo "local_shards=$SHARDS"
-              echo "has_batches=false"
-              echo "fanout={}"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::error::.github/scripts/ci-fanout.mjs is missing on this ref — rebase the PR onto main."
+            exit 1
           fi
           node .github/scripts/ci-fanout.mjs dispatch
 
@@ -733,195 +704,6 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  e2e:
-    name: 1 · CI · E2E (shard ${{ matrix.shard }})
-    needs: [e2e-plan, e2e-build-zones, e2e-seed, e2e-fanout]
-    # `local_shards` is '[]' when every shard was fanned out to workers — an
-    # empty matrix skips the job, which e2e-aggregate maps correctly.
-    if: ${{ inputs.run_e2e && needs.e2e-plan.outputs.run == 'true' && needs.e2e-fanout.outputs.local_shards != '[]' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: true
-      matrix:
-        shard: ${{ fromJSON(needs.e2e-fanout.outputs.local_shards) }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
-          ref: ${{ inputs.checkout_ref }}
-          persist-credentials: false
-
-      - uses: ./.github/actions/install
-
-      # Restore every zone's build (.open-next) + the seeded DB
-      # (.wrangler/state-e2e), produced in parallel by the e2e-build-zones matrix
-      # + e2e-seed. `pattern: e2e-*` matches all ten `e2e-zone-<name>` artifacts
-      # plus `e2e-seed`; `merge-multiple: true` lands every tar in the cwd.
-      # Untarring all of them reassembles the exact same tree the old single
-      # combined bundle produced. This is this shard's own mutable copy — tests
-      # can write freely without affecting other shards.
-      - name: Restore e2e build + seed
-        uses: actions/download-artifact@v7
-        with:
-          pattern: e2e-*
-          merge-multiple: true
-
-      - name: Unpack e2e build + seed
-        run: |
-          for f in *.tar; do tar -xf "$f"; done
-
-      # No /etc/hosts or TLS cert: e2e hits the dashboard worker directly on a
-      # free port over plain http://localhost (no proxy, no namthuan.local).
-
-      # Cache the Chromium download keyed on @playwright/test's resolved
-      # version from the lockfile. Saves ~1 min/shard on cache hit.
-      - name: Resolve Playwright version
-        id: pw
-        run: |
-          set -euo pipefail
-          VER=$(node -e "console.log(require('./node_modules/@playwright/test/package.json').version)")
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v5
-        id: pw-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
-
-      - name: Install Playwright Chromium
-        run: pnpm exec playwright install --with-deps chromium
-
-      # Boot a dedicated e2e stack on a free port (dashboard worker + gateway +
-      # leaves as bindings + one `wrangler dev` per zone worker — NO proxy, NO
-      # assistant) via scripts/ci-boot-e2e.sh: boot + /api/health + per-zone probe
-      # (a zone that booted but serves 5xx is caught here, before the tests, with
-      # a precise `::error::zone <x> …`), in its own process group (BUILD=0
-      # RESEED=0 — build + seed came from the restored artifacts). Then run THIS
-      # shard's Playwright slice against the reported port. Reboot the stack and
-      # re-run the shard ONCE on an INFRA failure — the boot failed (a crashed /
-      # SQLITE_BUSY-locked zone) OR the tests failed because the serve process
-      # died mid-run (a workerd crash → ECONNREFUSED cascade Playwright's own
-      # retries can't recover, since the server is gone). A test failure with the
-      # stack still ALIVE is genuine red — never retried, so we don't mask it.
-      # TOTAL comes from e2e-fanout, NOT e2e-plan: the effective shard count is
-      # capacity-dependent, and `--shard=i/N` is only coherent if every host —
-      # this repo and every fan-out batch — uses the SAME N.
-      - name: Boot e2e stack + run Playwright shard ${{ matrix.shard }}/${{ needs.e2e-fanout.outputs.total }}
-        env:
-          PLAYWRIGHT_NO_WEB_SERVER: '1'
-          SHARD: ${{ matrix.shard }}
-          TOTAL: ${{ needs.e2e-fanout.outputs.total }}
-          # Space-separated spec paths on a change-scoped run; empty on a full
-          # run (Playwright then runs every spec). Word-split intentionally.
-          E2E_TARGETS: ${{ needs.e2e-plan.outputs.targets }}
-          # The e2e base URL stays `localhost` (design-system specs hardcode
-          # `domain: localhost` theme cookies, see scripts/e2e-run.sh). On the CI
-          # runner Node resolves `localhost` to IPv6 `::1` first, but wrangler dev
-          # listens on IPv4 only → Playwright's Node `request` fixture got
-          # `connect ECONNREFUSED ::1:<port>`. Force IPv4-first resolution so
-          # `localhost` connects to 127.0.0.1 where the worker actually listens,
-          # without changing the cookie domain.
-          NODE_OPTIONS: --dns-result-order=ipv4first
-        run: |
-          set -uo pipefail
-          # A ~30-line inline-boot fallback used to sit here for PRs branched
-          # before scripts/ci-boot-e2e.sh existed. That script landed
-          # 2026-06-29 and no open PR predates it, so the branch was dead — its
-          # own comment said to remove it once every open PR had rebased past
-          # it. Assert instead, matching ci-e2e-batch.yml, so a genuinely
-          # missing script fails with a sentence rather than a stack of
-          # "command not found".
-          if [ ! -f scripts/ci-boot-e2e.sh ]; then
-            echo "::error::scripts/ci-boot-e2e.sh is missing on this ref — rebase the PR onto main."
-            exit 1
-          fi
-          serve_alive() { local p; p="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
-          teardown_serve() {
-            local p; p="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"
-            [ -n "$p" ] || return 0
-            kill -TERM -- -"$p" 2>/dev/null || true; sleep 2; kill -KILL -- -"$p" 2>/dev/null || true
-          }
-          # One attempt = boot the stack, then run this shard's slice. A boot
-          # failure returns the sentinel 70 (an INFRA failure — a crashed/locked
-          # zone, e.g. SENTRY_DO SQLITE_BUSY) so it's distinguishable from a
-          # Playwright test failure (small exit codes). The helper already tears
-          # its own stack down on boot failure.
-          attempt() {
-            bash scripts/ci-boot-e2e.sh || return 70
-            # shellcheck disable=SC2086  # E2E_TARGETS is an intentional path list
-            PLAYWRIGHT_BASE_URL="http://localhost:$(cat .wrangler/e2e-port)" \
-              pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL" $E2E_TARGETS
-          }
-          attempt
-          rc=$?
-          [ "$rc" -eq 0 ] && exit 0
-          # Reboot+retry ONCE for an infra failure: boot failed (rc=70), OR the
-          # tests failed AND the serve process died mid-run (a workerd crash →
-          # ECONNREFUSED cascade Playwright's own retries can't recover). A test
-          # failure with the stack STILL ALIVE is genuine red — never retried, so
-          # we don't mask real failures.
-          if [ "$rc" -ne 70 ] && serve_alive; then
-            echo "::error::shard $SHARD/$TOTAL failed with the stack still alive — a genuine test failure, not retrying"
-            teardown_serve
-            exit "$rc"
-          fi
-          echo "::warning::infra failure on shard $SHARD/$TOTAL (rc=$rc) — rebooting the stack and re-running this shard once"
-          teardown_serve
-          # Keep the first attempt's boot log for the failure upload.
-          mv e2e-serve.log e2e-serve.attempt1.log 2>/dev/null || true
-          attempt
-
-      - name: Tear down e2e stack
-        if: always()
-        run: |
-          SERVE_PID="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"
-          if [ -n "$SERVE_PID" ]; then
-            kill -TERM -- -"$SERVE_PID" 2>/dev/null || true
-            sleep 2
-            kill -KILL -- -"$SERVE_PID" 2>/dev/null || true
-          fi
-
-      # A FLAKY test passes on retry, so the shard exits 0 and the `if: failure()`
-      # this used to carry threw its evidence away. That is why every flaky in
-      # this suite has been undiagnosable after the fact: the noise gate reports
-      # `flaky 1`, but the trace, screenshot and `error-context.md` aria snapshot
-      # naming the actual cause were dropped on the way out.
-      #
-      # Playwright still writes `test-results/` for the FAILED first attempt of a
-      # retried test, so the evidence exists on disk — detect it and upload it
-      # alongside the genuine-failure case.
-      - name: Detect retained failure artifacts (covers flaky-passed-on-retry)
-        id: pw_artifacts
-        if: always()
-        run: |
-          if [ -d test-results ] && [ -n "$(ls -A test-results 2>/dev/null)" ]; then
-            echo "present=true" >>"$GITHUB_OUTPUT"
-            echo "::notice::shard ${{ matrix.shard }} retained failure artifacts (flaky first attempt) — uploading"
-          else
-            echo "present=false" >>"$GITHUB_OUTPUT"
-          fi
-
-      - name: Upload Playwright report
-        if: ${{ failure() || steps.pw_artifacts.outputs.present == 'true' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: playwright-report-shard-${{ matrix.shard }}
-          path: |
-            playwright-report/
-            test-results/
-            e2e-serve*.log
-          retention-days: 7
-          if-no-files-found: ignore
-
-  # Collapse the sharded e2e matrix into the single `e2e` workflow output the
-  # callers consume. Load-bearing for the change-scoped path: when the plan says
-  # `skip` (nothing e2e-relevant changed), the e2e matrix is SKIPPED — but a
-  # skipped job reports `skipped`, and ci-pr.yml's report flips CI red on
-  # anything other than `success`. Mapping skip → success keeps that contract
-  # intact. Runs always() so it reports even when the matrix skipped/failed.
   # Wait for the fanned-out batches running in other repos and fold their
   # verdict back in. This job is what makes a cross-repo matrix behave like one
   # matrix: it also provides the cross-org equivalent of `fail-fast: true` by
@@ -967,7 +749,7 @@ jobs:
 
   e2e-aggregate:
     name: 1 · CI · E2E (result)
-    needs: [e2e-plan, e2e-fanout, e2e, e2e-collect]
+    needs: [e2e-plan, e2e-fanout, e2e-collect]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -979,7 +761,6 @@ jobs:
           PLAN_RESULT: ${{ needs.e2e-plan.result }}
           PLAN_RUN: ${{ needs.e2e-plan.outputs.run }}
           FANOUT_RESULT: ${{ needs.e2e-fanout.result }}
-          E2E_RESULT: ${{ needs.e2e.result }}
           HAS_BATCHES: ${{ needs.e2e-fanout.outputs.has_batches }}
           COLLECT_RESULT: ${{ needs.e2e-collect.result }}
           COLLECT_VERDICT: ${{ needs.e2e-collect.outputs.result }}
@@ -996,24 +777,21 @@ jobs:
             # The fan-out step itself failed, so the shard split is unknown and
             # no shard set can be trusted to be complete.
             RESULT=failure
+          elif [ "$HAS_BATCHES" != "true" ]; then
+            # run==true but nothing was dispatched. Unreachable by design —
+            # ci-fanout.mjs throws rather than dispatch nothing — so treat it
+            # as a bug, not as a pass. With no local matrix left, `collect` is
+            # the SOLE source of the verdict and this is the only guard against
+            # reporting a suite that never ran.
+            echo "::error::e2e planned to run but no batch was dispatched — refusing to report success."
+            RESULT=failure
+          elif [ "$COLLECT_RESULT" != "success" ] || [ "$COLLECT_VERDICT" != "success" ]; then
+            RESULT=failure
           else
-            # Local shards. `skipped` is legitimate here and ONLY here: it means
-            # every shard was fanned out to workers, so the local matrix was
-            # empty. Any other non-success is a real failure.
-            case "$E2E_RESULT" in
-              success|skipped) RESULT=success ;;
-              *)               RESULT="$E2E_RESULT" ;;
-            esac
-            # Remote batches, if any. Fail closed: the collect job must have
-            # run AND returned success.
-            if [ "$HAS_BATCHES" = "true" ]; then
-              if [ "$COLLECT_RESULT" != "success" ] || [ "$COLLECT_VERDICT" != "success" ]; then
-                RESULT=failure
-              fi
-            fi
+            RESULT=success
           fi
           echo "result=$RESULT" >> "$GITHUB_OUTPUT"
-          echo "▶ e2e aggregate: plan=$PLAN_RESULT run=$PLAN_RUN local=$E2E_RESULT batches=$HAS_BATCHES collect=$COLLECT_RESULT/$COLLECT_VERDICT → $RESULT" >&2
+          echo "▶ e2e aggregate: plan=$PLAN_RESULT run=$PLAN_RUN batches=$HAS_BATCHES collect=$COLLECT_RESULT/$COLLECT_VERDICT → $RESULT" >&2
 
   # Precompute the "green-but-noisy" signals ONCE, server-side, into a tiny
   # `ci-noise-report` artifact so /watch-ci and /fix-ci read ONE small file
