@@ -118,7 +118,27 @@ jobs:
       # built once, by the coordinator, in a different org. download-artifact
       # supports this via `repository` + `run-id`; PAT_TOKEN already carries
       # actions:read on every fleet repo, so no new secret is involved.
+      # Retried once, deliberately. This download crosses an org boundary and
+      # pulls the full zone-bundle set, which makes it the most
+      # network-exposed step in the batch — and a `Connect Timeout Error` here
+      # is an INFRA failure, not a test result. Because the matrix is
+      # `fail-fast: true`, one such blip took its 7 sibling shards down with it
+      # and reddened the PR (observed: Delta batch 3/4, run 31678948548).
+      # `continue-on-error` on the first attempt keeps the step from ending the
+      # job, and the retry re-runs the identical download.
       - name: Restore e2e build + seed from coordinator
+        id: restore
+        uses: actions/download-artifact@v7
+        continue-on-error: true
+        with:
+          pattern: e2e-*
+          merge-multiple: true
+          repository: ${{ github.event.client_payload.ctx.artifact_repo }}
+          run-id: ${{ github.event.client_payload.ctx.artifact_run_id }}
+          github-token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Restore e2e build + seed (retry)
+        if: steps.restore.outcome == 'failure'
         uses: actions/download-artifact@v7
         with:
           pattern: e2e-*

@@ -827,34 +827,16 @@ jobs:
           NODE_OPTIONS: --dns-result-order=ipv4first
         run: |
           set -uo pipefail
-          # Backward-compat: PRs branched before this change don't ship
-          # scripts/ci-boot-e2e.sh — boot the legacy inline way (no zone probe,
-          # no reboot-retry) so their e2e still runs. Remove once every open PR
-          # has rebased past this commit.
+          # A ~30-line inline-boot fallback used to sit here for PRs branched
+          # before scripts/ci-boot-e2e.sh existed. That script landed
+          # 2026-06-29 and no open PR predates it, so the branch was dead — its
+          # own comment said to remove it once every open PR had rebased past
+          # it. Assert instead, matching ci-e2e-batch.yml, so a genuinely
+          # missing script fails with a sentence rather than a stack of
+          # "command not found".
           if [ ! -f scripts/ci-boot-e2e.sh ]; then
-            set -m
-            nohup env BUILD=0 RESEED=0 pnpm e2e:serve >e2e-serve.log 2>&1 &
-            SERVE_PID=$!
-            set +m
-            echo "$SERVE_PID" > .wrangler/e2e-serve.pid
-            for _ in $(seq 1 60); do
-              [ -s .wrangler/e2e-port ] && break
-              kill -0 "$SERVE_PID" 2>/dev/null || { echo "::error::e2e:serve exited early"; tail -n 80 e2e-serve.log; exit 1; }
-              sleep 1
-            done
-            PORT="$(cat .wrangler/e2e-port 2>/dev/null || true)"
-            [ -z "$PORT" ] && { echo "::error::e2e:serve never reported a port"; tail -n 80 e2e-serve.log; exit 1; }
-            deadline=$((SECONDS + 300))
-            ready=0
-            while (( SECONDS < deadline )); do
-              kill -0 "$SERVE_PID" 2>/dev/null || { echo "::error::e2e stack exited before becoming ready"; tail -n 80 e2e-serve.log; exit 1; }
-              curl -sf "http://localhost:$PORT/api/health" >/dev/null 2>&1 && { ready=1; break; }
-              sleep 1
-            done
-            [ "$ready" = 1 ] || { echo "::error::Timed out waiting for /api/health"; tail -n 80 e2e-serve.log; exit 1; }
-            # shellcheck disable=SC2086  # E2E_TARGETS is an intentional path list
-            PLAYWRIGHT_BASE_URL="http://localhost:$PORT" pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL" $E2E_TARGETS
-            exit $?
+            echo "::error::scripts/ci-boot-e2e.sh is missing on this ref — rebase the PR onto main."
+            exit 1
           fi
           serve_alive() { local p; p="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
           teardown_serve() {
