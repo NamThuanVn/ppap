@@ -100,7 +100,7 @@ jobs:
       # ci-checks.yml's e2e-fanout job borrows idle fleet repos for the surplus,
       # so this can exceed one org's ~14-shard ceiling. Empty ⇒ ci-checks.yml's
       # own default.
-      e2e_shards: ${{ fromJSON(inputs.e2e_shards || '36') }}
+      e2e_shards: ${{ fromJSON(inputs.e2e_shards || '32') }}
       # The fleet this run may borrow e2e capacity from, forwarded by the
       # private dispatcher (which owns PPAP_CI_REPOS). Absent on a manual
       # workflow_dispatch → no fan-out, every shard stays here.

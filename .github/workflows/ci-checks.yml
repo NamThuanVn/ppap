@@ -13,9 +13,9 @@ on:
         type: string
         required: true
       e2e_shards:
-        description: 'DESIRED number of parallel Playwright shards. The effective count is min(this, available capacity) — see the e2e-fanout job. Both PR CI and the deploy gate inherit it.'
+        description: 'DESIRED number of parallel Playwright shards. The effective count is min(this, available capacity) — see the e2e-fanout job. 32 = 4 workers x 8 shards at the default WORKER_SLOTS. Both PR CI and the deploy gate inherit it.'
         type: number
-        default: 36
+        default: 32
       fleet:
         description: 'Comma-separated owner/repo list of ppap CI repos this run may borrow idle e2e capacity from (the erp-namthuan variable PPAP_CI_REPOS). Empty ⇒ no fan-out; every shard runs on this repo.'
         type: string
@@ -664,11 +664,26 @@ jobs:
           # Unique per coordinator run+attempt — this is what a batch's
           # run-name embeds and what `collect` matches on.
           CORRELATION: ${{ github.run_id }}-${{ github.run_attempt }}
-          # Coordinator keeps 14 of its 20 slots for shards; the remainder
-          # covers e2e-collect plus any lint/typecheck/vitest leg still
-          # finishing. A worker repo runs nothing else, so it takes 18 of 20.
-          COORD_SLOTS: '14'
-          WORKER_SLOTS: '18'
+          # The coordinator keeps NO shards of its own: every shard runs in a
+          # batch repo. Splitting them — some inline here, some remote — made
+          # this run's page show a partial "Matrix: checks / e2e · 8/12 jobs"
+          # that reads like the whole suite but is a fraction of it, with no
+          # link to the rest. One kind of shard job, in one kind of place.
+          #
+          # COORD_FALLBACK_SLOTS is the escape hatch: with no recruitable
+          # worker, 0 local slots would mean no e2e at all, so the coordinator
+          # carries the run itself. That is the ONLY case that still produces a
+          # local shard matrix, and it is warned about in the log + summary.
+          # 8 shards per worker. A worker also runs its own `plan` job, so
+          # this sits at 9 of the org's 20 concurrent jobs — deliberately loose,
+          # leaving each org room for a second PR's batch instead of one PR
+          # monopolising it. Paired with the 32-shard default this fans out over
+          # exactly FOUR workers (32 / 8), and wall-clock is unchanged by the
+          # split: the shards run in parallel either way, so per-worker width
+          # only decides how close each org sits to its cap.
+          COORD_SLOTS: '0'
+          COORD_FALLBACK_SLOTS: '14'
+          WORKER_SLOTS: '8'
         run: |
           set -euo pipefail
           # Backward-compat, and it is load-bearing on the day this merges.
