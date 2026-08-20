@@ -34,11 +34,15 @@ name: Agent · clear-todo-issue
 #
 # Claude auth is a POOL of subscription accounts (CLAUDE_CODE_OAUTH_TOKENS, one
 # newline-separated secret); .github/scripts/agent-claude-run.sh probes,
-# rotates, and fails over mid-run. GitHub identity is the pooled PAT this run resolved (the
-# itdevnamthuan account) — the checkout targets the UPSTREAM repo (freshest
-# main), while ITS fork stays the push target and the claim-lock namespace,
-# so claims are atomic among all CI agents. Human sessions on OTHER forks are
-# covered by the open-PR backstop.
+# rotates, and fails over mid-run. GitHub identity is whichever POOLED account
+# the `Resolve PAT from pool` step picked — NOT a fixed account; the log line
+# `PAT pool -> @<login>` names it, and it is stable for the whole run so a lane
+# claims, works and releases as one identity. The checkout targets the UPSTREAM
+# repo (freshest main), while the SHARED fork (vars.AGENT_FORK_REPO) stays the
+# push target and the claim-lock namespace — shared because the claim ref there
+# is the atomic cross-lane lock, so it must not be split per account. Claims are
+# therefore atomic among all CI agents; human sessions on OTHER forks are covered
+# by the open-PR backstop.
 #
 # Dispatched by agent-loop.yml (repository_dispatch[agent-todo]);
 # workflow_dispatch is the manual/smoke-test entry. Filename is deliberately
@@ -80,8 +84,14 @@ env:
   PRIVATE_REPO: NamThuanVn/erp-namthuan
   # the agent account's own fork — push works without a cross-account grant. Must
   # exist before the first run (gh repo fork NamThuanVn/erp-namthuan
-  # --clone=false, as itdevnamthuan).
-  FORK_REPO: itdevnamthuan/erp-namthuan
+  # The agent fork — ONE shared namespace on purpose, and not because any one
+  # account is special. `claim-todo.mjs` creates the claim ref here
+  # (`repos/<fork>/git/refs`) and that ref IS the atomic cross-lane lock: split
+  # it per account and two lanes could claim the same issue. Which account owns
+  # the fork is arbitrary, so it lives in ONE place — the ppap repo variable
+  # `AGENT_FORK_REPO` — instead of being baked into four files. Every pooled
+  # account needs write on it (see .claude/ppap.md § PAT_TOKEN_POOL).
+  FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
 
 jobs:
   agent:
