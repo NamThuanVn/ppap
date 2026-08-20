@@ -59,7 +59,11 @@ on:
         description: 'JSON array of the fanned-out batch runs ([{repo, batch, run_id, conclusion}]) so the caller can scan their logs. Empty when nothing was dispatched.'
         value: ${{ jobs.e2e.outputs.runs }}
     secrets:
-      PAT_TOKEN:
+      # The multi-account PAT pool — the ONLY token source. Required: the
+      # single-PAT fallback was retired once the pool was live in all 8 stores,
+      # because a fallback meant a mis-set pool silently reverted the whole
+      # system to one account's quota and looked healthy doing it.
+      PAT_TOKEN_POOL:
         required: true
 
 permissions: read-all
@@ -81,10 +85,49 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
       - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ env.RESOLVED_PAT }}
           ref: ${{ inputs.checkout_ref }}
           # Full history so HEAD^1 (the PR's base parent on the merge ref) is
           # available for the demo-migration-guard diff below.
@@ -201,10 +244,49 @@ jobs:
           - name: rest   # 76
             pkgs: ''   # catch-all — everything not in BINNED_PKGS
     steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
       - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ env.RESOLVED_PAT }}
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
@@ -237,10 +319,49 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
       - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ env.RESOLVED_PAT }}
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
@@ -310,10 +431,49 @@ jobs:
           - name: rest        # 32
             pkgs: ''   # catch-all — everything not in BINNED_PKGS
     steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
       - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ env.RESOLVED_PAT }}
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
@@ -364,10 +524,49 @@ jobs:
       shards: ${{ steps.plan.outputs.shards }}
       total: ${{ steps.plan.outputs.total }}
     steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
       - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ env.RESOLVED_PAT }}
           ref: ${{ inputs.checkout_ref }}
           # Full history so HEAD^1 (the PR's base parent on the merge ref) is
           # available for the diff.
@@ -466,10 +665,49 @@ jobs:
           - { name: hris, pkg: '@namthuanvn/zone-hris' }
           - { name: utilities, pkg: '@namthuanvn/zone-utilities' }
     steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
       - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ env.RESOLVED_PAT }}
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
@@ -559,10 +797,49 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
       - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ env.RESOLVED_PAT }}
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
@@ -575,7 +852,7 @@ jobs:
           # data and must not be public). Without a token `gh` cannot read it and
           # this job silently falls back to a full cold migration run — correct,
           # just slower — so the seed step would quietly lose its speedup.
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: STATE_DIR=.wrangler/state-e2e bash scripts/db-reset.sh
 
       # Mostly-incompressible sqlite — skip artifact gzip.
@@ -614,6 +891,45 @@ jobs:
       result: ${{ steps.verdict.outputs.result }}
       runs: ${{ steps.collect.outputs.runs }}
     steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
       # The whole "should this stage run, and did its inputs survive?" decision
       # in one place. Previously spread across three `if:` expressions and the
       # aggregate's shell.
@@ -652,7 +968,7 @@ jobs:
         if: ${{ steps.gate.outputs.proceed == 'true' }}
         with:
           repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ env.RESOLVED_PAT }}
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
@@ -660,10 +976,10 @@ jobs:
         id: dispatch
         if: ${{ steps.gate.outputs.proceed == 'true' }}
         env:
-          # PAT_TOKEN, not GITHUB_TOKEN: the probe and the dispatch both cross
+          # A pooled PAT, not GITHUB_TOKEN: the probe and the dispatch both cross
           # org boundaries, and events created with GITHUB_TOKEN do not trigger
           # workflows at all.
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           SELF: ${{ github.repository }}
           FLEET: ${{ inputs.fleet }}
           MODE: ${{ needs.e2e-plan.outputs.mode }}
@@ -698,7 +1014,7 @@ jobs:
         id: collect
         if: ${{ steps.gate.outputs.proceed == 'true' && steps.dispatch.outcome == 'success' }}
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           FANOUT: ${{ steps.dispatch.outputs.fanout }}
           TIMEOUT_S: '2400'
         run: node .github/scripts/ci-fanout.mjs collect

@@ -70,6 +70,45 @@ jobs:
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
     steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
       # The checkout is the UPSTREAM repo — always the freshest main, so the
       # planner reads current BA spec files (the fork's main is only as fresh
       # as its last sync). The next step rewires remotes into the fork layout
@@ -81,13 +120,13 @@ jobs:
         with:
           repository: NamThuanVn/erp-namthuan
           ref: main
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ env.RESOLVED_PAT }}
           fetch-depth: 1
           persist-credentials: false
 
       - name: Set up fork layout + identity
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -euo pipefail
           git remote rename origin upstream
@@ -109,7 +148,7 @@ jobs:
       - name: Detect unplanned leaves
         id: sweep
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -euo pipefail
           UNPLANNED=$(for L in ba-bug ba-change ba-feature; do
@@ -143,7 +182,7 @@ jobs:
         env:
           REL_PLAN: '1'
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: bash .github/scripts/agent-claude-run.sh
 
       # Deterministic enforcement: any leaf still unplanned → red job → no
@@ -152,7 +191,7 @@ jobs:
       - name: Verify plan coverage
         if: steps.sweep.outputs.proceed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -euo pipefail
           LEFT=$(for L in ba-bug ba-change ba-feature; do
@@ -201,7 +240,7 @@ jobs:
       - name: Continue loop
         if: success()
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
         run: |
           set +e

@@ -34,7 +34,7 @@ name: Agent · clear-todo-issue
 #
 # Claude auth is a POOL of subscription accounts (CLAUDE_CODE_OAUTH_TOKENS, one
 # newline-separated secret); .github/scripts/agent-claude-run.sh probes,
-# rotates, and fails over mid-run. GitHub identity is PAT_TOKEN (the
+# rotates, and fails over mid-run. GitHub identity is the pooled PAT this run resolved (the
 # itdevnamthuan account) — the checkout targets the UPSTREAM repo (freshest
 # main), while ITS fork stays the push target and the claim-lock namespace,
 # so claims are atomic among all CI agents. Human sessions on OTHER forks are
@@ -78,7 +78,7 @@ permissions: read-all
 
 env:
   PRIVATE_REPO: NamThuanVn/erp-namthuan
-  # PAT_TOKEN's own fork — push works without any cross-account grant. Must
+  # the agent account's own fork — push works without a cross-account grant. Must
   # exist before the first run (gh repo fork NamThuanVn/erp-namthuan
   # --clone=false, as itdevnamthuan).
   FORK_REPO: itdevnamthuan/erp-namthuan
@@ -97,6 +97,45 @@ jobs:
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
     steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
       # The checkout is the UPSTREAM repo — always the freshest main. It used
       # to target the fork, whose main is only as fresh as its last sync
       # (observed 15+ min / several PRs behind between runs), making every
@@ -110,7 +149,7 @@ jobs:
         with:
           repository: NamThuanVn/erp-namthuan
           ref: main
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ env.RESOLVED_PAT }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -122,7 +161,7 @@ jobs:
       # every github.com remote.
       - name: Set up fork layout + freshen fork + identity
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -euo pipefail
           git remote rename origin upstream
@@ -146,7 +185,7 @@ jobs:
         id: claim
         if: env.ITEM_ARG == ''
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           STALE_REF_HOURS: ${{ vars.STALE_REF_HOURS || '3.5' }}
           BARE_REF_MINUTES: ${{ vars.BARE_REF_MINUTES || '15' }}
         run: node .github/scripts/agent-board/claim-todo.mjs
@@ -158,7 +197,7 @@ jobs:
       - name: Restore salvaged session
         if: steps.claim.outputs.salvage_run_id != '' && steps.claim.outputs.session_artifact != ''
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           SALVAGE_RUN_ID: ${{ steps.claim.outputs.salvage_run_id }}
           ARTIFACT: ${{ steps.claim.outputs.session_artifact }}
           SESSION_ID: ${{ steps.claim.outputs.session_id }}
@@ -256,10 +295,10 @@ jobs:
           # snapshot from a release on the PRIVATE repo (it holds real seeded
           # employee/budget data). Without a token `gh` cannot read it and this
           # silently does a full cold migration run instead — correct, just slower.
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: pnpm worktree:init --verbose
 
-      # The main event. GH_TOKEN = PAT_TOKEN is the gh identity for the whole
+      # The main event. GH_TOKEN = the resolved pooled PAT is the gh identity for the whole
       # session (board GraphQL reads, PR create, /watch-ci across the fleet
       # orgs). The wrapper owns workspace trust, token-pool selection,
       # mid-run failover, mode detection (claim.json → /solve-issue; ITEM_ARG
@@ -270,7 +309,7 @@ jobs:
         if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: bash .github/scripts/agent-claude-run.sh
 
       # ── Typed verdict pipeline (claim-mode runs only) ─────────────────────
@@ -283,28 +322,28 @@ jobs:
         id: outcome
         if: always() && steps.claim.outputs.claimed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: node .github/scripts/agent-board/parse-verdict.mjs
 
       - name: Finalize merged
         id: finalize
         if: always() && steps.outcome.outputs.verdict == 'MERGED'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: node .github/scripts/agent-board/finalize-merged.mjs
 
       - name: Execute park
         id: park
         if: always() && steps.outcome.outputs.verdict == 'PARK'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: node .github/scripts/agent-board/execute-park.mjs
 
       - name: Execute split
         id: split
         if: always() && steps.outcome.outputs.verdict == 'SPLIT'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: node .github/scripts/agent-board/execute-split.mjs
 
       # Backstop for a run with no executed verdict (failed / cancelled /
@@ -317,7 +356,7 @@ jobs:
         id: salvage
         if: always() && steps.claim.outputs.claimed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           RUN_OUTCOME: ${{ steps.run.outcome }}
           VERDICT: ${{ steps.outcome.outputs.verdict || 'NONE' }}
           EXECUTOR_FAILED: ${{ steps.finalize.outcome == 'failure' || steps.park.outcome == 'failure' || steps.split.outcome == 'failure' }}
@@ -336,7 +375,7 @@ jobs:
       - name: Reconcile parent issues
         if: always()
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: node .github/scripts/agent-board/reconcile-parents.mjs
 
       # PUBLIC artifact (this is a public repo) — accepted trade-off. The next
@@ -350,19 +389,28 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
-      # Legacy terminal-state backstop for WRAPPER runs (manual `item`) — the
-      # session does its own claim + board writes there, so the scripted
-      # salvage above can't cover it. A genuine terminal state is the final
-      # run-summary block the agent PRINTS as assistant TEXT — a concrete
-      # `Result:` line. A whole-file grep false-positives: the loaded command
-      # doc (user/system event) and the agent's own ScheduleWakeup nudge
-      # prompts (tool_use inputs) both quote every marker phrase as a template
-      # (run 29742534515 mis-cleared exactly so). Best-effort, never reds the
-      # job further.
-      - name: Flag stranded item (wrapper runs)
+      # Terminal-state backstop for WRAPPER runs (manual `item`) — the session
+      # does its own claim + board writes there, so the scripted `Salvage or
+      # revert` above is SKIPPED (no claim.json, no claim outputs) and this is
+      # the only thing standing between a dead wrapper run and a stranded item.
+      # It used to merely COMMENT "may be stranded", leaving the item In
+      # Progress + assigned — invisible to the claim sweep, which wants Todo +
+      # unassigned — until agent-loop's stranded pass noticed hours later. It
+      # now RELEASES it (unassign + board → Todo, via release-claim.mjs) so
+      # every path out of this workflow hands the item back for the next pick.
+      # Open PRs and claim branches stay put: the next claim resumes the PR and
+      # the stale-ref rule owns a dead branch.
+      #
+      # A genuine terminal state is the final run-summary block the agent PRINTS
+      # as assistant TEXT — a concrete `Result:` line. A whole-file grep
+      # false-positives: the loaded command doc (user/system event) and the
+      # agent's own ScheduleWakeup nudge prompts (tool_use inputs) both quote
+      # every marker phrase as a template (run 29742534515 mis-cleared exactly
+      # so). Best-effort, never reds the job further.
+      - name: Release stranded item (wrapper runs)
         if: always() && env.ITEM_ARG != ''
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set +e
@@ -380,10 +428,7 @@ jobs:
             echo "::warning::run ended non-terminal after a claim, but the claimed issue number could not be parsed — check the transcript"
             exit 0
           fi
-          gh issue comment "$ISSUE" --repo "$PRIVATE_REPO" --body \
-            "⚠️ CI agent run ended without reaching a terminal state — this item may be stranded In Progress with a live claim branch. Run: $RUN_URL (see .claude/commands/clear-todo-issue.md § Claim the item)." \
-            && echo "✓ flagged possibly-stranded issue #$ISSUE" \
-            || echo "::warning::could not comment on issue #$ISSUE"
+          RELEASE_ISSUE="$ISSUE" node .github/scripts/agent-board/release-claim.mjs
           exit 0
 
       # PUBLIC artifact (this is a public repo) — accepted trade-off.
@@ -437,7 +482,7 @@ jobs:
       - name: Notify Telegram on failure
         if: failure()
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
@@ -498,7 +543,7 @@ jobs:
           steps.park.outcome != 'failure' &&
           steps.split.outcome != 'failure'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
         run: |
           set +e

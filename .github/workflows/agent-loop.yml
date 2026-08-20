@@ -44,7 +44,7 @@ name: Agent · loop
 #
 # Hardening: triggers are repository_dispatch + workflow_dispatch ONLY (ppap
 # public-repo rule). repository_dispatch requires a write-capable token, i.e.
-# PAT_TOKEN holders. All dispatches BY this workflow use PAT_TOKEN too —
+# pool holders. All dispatches BY this workflow use a pooled PAT too —
 # GITHUB_TOKEN-created events do not trigger workflows (same footgun class as
 # release.yml's `gh release create`).
 
@@ -137,13 +137,52 @@ jobs:
       CAP_VAR: ${{ vars.AGENT_MAX_PARALLEL || '' }}
       TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
     steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
       - name: Resolve cap
         id: cap
         env:
           # Reading/writing the sticky-override repo variable needs a token with
-          # Actions Variables write — the classic PAT_TOKEN (repo scope), not the
+          # Actions Variables write — a classic pooled PAT (repo scope), not the
           # read-all GITHUB_TOKEN.
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -euo pipefail
           NOW=$(date +%s)
@@ -162,7 +201,7 @@ jobs:
                || gh api --method POST "$VAR_API" -f name=AGENT_CAP_OVERRIDE -f value="$val" >/dev/null 2>&1; then
               echo "::notice::remembered cap=$1 for 24h (expires epoch $exp)"
             else
-              echo "::warning::could not persist cap override (PAT_TOKEN missing Actions Variables write?) — applies to this run only"
+              echo "::warning::could not persist cap override (pooled PAT missing Actions Variables write?) — applies to this run only"
             fi
           }
           forget() { gh api --method DELETE "$VAR_API/AGENT_CAP_OVERRIDE" >/dev/null 2>&1 || true; }
@@ -208,15 +247,21 @@ jobs:
       # count). Still racy vs in-flight sibling lanes by design: the atomic
       # claim stays the authority; a raced candidate costs one cheap
       # backlog-empty run.
+
+      # NOT gated on the cap: the stranded sweep below must tick even while the
+      # kill switch (AGENT_MAX_PARALLEL=0) holds dispatch at zero — otherwise a
+      # switch flip while a lane was mid-item leaves that item assigned + In
+      # Progress with nothing left to release it.
       - name: Checkout board scripts (sparse)
-        if: steps.cap.outputs.proceed == 'true'
         uses: actions/checkout@v7
         with:
           repository: NamThuanVn/erp-namthuan
           ref: main
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ env.RESOLVED_PAT }}
           fetch-depth: 1
-          sparse-checkout: .github/scripts/agent-board
+          # `.github/scripts` (not just agent-board): the "Resolve PAT pool
+          # logins" step below runs .github/scripts/pat-pool.sh from here.
+          sparse-checkout: .github/scripts
           persist-credentials: false
 
       # Stranded-claim sweep — release items whose backing run is provably dead
@@ -225,20 +270,38 @@ jobs:
       # runner reclaim skips the in-job salvage-or-revert (always() does not
       # survive a runner shutdown), stranding the item; this is the decoupled
       # backstop. Runs BEFORE the count so a released item is a candidate this
-      # same tick. Best-effort, never reds the controller.
-      - name: Reclaim stranded items
-        if: steps.cap.outputs.proceed == 'true'
+      # same tick, and BEFORE the cap gate so the kill switch can't suspend
+      # board hygiene. Best-effort, never reds the controller.
+      # Every login in the PAT pool, so the sweep below can see a claim held by
+      # ANY pooled account — not just the one this tick authenticated as. Without
+      # it, a pool silently breaks the sweep: lane A claims as account X, the
+      # controller runs as Y, and X's stranded items are never released.
+      # Best-effort: on failure AGENT_LOGINS stays empty and the sweep falls back
+      # to its own login (single-PAT behaviour).
+      - name: Resolve PAT pool logins
+        id: logins
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          L=$(bash .github/scripts/pat-pool.sh --logins || true)
+          echo "AGENT_LOGINS=$L" >> "$GITHUB_ENV"
+          echo "claim owners: ${L:-<none — sweep uses its own login>}"
+
+      - name: Reclaim stranded items
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           STRANDED_HOURS: ${{ vars.STRANDED_HOURS || '6' }}
+          AGENT_LOGINS: ${{ env.AGENT_LOGINS }}
         run: node .github/scripts/agent-board/reclaim-stranded.mjs
 
       - name: Count claimable candidates
         id: count
         if: steps.cap.outputs.proceed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           COUNT_ONLY: '1'
         run: node .github/scripts/agent-board/claim-todo.mjs
 
@@ -277,7 +340,7 @@ jobs:
         id: relplan
         if: steps.probe.outputs.proceed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
         run: |
           set -euo pipefail
@@ -302,9 +365,9 @@ jobs:
         env:
           # Same-repo Actions reads: GITHUB_TOKEN suffices (read-all).
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Dispatch writes MUST use PAT_TOKEN (GITHUB_TOKEN events don't
+          # Dispatch writes MUST use a pooled PAT (GITHUB_TOKEN events don't
           # trigger workflows).
-          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          POOL_PAT: ${{ env.RESOLVED_PAT }}
           CAP: ${{ steps.cap.outputs.cap }}
           CANDIDATES: ${{ steps.probe.outputs.candidates }}
         run: |
@@ -350,7 +413,7 @@ jobs:
             # -F: it would send a real JSON boolean and the consumer's
             # `client_payload.loop == 'true'` gate would silently stop
             # matching.
-            GH_TOKEN="$PAT_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
+            GH_TOKEN="$POOL_PAT" gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
               -f event_type=agent-todo \
               -f client_payload[item]="" \
               -f client_payload[loop]="true" \
