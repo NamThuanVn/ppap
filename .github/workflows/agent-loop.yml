@@ -295,6 +295,7 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           STRANDED_HOURS: ${{ vars.STRANDED_HOURS || '6' }}
           AGENT_LOGINS: ${{ env.AGENT_LOGINS }}
+          FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
         run: node .github/scripts/agent-board/reclaim-stranded.mjs
 
       - name: Count claimable candidates
@@ -303,6 +304,10 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           COUNT_ONLY: '1'
+          # In scope even though COUNT_ONLY never touches the fork: every step
+          # that runs a board script passes it, so nothing depends on which code
+          # path happens to avoid it. scripts/check-agent-board-env.mjs enforces.
+          FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
         run: node .github/scripts/agent-board/claim-todo.mjs
 
       - name: Probe private-repo backlog (exact eligibility)
