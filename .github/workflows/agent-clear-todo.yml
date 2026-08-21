@@ -455,7 +455,14 @@ jobs:
       - name: Archive finished BA items
         if: always()
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          # The pooled PAT, like every other step in this job. This used to read
+          # `secrets.PAT_TOKEN`, which `scripts/set-pat-pool.sh --purge-legacy`
+          # deleted from all 8 stores when the pool replaced it — so the token
+          # was EMPTY, the clone of a private repo failed auth, and the `|| exit 0`
+          # below swallowed it. The sweep was silently dead on every agent run
+          # (see run 32451123149: "ba-archive: clone failed"), which is why 24
+          # finished items had to be archived by hand in #2687.
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -uo pipefail
           WORK="${RUNNER_TEMP}/ba-archive"

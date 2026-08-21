@@ -146,7 +146,7 @@ jobs:
       # Demo/test fixtures must never ship as a schema migration under
       # apis/*/migrations/ — they apply to Staging AND Production with no
       # environment filter (this has recurred twice; see
-      # docs/ba/scnpms/bugs/cross-module/2026-08-04-demo-fixture-data-live-in-staging-and-production.md).
+      # docs/ba/4-archive/scnpms/bugs/cross-module/2026-08-04-demo-fixture-data-live-in-staging-and-production.md).
       # Diff-scoped to files ADDED by this PR (HEAD^1 = the base parent on
       # refs/pull/N/merge, same convention as scripts/e2e-plan.sh) — the 22
       # already-shipped demo migrations stay in place and must not retrigger.
@@ -195,6 +195,27 @@ jobs:
       # reasoning as test:hooks above, same reason it runs in CI rather than
       # pre-commit.
       - run: pnpm test:scripts
+
+      # The BA tree's ~2,700 relative links, its `status:` vocabulary and its
+      # channel READMEs had NO gate at all — `ba:check-links` existed and ran on
+      # precisely zero triggers, local or CI. It fails on a status outside the
+      # seven-word vocabulary (a value in neither set neither mints nor archives:
+      # `status: open` hid a critical data-loss report for 26 days), on a channel
+      # folder with no README (git does not track empty dirs, so the channel
+      # vanishes), on a finished item still sitting in 1-projects/, and on any
+      # link a move broke. It also asserts the sweep can still SEE the tree —
+      # point it one level off and every other check passes vacuously.
+      #
+      # Seconds, filesystem-only, no network. Not in pre-commit: docs PRs go
+      # through /ship-docs, which deliberately runs nothing.
+      - run: pnpm ba:check-links
+
+      # The BA hubs carry generated inventory blocks — every use case's stories,
+      # shipped packages and bugs in one note. They are generated because the
+      # hand-maintained predecessor rotted: story-index.md read `Draft` for all
+      # twelve use cases while UC-08, UC-09 and UC-10 had shipped, and had no
+      # task or bug column at all. This fails if a block is stale.
+      - run: node scripts/ba-spine.mjs --check
 
       # terraform/ used to be executed for the FIRST time at deploy, inside the
       # deploy job's `terraform apply`. A bad module reference or undeclared
