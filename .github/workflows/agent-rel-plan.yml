@@ -74,13 +74,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # Harness state outside the checkout — same reason as agent-clear-todo.yml:
-      # the agent works in the repo and sweeps untracked files it does not
-      # recognise. See agent-claude-run.sh's STATE_DIR.
-      AGENT_STATE_DIR: ${{ runner.temp }}/agent-state
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
     steps:
+      # AGENT_STATE_DIR must be set HERE, not in the job-level `env:` block.
+      # `runner` is not an available context for `jobs.<id>.env` — only from
+      # step level onward — so `AGENT_STATE_DIR: ${{ runner.temp }}/…` up there
+      # does not merely evaluate to empty, it makes GitHub reject the WHOLE
+      # workflow file. Both agent workflows were invalid from 2026-08-21 03:16
+      # until this fix: every sync push failed in 0s with "workflow file issue",
+      # every dispatched lane silently created no run, and the loop spun on the
+      # rel-planning gate for two hours with 6 claimable items on the board.
+      # $RUNNER_TEMP is a plain env var inside `run:`, always available.
+      - name: Pin the harness state dir
+        run: |
+          set -euo pipefail
+          echo "AGENT_STATE_DIR=${RUNNER_TEMP}/agent-state" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/agent-state"
+          echo "· harness state dir: ${RUNNER_TEMP}/agent-state (outside the checkout)"
+
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
       # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
       # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
