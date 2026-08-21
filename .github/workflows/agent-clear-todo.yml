@@ -106,6 +106,16 @@ jobs:
     env:
       # Both repository_dispatch client_payload values and workflow_dispatch
       # inputs arrive as strings; either side may be absent per trigger.
+      # The harness's own run state — claim.json, solve-verdict.json,
+      # agent-transcript.jsonl, agent-result.json, session-meta.json — lives
+      # HERE, deliberately outside the checkout. It used to sit untracked at the
+      # repo root, i.e. inside the blast radius of the agent working in that
+      # repo: run 32437118850's session ran `rm -f .../agent-transcript.jsonl
+      # .../claim.json` as "clean up untracked scratch files left from claim
+      # tooling" — which is exactly what keep-upstream-clean asks of it. A valid
+      # ABANDONED verdict went with them and the job exited 65. Read by
+      # agent-claude-run.sh (STATE_DIR) and agent-board/lib.mjs (statePath).
+      AGENT_STATE_DIR: ${{ runner.temp }}/agent-state
       ITEM_ARG: ${{ github.event.client_payload.item || inputs.item || '' }}
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
@@ -177,6 +187,20 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -euo pipefail
+          # Fail LOUDLY on a bad fork. `set -e` alone exits 1 with no ::error::,
+          # and every lane the controller dispatches then dies the same silent
+          # death: on 2026-08-20 a stale AGENT_FORK_REPO
+          # (itdevnamthuan/erp-namthuan) killed 18 runs between 08:10 and 09:20
+          # with nothing in the log but "Process completed with exit code 1".
+          # This is pre-claim, so nothing strands — but the loop keeps paying.
+          [ -n "${FORK_REPO:-}" ] || {
+            echo "::error::AGENT_FORK_REPO is unset on this repo — set it to the shared agent fork (see .claude/ppap.md § Agent runs)"
+            exit 1
+          }
+          gh repo view "$FORK_REPO" --json name >/dev/null 2>&1 || {
+            echo "::error::AGENT_FORK_REPO='${FORK_REPO}' is not reachable with this token — the fork was renamed/deleted, or the pooled account lost access. Every agent lane fails here until it is fixed (ppap vars → AGENT_FORK_REPO)."
+            exit 1
+          }
           git remote rename origin upstream
           git remote add origin "https://github.com/${FORK_REPO}.git"
           gh repo sync "$FORK_REPO" -b main
@@ -216,19 +240,22 @@ jobs:
           SESSION_ID: ${{ steps.claim.outputs.session_id }}
         run: |
           set +e
+          # Unpacked under AGENT_STATE_DIR, not the checkout: the agent runs
+          # after this step and sweeps untracked paths it doesn't recognise.
+          RESTORE="${AGENT_STATE_DIR}/claude-session-restore"
           gh run download "$SALVAGE_RUN_ID" --repo "${GITHUB_REPOSITORY}" \
-            -n "$ARTIFACT" -D claude-session-restore
-          if [ ! -s "claude-session-restore/${SESSION_ID}.jsonl" ]; then
+            -n "$ARTIFACT" -D "$RESTORE"
+          if [ ! -s "${RESTORE}/${SESSION_ID}.jsonl" ]; then
             echo "::notice::session artifact unavailable/expired — fresh start from the salvage branch"
             exit 0
           fi
-          PROJECT_DIR=$(node -e "console.log(JSON.parse(require('fs').readFileSync('claude-session-restore/session-meta.json','utf8')).project_dir || '')" 2>/dev/null)
+          PROJECT_DIR=$(RESTORE="$RESTORE" node -e "console.log(JSON.parse(require('fs').readFileSync(process.env.RESTORE + '/session-meta.json','utf8')).project_dir || '')" 2>/dev/null)
           if [ -z "$PROJECT_DIR" ]; then
             echo "::notice::no project_dir in session-meta — fresh start"
             exit 0
           fi
           mkdir -p "$HOME/.claude/projects/$PROJECT_DIR"
-          cp "claude-session-restore/${SESSION_ID}.jsonl" "$HOME/.claude/projects/$PROJECT_DIR/"
+          cp "${RESTORE}/${SESSION_ID}.jsonl" "$HOME/.claude/projects/$PROJECT_DIR/"
           echo "RESUME_SESSION_ID=$SESSION_ID" >> "$GITHUB_ENV"
           echo "✓ session $SESSION_ID restored for resume"
           exit 0
@@ -440,15 +467,16 @@ jobs:
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set +e
-          [ -s agent-transcript.jsonl ] || exit 0
-          grep -q 'claimed + branch' agent-transcript.jsonl || exit 0
+          TR="${AGENT_STATE_DIR}/agent-transcript.jsonl"
+          [ -s "$TR" ] || exit 0
+          grep -q 'claimed + branch' "$TR" || exit 0
           if jq -rR 'fromjson? | select(.type=="assistant") | .message.content[]?
-                       | select(.type=="text") | .text' agent-transcript.jsonl 2>/dev/null \
+                       | select(.type=="text") | .text' "$TR" 2>/dev/null \
                | grep -qE '^Result: +(merged PR #[0-9]+|parked to Pending|split into [0-9]+ slices|abandoned \(already covered\)|BACKLOG EMPTY)'; then
             echo "terminal checkpoint found — nothing stranded"
             exit 0
           fi
-          ISSUE=$(grep -a -- '--add-assignee' agent-transcript.jsonl \
+          ISSUE=$(grep -a -- '--add-assignee' "$TR" \
             | grep -oE 'gh issue edit [0-9]+' | grep -oE '[0-9]+' | head -1)
           if [ -z "$ISSUE" ]; then
             echo "::warning::run ended non-terminal after a claim, but the claimed issue number could not be parsed — check the transcript"
@@ -464,11 +492,11 @@ jobs:
         with:
           name: agent-transcript
           path: |
-            agent-transcript.jsonl
-            agent-result.json
-            claim.json
-            solve-verdict.json
-            session-meta.json
+            ${{ runner.temp }}/agent-state/agent-transcript.jsonl
+            ${{ runner.temp }}/agent-state/agent-result.json
+            ${{ runner.temp }}/agent-state/claim.json
+            ${{ runner.temp }}/agent-state/solve-verdict.json
+            ${{ runner.temp }}/agent-state/session-meta.json
           retention-days: 7
           if-no-files-found: ignore
 
@@ -479,23 +507,23 @@ jobs:
           {
             echo "### Agent — one iteration"
             echo ""
-            if [ -s claim.json ]; then
-              echo "- **Claim:** $(jq -r 'if .claimed then "#\(.issue) \(.kind) → \(.branch)" else "none (\(.reason))" end' claim.json)"
+            if [ -s "${AGENT_STATE_DIR}/claim.json" ]; then
+              echo "- **Claim:** $(jq -r 'if .claimed then "#\(.issue) \(.kind) → \(.branch)" else "none (\(.reason))" end' "${AGENT_STATE_DIR}/claim.json")"
             elif [ -n "${ITEM_ARG:-}" ]; then
               echo "- **Mode:** legacy wrapper — item \`${ITEM_ARG}\`"
             fi
-            if [ -s solve-verdict.json ]; then
-              echo "- **Verdict:** $(jq -r '.verdict + (if .data.pr then " (PR #\(.data.pr))" else "" end)' solve-verdict.json)"
+            if [ -s "${AGENT_STATE_DIR}/solve-verdict.json" ]; then
+              echo "- **Verdict:** $(jq -r '.verdict + (if .data.pr then " (PR #\(.data.pr))" else "" end)' "${AGENT_STATE_DIR}/solve-verdict.json")"
             fi
             echo "- **Salvaged:** ${{ steps.salvage.outputs.salvaged || 'n/a' }}"
             echo ""
-            if [ -s agent-result.json ]; then
-              SUBTYPE=$(jq -r '.subtype // "n/a"' agent-result.json)
-              TURNS=$(jq -r '.num_turns // "n/a"' agent-result.json)
+            if [ -s "${AGENT_STATE_DIR}/agent-result.json" ]; then
+              SUBTYPE=$(jq -r '.subtype // "n/a"' "${AGENT_STATE_DIR}/agent-result.json")
+              TURNS=$(jq -r '.num_turns // "n/a"' "${AGENT_STATE_DIR}/agent-result.json")
               echo "- **Result subtype:** \`$SUBTYPE\` · **turns:** $TURNS"
               echo ""
               echo '```'
-              jq -r '.result // "<no result text>"' agent-result.json | tail -40
+              jq -r '.result // "<no result text>"' "${AGENT_STATE_DIR}/agent-result.json" | tail -40
               echo '```'
             else
               echo "_no result event captured (see transcript artifact)_"
@@ -519,8 +547,8 @@ jobs:
           # closed = its PR merged — e.g. an async auto-merge that landed after
           # the agent's turn, or a premature-verdict finalize refusal), the run
           # "failed" but the work is done. Don't page for it.
-          if [ -s claim.json ]; then
-            ISSUE=$(jq -r '.issue // empty' claim.json 2>/dev/null || true)
+          if [ -s "${AGENT_STATE_DIR}/claim.json" ]; then
+            ISSUE=$(jq -r '.issue // empty' "${AGENT_STATE_DIR}/claim.json" 2>/dev/null || true)
             if [ -n "${ISSUE:-}" ] && \
                [ "$(gh issue view "$ISSUE" --repo "$PRIVATE_REPO" --json state --jq .state 2>/dev/null)" = "CLOSED" ]; then
               echo "::notice::claimed #$ISSUE is CLOSED (work shipped) — suppressing false-failure alert"

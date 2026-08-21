@@ -74,6 +74,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
+      # Harness state outside the checkout — same reason as agent-clear-todo.yml:
+      # the agent works in the repo and sweeps untracked files it does not
+      # recognise. See agent-claude-run.sh's STATE_DIR.
+      AGENT_STATE_DIR: ${{ runner.temp }}/agent-state
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
     steps:
@@ -219,8 +223,8 @@ jobs:
         with:
           name: rel-plan-transcript
           path: |
-            agent-transcript.jsonl
-            agent-result.json
+            ${{ runner.temp }}/agent-state/agent-transcript.jsonl
+            ${{ runner.temp }}/agent-state/agent-result.json
           retention-days: 7
           if-no-files-found: ignore
 
@@ -232,10 +236,10 @@ jobs:
             echo "### Rel-plan — one planning pass"
             echo ""
             echo "- **Unplanned at start:** ${{ steps.sweep.outputs.unplanned || 'n/a' }}"
-            if [ -s agent-result.json ]; then
+            if [ -s "${AGENT_STATE_DIR}/agent-result.json" ]; then
               echo ""
               echo '```'
-              jq -r '.result // "<no result text>"' agent-result.json | tail -20
+              jq -r '.result // "<no result text>"' "${AGENT_STATE_DIR}/agent-result.json" | tail -20
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
