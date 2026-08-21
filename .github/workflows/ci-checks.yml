@@ -146,7 +146,7 @@ jobs:
       # Demo/test fixtures must never ship as a schema migration under
       # apis/*/migrations/ — they apply to Staging AND Production with no
       # environment filter (this has recurred twice; see
-      # docs/ba/scnpms/bug/cross-module/2026-08-04-demo-fixture-data-live-in-staging-and-production.md).
+      # docs/ba/scnpms/bugs/cross-module/2026-08-04-demo-fixture-data-live-in-staging-and-production.md).
       # Diff-scoped to files ADDED by this PR (HEAD^1 = the base parent on
       # refs/pull/N/merge, same convention as scripts/e2e-plan.sh) — the 22
       # already-shipped demo migrations stay in place and must not retrigger.
@@ -186,6 +186,15 @@ jobs:
       # see the same uncommitted+untracked scope here as they do locally. (This
       # job checks out fetch-depth 0 anyway, for the demo-migration guard.)
       - run: pnpm test:hooks
+
+      # .github/scripts/** is the BA intake + agent-board machinery. It is not a
+      # pnpm workspace, so `test:changed` never reaches it — yet a silent
+      # mistake there is expensive in both directions: a path regex that stops
+      # matching mints NOTHING and the run still reports success, and a dedup key
+      # that stops matching mints a DUPLICATE of work already tracked. Same
+      # reasoning as test:hooks above, same reason it runs in CI rather than
+      # pre-commit.
+      - run: pnpm test:scripts
 
       # terraform/ used to be executed for the FIRST time at deploy, inside the
       # deploy job's `terraform apply`. A bad module reference or undeclared

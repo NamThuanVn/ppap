@@ -162,7 +162,7 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -euo pipefail
-          UNPLANNED=$(for L in ba-bug ba-change ba-feature; do
+          UNPLANNED=$(for L in ba-bug ba-task ba-change ba-feature; do
             gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
               --json number,body,labels --limit 200 \
               --jq '.[] | select(.body | test("<!--\\s*ba-(bugs|change-packages|features)-batch:") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
@@ -205,7 +205,7 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -euo pipefail
-          LEFT=$(for L in ba-bug ba-change ba-feature; do
+          LEFT=$(for L in ba-bug ba-task ba-change ba-feature; do
             gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
               --json number,body,labels --limit 200 \
               --jq '.[] | select(.body | test("<!--\\s*ba-(bugs|change-packages|features)-batch:") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'

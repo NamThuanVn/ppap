@@ -431,6 +431,50 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: node .github/scripts/agent-board/reconcile-parents.mjs
 
+      # Last thing the run does: sweep every finished BA item out of the active
+      # tree into docs/ba/archive/. An IDEMPOTENT sweep, not a move of "the item
+      # this run cleared" — a crashed or parked run leaves nothing behind,
+      # because the next run re-scans the whole tree.
+      #
+      # Works from a FRESH clone of main, never the job workspace: by this point
+      # the agent has done arbitrary git ops and is sitting on a feature branch
+      # with a dirty tree.
+      #
+      # Pushes straight to main. `main` carries no branch protection, and a
+      # docs-only push triggers only sync-agent-fork.yml (main-push-dispatch
+      # filters docs/ out, so no deploy; ba-to-issues is pull_request_target, so
+      # a push does not fire it at all). Several lanes run concurrently, hence
+      # rebase-and-retry. Never reds the job — an unswept item is picked up next
+      # run.
+      - name: Archive finished BA items
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -uo pipefail
+          WORK="${RUNNER_TEMP}/ba-archive"
+          rm -rf "$WORK"
+          git clone --quiet --depth=1 --branch main \
+            "https://x-access-token:${GH_TOKEN}@github.com/NamThuanVn/erp-namthuan.git" "$WORK" || {
+              echo "::warning::ba-archive: clone failed — skipping the sweep this run"; exit 0; }
+          cd "$WORK"
+          git config user.name "$(gh api user --jq .login)"
+          git config user.email "$(gh api user --jq .login)@users.noreply.github.com"
+          if ! node scripts/ba-archive.mjs; then
+            echo "::warning::ba-archive: sweep failed — nothing pushed, next run retries"; exit 0
+          fi
+          # No new commit → nothing was finished this round.
+          if git diff --quiet origin/main HEAD; then
+            echo "· nothing to archive"; exit 0
+          fi
+          for attempt in 1 2 3; do
+            if git pull --rebase --quiet origin main && git push --quiet origin HEAD:main; then
+              echo "✓ archived and pushed to main (attempt $attempt)"; exit 0
+            fi
+            echo "· push raced another lane — retrying ($attempt/3)"; sleep 5
+          done
+          echo "::warning::ba-archive: could not push after 3 attempts — next run retries"
+
       # PUBLIC artifact (this is a public repo) — accepted trade-off. The next
       # claim of the same issue downloads it to resume the session.
       - name: Upload Claude session (salvage)

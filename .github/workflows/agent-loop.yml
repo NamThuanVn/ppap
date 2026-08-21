@@ -10,7 +10,7 @@ name: Agent · loop
 #   · manually — workflow_dispatch on this workflow (gh workflow run
 #     agent-loop.yml -R NamThuanVn/ppap);
 #   · by ba-to-issues.yml in the private repo after a merged BA-docs PR minted
-#     at least one sweepable (ba-bug/ba-change) issue;
+#     at least one sweepable (ba-bug/ba-task) issue;
 #   · by each agent run that EXECUTED a solve-verdict (MERGED / PARK / SPLIT /
 #     ABANDONED with green executor steps) — the "Continue loop" step in
 #     agent-clear-todo.yml chains the next lane immediately (lowest latency);
@@ -349,7 +349,7 @@ jobs:
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
         run: |
           set -euo pipefail
-          UNPLANNED=$(for L in ba-bug ba-change ba-feature; do
+          UNPLANNED=$(for L in ba-bug ba-task ba-change ba-feature; do
             gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
               --json number,body,labels --limit 200 \
               --jq '.[] | select(.body | test("<!--\\s*ba-(bugs|change-packages|features)-batch:") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
