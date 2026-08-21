@@ -16,7 +16,10 @@ name: Agent · clear-todo-issue
 #      confirmed-merged PR, or emits a typed solve-verdict block. ZERO board
 #      writes inside the session.
 #   3. EXECUTORS (typed on the parsed verdict): finalize-merged / execute-park /
-#      execute-split mutate the board; salvage-or-revert is the backstop for a
+#      execute-split / execute-abandoned mutate the board — every verdict has
+#      one, and each lands the item in a TERMINAL column (Done or Pending), so
+#      no verdict can return it to Todo to be re-claimed and re-decided;
+#      salvage-or-revert is the backstop for a
 #      run that died without a verdict — it preserves WIP on a
 #      salvage/<issue>-<run_id> branch + draft PR + Claude-session artifact,
 #      then releases the item back to Todo (the next claim resumes it).
@@ -356,6 +359,19 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: node .github/scripts/agent-board/execute-split.mjs
 
+      # ABANDONED is a TERMINAL verdict and needs an executor like the other
+      # three: without one the run exited success with the item still In
+      # Progress + assigned, the stranded sweep pushed it back to Todo ~30 min
+      # later, the next lane re-claimed it and abandoned again — #2565 spun
+      # NINE green runs on that circuit. The executor lands it in Done (covering
+      # PR merged) or Pending (covering PR open / unverifiable), never Todo.
+      - name: Execute abandoned
+        id: abandoned
+        if: always() && steps.outcome.outputs.verdict == 'ABANDONED'
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node .github/scripts/agent-board/execute-abandoned.mjs
+
       # Backstop for a run with no executed verdict (failed / cancelled /
       # timed out / verdict=NONE): preserve WIP on salvage/<issue>-<run_id> +
       # draft PR (Refs, never Closes) + session artifact, then release the
@@ -369,7 +385,7 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           RUN_OUTCOME: ${{ steps.run.outcome }}
           VERDICT: ${{ steps.outcome.outputs.verdict || 'NONE' }}
-          EXECUTOR_FAILED: ${{ steps.finalize.outcome == 'failure' || steps.park.outcome == 'failure' || steps.split.outcome == 'failure' }}
+          EXECUTOR_FAILED: ${{ steps.finalize.outcome == 'failure' || steps.park.outcome == 'failure' || steps.split.outcome == 'failure' || steps.abandoned.outcome == 'failure' }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           STALE_REF_HOURS: ${{ vars.STALE_REF_HOURS || '3.5' }}
         run: node .github/scripts/agent-board/salvage-or-revert.mjs
@@ -551,7 +567,8 @@ jobs:
           steps.outcome.outputs.verdict != 'NONE' &&
           steps.finalize.outcome != 'failure' &&
           steps.park.outcome != 'failure' &&
-          steps.split.outcome != 'failure'
+          steps.split.outcome != 'failure' &&
+          steps.abandoned.outcome != 'failure'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
