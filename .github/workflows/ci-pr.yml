@@ -10,7 +10,7 @@ name: CI · PR · Lint · Typecheck · Test · E2E
 # Uses a pooled PAT (same pool as deploy/sync, ppap-side copy). It must have
 # Checks:R/W on erp-namthuan so the `report` job can PATCH the Check Run.
 # Note: this collapses the fork-safety boundary that a separate CI_PAT
-# would have provided — see the trade-off note in .claude/ppap.md § PAT_TOKEN_POOL.
+# would have provided — see the trade-off note in docs/engineering/platform/ppap.md § PAT_TOKEN_POOL.
 
 run-name: "${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('CI · PR #{0} · {1}', github.event.client_payload.pr_number || inputs.pr_number, github.event.client_payload.title || 'manual rerun') || 'CI · manual · main' }}"
 
@@ -75,7 +75,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -200,7 +200,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"

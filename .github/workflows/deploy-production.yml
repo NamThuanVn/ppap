@@ -3,7 +3,7 @@ name: Deploy · Production
 # Triggered cross-repo from NamThuanVn/erp-namthuan when `release.yml` cuts a
 # new release. `workflow_dispatch` requires typing PRODUCTION into the confirm
 # input as a tripwire against fat-fingered clicks. All deploy logic lives in
-# deploy.yml (reusable workflow_call). See .claude/ppap.md for the architecture.
+# deploy.yml (reusable workflow_call). See docs/engineering/platform/ppap.md for the architecture.
 run-name: "${{ github.event.client_payload.title || format('Deploy Production — triggered by @{0} ({1})', inputs.triggered_by || github.actor, inputs.tag) }}"
 
 on:

@@ -13,7 +13,7 @@ name: DB · Publish local D1 snapshot
 # the snapshot always corresponds to a tagged release, and between releases it
 # goes stale by design: restore-then-apply replays whatever migrations landed
 # since, which is correct, just progressively less of a speedup.
-# See .claude/ppap.md § DB snapshot.
+# See docs/engineering/platform/ppap.md § DB snapshot.
 #
 # WHY a release asset and not a commit back into erp-namthuan: the state is
 # ~10MB (~3MB gzipped) and migrations are touched ~2.4x/day. Git keeps every
@@ -21,7 +21,7 @@ name: DB · Publish local D1 snapshot
 # .git that is ~65MB today — paid by every clone and every worktree. A rolling
 # release asset replaces its previous version and costs the repo nothing. It
 # also avoids pushing to main entirely, so there is no [skip ci] marker to get
-# wrong (see .claude/ppap.md § footguns — skip markers leak through squash-merge
+# wrong (see docs/engineering/platform/ppap.md § footguns — skip markers leak through squash-merge
 # bodies and silently kill the dispatchers).
 #
 # FILENAME: must NOT start with `ci-`. sync-workflows-to-ppap.yml mirrors
@@ -103,7 +103,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"

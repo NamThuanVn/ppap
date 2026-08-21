@@ -3,7 +3,7 @@ name: Deploy · Staging
 # Triggered cross-repo from NamThuanVn/erp-namthuan after CI passes on main.
 # `workflow_dispatch` is the manual escape hatch (smoke tests, hand re-runs).
 # All deploy logic lives in deploy.yml (reusable workflow_call); this file is
-# just the trigger + per-env inputs. See .claude/ppap.md for the architecture.
+# just the trigger + per-env inputs. See docs/engineering/platform/ppap.md for the architecture.
 run-name: "${{ github.event.client_payload.title || format('Deploy Staging — triggered by @{0}', inputs.triggered_by || github.actor) }}"
 
 on:

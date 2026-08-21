@@ -7,7 +7,7 @@ name: Deploy · Reusable
 # everything in parallel (worker bundles + zone OpenNext outputs) → one ordered
 # deploy job that applies Terraform and then uploads the prebuilt artifacts
 # (monitor → leaves → tier-1.5 → gateway → zones → dispatcher) → status
-# pingback. See .claude/ppap.md in the private repo for the full architecture.
+# pingback. See docs/engineering/platform/ppap.md in the private repo for the full architecture.
 #
 # Why build/deploy are split: builds have no inter-worker dependencies — only
 # DEPLOYS must be ordered (a worker's service/tail bindings require the target
@@ -185,7 +185,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -332,7 +332,7 @@ jobs:
   #    Fresh workspace (no state → no outputs at all): fall back to a full apply
   #    here, otherwise the build stage has no VAPID key / credentials to read.
   #    That is the documented production cold-start path (see
-  #    .claude/infrastructure.md § Production cold-start bootstrap); the deploy
+  #    docs/engineering/platform/infrastructure.md § Production cold-start bootstrap); the deploy
   #    job's own apply is then a no-op second pass.
   # ───────────────────────────────────────────────────────────────────────────
   tf-outputs:
@@ -393,7 +393,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -500,7 +500,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -605,7 +605,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -652,7 +652,7 @@ jobs:
           jq -er .vapid_public_key.value /tmp/tf-outputs.json | xargs -I {} echo "public_key={}" >> "$GITHUB_OUTPUT"
 
       # Sentry config — all four optional. Empty values skip the echo so the
-      # SDK initializes with `enabled: false`. See `docs/engineering/sentry.md`.
+      # SDK initializes with `enabled: false`. See `docs/engineering/runbooks/sentry.md`.
       # Every zone shares the one dashboard Sentry project (they are one product).
       - name: Load Sentry config from tf-outputs
         id: sentry
@@ -773,7 +773,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -834,7 +834,7 @@ jobs:
       # Credentials come from the PREVIOUS state's outputs (readable after
       # init, before apply); on a completely fresh workspace there are none,
       # so the step skips and the documented two-pass HCP bootstrap applies
-      # (see .claude/infrastructure.md § Production cold-start bootstrap).
+      # (see docs/engineering/platform/infrastructure.md § Production cold-start bootstrap).
       - name: Bootstrap missing Workers (secrets cold-start)
         working-directory: terraform
         run: |
@@ -902,7 +902,7 @@ jobs:
       # `cloudflare_vectorize_index` (added in v5). Idempotent: first run creates
       # the index + metadata indexes, later runs are no-ops. Must precede the
       # assistant deploy (its binding references the index).
-      # See `.claude/infrastructure.md` § Vectorize bootstrap. Only needed when
+      # See `docs/engineering/platform/infrastructure.md` § Vectorize bootstrap. Only needed when
       # the assistant leaf is being (re)deployed — its binding references the index.
       - name: Bootstrap Vectorize index (idempotent)
         if: ${{ contains(fromJSON(needs.changes.outputs.workers), 'assistant') }}
@@ -1081,7 +1081,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"

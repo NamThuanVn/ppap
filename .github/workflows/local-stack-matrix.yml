@@ -25,7 +25,7 @@ name: Local Stack · macOS / Linux / Windows
 #
 # WHY IT LIVES IN PPAP: macOS runners bill at 10× and Windows at 2× of Linux
 # minutes on a PRIVATE repo. On a PUBLIC ppap repo every OS is free — the same
-# economics that put the rest of CI here (.claude/ppap.md).
+# economics that put the rest of CI here (docs/engineering/platform/ppap.md).
 #
 # WHY NOT NAMED ci-*.yml: sync-workflows-to-ppap.yml mirrors `ci-*.yml` to every
 # repo in PPAP_CI_REPOS. This is not a per-PR gate and must not eat a fleet
@@ -45,7 +45,7 @@ name: Local Stack · macOS / Linux / Windows
 # refs/pull/<N>/merge. Three verification runs died at `actions/checkout` that
 # way — one 20s after dispatch, the PR having merged between dispatch and
 # checkout — skipping every real step while looking like a genuine failure.
-# Land the fix, then verify against main. See .claude/ppap.md § Local-stack matrix.
+# Land the fix, then verify against main. See docs/engineering/platform/ppap.md § Local-stack matrix.
 
 on:
   workflow_dispatch:
@@ -160,7 +160,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see .claude/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -212,7 +212,7 @@ jobs:
 
       # uv backs mcp-databases.sh (`uvx mcp-server-sqlite`). Official installer
       # rather than a third-party action: the ppap repos run an allowed-actions
-      # policy (.claude/ppap.md § Public-repo security hardening), so adding an
+      # policy (docs/engineering/platform/ppap.md § Public-repo security hardening), so adding an
       # action would need a policy change; a script needs none. Same command the
       # script itself prints when uv is missing.
       - name: Install uv
@@ -361,7 +361,7 @@ jobs:
           # scripts/serve-monolith.sh, which already runs on Git Bash) so a dead
           # boot fails in seconds instead of burning the whole deadline.
           # 127.0.0.1, not localhost: the proxy binds dual-stack, but pinning
-          # IPv4 removes the ::1-first resolution flake (.claude/testing.md).
+          # IPv4 removes the ::1-first resolution flake (docs/engineering/platform/testing.md).
           probe() {
             url="$1"; deadline="$2"; label="$3"; waited=0; code=""
             while [ "$waited" -lt "$deadline" ]; do
