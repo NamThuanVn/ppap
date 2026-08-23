@@ -1,0 +1,328 @@
+name: Agent · ambulance
+
+# Repairs the AGENT HARNESS when the loop has held itself.
+#
+# The lanes are the fleet's workers; this is its ambulance. When a run dies
+# somewhere the ITEM cannot be blamed for — a codegraph cache restore, `pnpm
+# install`, `pnpm worktree:init`, the claim script, an executor — the fault is
+# shared and deterministic: every lane and every item would die at the same step.
+# Before this workflow existed the harness filed that as an item fault, released
+# the untouched item to Todo, and agent-loop's `workflow_run: [completed]`
+# trigger re-probed on the very failure — so the fleet re-spun at bootstrap pace
+# until a human noticed Telegram and flipped AGENT_MAX_PARALLEL=0.
+#
+# Now capture-failure.mjs writes a `harness-broken` hold, the controller stops
+# dispatching lanes, and dispatches ONE of these instead. Fix the problem before
+# continuing the loop.
+#
+# THE PIPELINE (mirrors agent-clear-todo.yml's shape, one layer thinner):
+#   1. Materialise the hold  — vars.AGENT_LOOP_HOLD → $AGENT_STATE_DIR/hold.json,
+#      which is what /repair-harness reads. Refuses to run without one.
+#   2. /repair-harness       — reproduce the fault on this runner, fix the root
+#      cause, prove it by re-running, land it as a merged PR. The harness owns
+#      the PR-CI wait (REPAIR_BRANCH), so the session never polls its own CI.
+#   3. parse-repair-verdict  — the machine contract: exactly one fenced
+#      `json repair-verdict` block; anything off degrades to STUCK, never a step
+#      failure. STUCK is the safe direction — it KEEPS the hold, so a garbled
+#      ambulance cannot hand a broken fleet its lanes back.
+#   4. execute-repair        — REPAIRED (API-verified merge) / TRANSIENT → clear
+#      the hold + re-dispatch agent-loop. STUCK → record the diagnosis; the
+#      controller sends an escalated attempt, or parks at the cap.
+#
+# LIGHT BOOTSTRAP on purpose: checkout, node/pnpm, gh, Claude CLI. No Playwright,
+# no codegraph, no worktree:init — the agent runs the failing command ITSELF,
+# which is the only way it can watch the fault happen and then watch the fix
+# work. `pnpm install` is continue-on-error because install may BE the fault
+# under diagnosis.
+#
+# ATTEMPT BUDGET is spent by the CONTROLLER at dispatch, not here (see
+# loop-gate.mjs claimRepairAttempt). An ambulance can die without a verdict —
+# spot reclaim, timeout, exit 65 — and the controller is re-triggered on exactly
+# those completions plus every heartbeat tick, so counting at verdict time would
+# make the ambulance the new infinite loop. `attempt` in the payload only selects
+# how hard this one tries.
+#
+# Filename is deliberately NOT ci-*.yml → the sync mirrors it to NamThuanVn/ppap
+# only, never to the CI fleet. NOTE the transcript artifact and logs are PUBLIC
+# (accepted trade-off — see docs/engineering/platform/ppap-agent-runs.md).
+
+run-name: 'Agent · ambulance'
+
+on:
+  repository_dispatch:
+    types: [agent-ambulance]
+  workflow_dispatch:
+    inputs:
+      claude_version:
+        description: 'Claude Code CLI version to install (pin; bump deliberately).'
+        required: false
+        default: '2.1.211'
+        type: string
+      model:
+        description: 'Optional --model override. Empty = the account default on attempt 1, and the escalated model from attempt 2 onward.'
+        required: false
+        default: ''
+        type: string
+
+permissions: read-all
+
+# One ambulance at a time. cancel-in-progress stays false: an ambulance mid-fix
+# must never be killed halfway — it could leave a half-pushed branch and an
+# unspent verdict, and the controller would read that as "no repair happened".
+concurrency:
+  group: agent-ambulance
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+  # The shared agent fork — the push target for the repair branch, exactly as it
+  # is for a solve lane. Named ONLY by this repo variable; there is deliberately
+  # no literal fallback (the old baked-in default outlived the account it named).
+  FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+
+jobs:
+  repair:
+    name: Repair harness
+    runs-on: ubuntu-latest
+    # Generous but far short of a lane's 330: reproducing a bootstrap fault and
+    # driving one small PR through CI is the whole job. A repair that cannot get
+    # there in two hours should come back as STUCK with a diagnosis.
+    timeout-minutes: 120
+    env:
+      ATTEMPT: ${{ github.event.client_payload.attempt || '1' }}
+      CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
+    steps:
+      # AGENT_STATE_DIR must be set HERE, not in the job-level `env:` block.
+      # `runner` is not an available context for `jobs.<id>.env` — only from step
+      # level onward — and GitHub does not evaluate it to empty, it REJECTS the
+      # whole workflow file (which on 2026-08-21 made every dispatched lane
+      # create no run at all while the controller kept reporting success).
+      # $RUNNER_TEMP is a plain env var inside `run:`, always available.
+      - name: Pin the harness state dir
+        run: |
+          set -euo pipefail
+          echo "AGENT_STATE_DIR=${RUNNER_TEMP}/agent-state" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/agent-state"
+          echo "· harness state dir: ${RUNNER_TEMP}/agent-state (outside the checkout)"
+
+      # Same inlined pool resolution as the other agent workflows (canonical copy
+      # is .github/scripts/pat-pool.sh — keep them in step). It cannot call that
+      # script here either: the checkout below needs a token first.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      # The checkout is the UPSTREAM repo — always the freshest main, so the
+      # planner reads current BA spec files (the fork's main is only as fresh
+      # as its last sync). The next step rewires remotes into the fork layout
+      # the skill expects for upstream-slug resolution. No fork sync here —
+      # planning creates no claim refs (sync-agent-fork.yml + the solve job's
+      # own freshen keep the fork current).
+      - name: Materialise the hold
+        id: hold
+        env:
+          # Two sources, in priority order. A payload hold is ITEM-scoped: one
+          # cursed issue that failed the same way twice, dispatched by
+          # salvage-or-revert. It travels in the payload rather than the repo
+          # variable on purpose — the fleet is healthy and must keep draining the
+          # backlog, so this repair must not be able to stop lanes. The repo
+          # variable is the FLEET-scoped hold, where lanes really are stopped.
+          PAYLOAD_HOLD: ${{ github.event.client_payload.hold }}
+          LOOP_HOLD: ${{ vars.AGENT_LOOP_HOLD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PAYLOAD_HOLD:-}" ]; then
+            printf '%s\n' "$PAYLOAD_HOLD" | jq . > "${AGENT_STATE_DIR}/hold.json"
+            echo "· hold source: dispatch payload (item-scoped)"
+          elif [ -n "${LOOP_HOLD:-}" ]; then
+            printf '%s\n' "$LOOP_HOLD" | jq . > "${AGENT_STATE_DIR}/hold.json"
+            echo "· hold source: AGENT_LOOP_HOLD (fleet-scoped)"
+          else
+            echo "::error::no hold in the payload and AGENT_LOOP_HOLD is unset — there is no recorded failure to repair, and an ambulance with no fault to reproduce is exactly what this design exists to prevent."
+            exit 1
+          fi
+          FP=$(jq -r '.fingerprint // "unknown"' "${AGENT_STATE_DIR}/hold.json")
+          STEP=$(jq -r '.step // "unknown"' "${AGENT_STATE_DIR}/hold.json")
+          REASON=$(jq -r '.reason // "unknown"' "${AGENT_STATE_DIR}/hold.json")
+          if [ "$REASON" != "harness-broken" ]; then
+            echo "::error::the standing hold is '$REASON', not 'harness-broken' — a timed pool-exhausted hold needs a clock, not a repair"
+            exit 1
+          fi
+          # The repair branch is chosen HERE, not by the session, so the wrapper
+          # can own the PR-CI wait on it (REPAIR_BRANCH → open_pr_for_claim).
+          echo "REPAIR_BRANCH=fix/ambulance-${FP}-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+          echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
+          echo "· repairing fingerprint $FP — died in \"$STEP\" (attempt ${ATTEMPT})"
+
+      # From attempt 2 the same approach has already failed once, so escalate the
+      # reasoning tier rather than re-running an identical session. An explicit
+      # `model` input always wins.
+      - name: Resolve model
+        run: |
+          set -euo pipefail
+          EXPLICIT="${{ github.event.client_payload.model || inputs.model || '' }}"
+          if [ -n "$EXPLICIT" ]; then
+            echo "CLAUDE_MODEL=$EXPLICIT" >> "$GITHUB_ENV"
+            echo "· model: $EXPLICIT (explicit)"
+          elif [ "${ATTEMPT}" -ge 2 ]; then
+            echo "CLAUDE_MODEL=claude-opus-5" >> "$GITHUB_ENV"
+            echo "· model: claude-opus-5 (escalated — attempt ${ATTEMPT})"
+          else
+            echo "· model: account default (attempt 1)"
+          fi
+
+      # UPSTREAM checkout — the freshest main, which is what the fix must apply
+      # to. The fork stays the push target, as it is for a solve lane.
+      - name: Checkout upstream (freshest main)
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up fork layout + identity
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -euo pipefail
+          git remote rename origin upstream
+          git remote add origin "https://github.com/${FORK_REPO}.git"
+          gh auth setup-git
+          gh repo set-default "$FORK_REPO"
+          LOGIN=$(gh api user --jq .login)
+          git config user.name "$LOGIN"
+          git config user.email "${LOGIN}@users.noreply.github.com"
+          echo "✓ workspace on upstream main $(git rev-parse --short HEAD) · acting as @$LOGIN"
+
+      # continue-on-error because the dependency install may BE the fault under
+      # diagnosis — and an ambulance that dies on the very step it was sent to
+      # investigate is useless. node + pnpm are set up by this action before it
+      # installs, so a failed install still leaves the agent a working shell, and
+      # it can install what it needs itself.
+      - name: Install dependencies (best-effort)
+        id: deps
+        continue-on-error: true
+        uses: ./.github/actions/install
+
+      - name: Install Claude Code CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version
+
+      # REPAIR=1 → the wrapper runs `/repair-harness` (MCP stripped — nothing
+      # registered them in this light bootstrap) with the usual token-pool probe,
+      # rotation and mid-run failover, and owns the PR-CI wait on REPAIR_BRANCH.
+      - name: Run ambulance
+        id: run
+        env:
+          REPAIR: '1'
+          CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          DEPS_OUTCOME: ${{ steps.deps.outcome }}
+        run: bash .github/scripts/agent-claude-run.sh
+
+      - name: Parse repair verdict
+        id: verdict
+        if: always()
+        run: node .github/scripts/agent-board/parse-repair-verdict.mjs
+
+      # The only step that touches the hold. Clearing it is what hands the fleet
+      # its lanes back, so it is deliberately deterministic and API-verified
+      # rather than trusted from the session.
+      - name: Execute repair verdict
+        id: execute
+        if: always()
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node .github/scripts/agent-board/execute-repair.mjs
+
+      - name: Upload transcript
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ambulance-${{ steps.hold.outputs.fingerprint || 'unknown' }}-${{ github.run_id }}
+          path: |
+            ${{ env.AGENT_STATE_DIR }}/agent-transcript.jsonl
+            ${{ env.AGENT_STATE_DIR }}/agent-result.json
+            ${{ env.AGENT_STATE_DIR }}/repair-verdict.json
+            ${{ env.AGENT_STATE_DIR }}/hold.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "### Agent · ambulance"
+            echo
+            echo "- fingerprint: \`${{ steps.hold.outputs.fingerprint || 'unknown' }}\`"
+            echo "- attempt: ${ATTEMPT}"
+            echo "- verdict: **${{ steps.verdict.outputs.verdict || 'none' }}**"
+            echo "- outcome: ${{ steps.execute.outputs.outcome || 'n/a' }}"
+            if [ "${{ steps.execute.outputs.parked }}" = "true" ]; then
+              echo "- **the loop is PARKED** — the repair budget is spent and the hold still stands"
+            fi
+            if [ -n "${{ steps.verdict.outputs.pr }}" ]; then
+              echo "- PR: ${{ steps.verdict.outputs.pr }}"
+            fi
+            echo
+            echo "${{ steps.verdict.outputs.diagnosis }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Alert only when the loop is genuinely stuck — the repair budget is gone
+      # and no lane will run again until someone looks. A STUCK attempt with
+      # budget left is not news: the controller sends an escalated ambulance.
+      - name: Notify Telegram when parked
+        if: always() && steps.execute.outputs.parked == 'true'
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FINGERPRINT: ${{ steps.hold.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured — skipping notify."
+            exit 0
+          fi
+          TEXT="🚑🛑 <b>Agent loop PARKED</b> — the harness could not be repaired automatically"
+          TEXT="${TEXT}"$'\n'"fingerprint <code>${FINGERPRINT}</code> · no lanes will be dispatched until the hold is cleared"
+          TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" \
+            -d parse_mode=HTML \
+            -d disable_web_page_preview=true; then
+            echo "✓ Telegram parked alert sent."
+          else
+            echo "::warning::Telegram notify failed."
+          fi

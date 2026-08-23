@@ -66,13 +66,19 @@ on:
   # one-shot manual run (workflow_dispatch, e.g. a human debugging one item)
   # never auto-starts the autonomous loop.
   #
-  # TRADE-OFF (intentional): this relaxes the old "a failure never re-triggers"
-  # anti-spin invariant. A genuinely-broken item or a DEAD TOKEN POOL (exit 78 at
-  # probe, ~1 min) can now fail→re-dispatch→fail faster than the old 15-min cron
-  # paced it. Bounded by: failure-only Telegram alert (visible), the
-  # AGENT_MAX_PARALLEL=0 kill switch, and agent-claude-run.sh's transient-5xx
-  # retry (no longer dies on a blip). Watch the Telegram topic; flip the kill
-  # switch if a dead pool starts spinning.
+  # This trigger fires on the very failures it recovers from, so on its own it
+  # would re-spin the fleet at run-duration pace — which is exactly what it used
+  # to do, bounded only by a human flipping AGENT_MAX_PARALLEL=0. The bound is
+  # now structural: the "Read loop hold" step runs FIRST and dispatches nothing
+  # while a hold stands. A spent token pool holds until its window reopens; a
+  # harness fault holds until an ambulance repairs it, for at most three
+  # attempts. So a re-trigger on a failure is cheap — the controller looks, sees
+  # the hold, and stops.
+  #
+  # An "Agent · ambulance" completion is in this list for the same reason a lane
+  # completion is: an ambulance that dies without a verdict must still re-arm the
+  # controller. That cannot loop, because the attempt is charged at DISPATCH
+  # (loop-gate.mjs), not at verdict.
   # "Agent · loop heartbeat" is the 15-min BACKSTOP (controller-self-reclaim
   # gap), kept in its own workflow so it can be enabled/disabled from the Actions
   # UI without touching this controller. It does nothing but complete on
@@ -82,7 +88,7 @@ on:
   # gated to repository_dispatch-origin so a one-shot manual run can't start
   # the loop).
   workflow_run:
-    workflows: ["Agent · clear-todo-issue", "Agent · rel-plan", "Agent · loop heartbeat"]
+    workflows: ["Agent · clear-todo-issue", "Agent · rel-plan", "Agent · ambulance", "Agent · loop heartbeat"]
     types: [completed]
   repository_dispatch:
     types: [agent-loop]
@@ -298,9 +304,30 @@ jobs:
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
         run: node .github/scripts/agent-board/reclaim-stranded.mjs
 
+      # ── Loop hold: the FIRST question, before the backlog matters ─────────
+      # A lane that died outside its Claude session left a `harness-broken` hold;
+      # a spent token pool left a timed `pool-exhausted` one. Either way no lane
+      # can make progress, and this workflow's `workflow_run: [completed]`
+      # trigger fires on those very failures — which is how a broken harness used
+      # to re-spin the fleet at bootstrap pace until a human flipped the kill
+      # switch. Now: dispatch nothing, and for a harness fault dispatch ONE
+      # ambulance to reproduce and repair the root cause. Fix the problem before
+      # continuing the loop.
+      #
+      # Placed AFTER the stranded sweep on purpose — board hygiene must keep
+      # running while the loop is held, exactly as it does under the kill switch.
+      # It also publishes how many Claude accounts are usable, which the dispatch
+      # step folds into K.
+      - name: Read loop hold
+        id: hold
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
+        run: node .github/scripts/agent-board/loop-gate.mjs
+
       - name: Count claimable candidates
         id: count
-        if: steps.cap.outputs.proceed == 'true'
+        if: steps.cap.outputs.proceed == 'true' && steps.hold.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           COUNT_ONLY: '1'
@@ -312,7 +339,7 @@ jobs:
 
       - name: Probe private-repo backlog (exact eligibility)
         id: probe
-        if: steps.cap.outputs.proceed == 'true'
+        if: steps.cap.outputs.proceed == 'true' && steps.hold.outputs.proceed == 'true'
         env:
           TOTAL: ${{ steps.count.outputs.eligible || '0' }}
         run: |
@@ -375,6 +402,9 @@ jobs:
           POOL_PAT: ${{ env.RESOLVED_PAT }}
           CAP: ${{ steps.cap.outputs.cap }}
           CANDIDATES: ${{ steps.probe.outputs.candidates }}
+          # How many Claude accounts the last pool probe found usable. Empty when
+          # no probe is fresh enough to trust, in which case K is not capped by it.
+          USABLE_ACCOUNTS: ${{ steps.hold.outputs.usable_accounts }}
         run: |
           set -euo pipefail
           # The runs-list `status` param is single-valued → two calls. The list
@@ -407,8 +437,17 @@ jobs:
           echo "· live agent runs: $ACTIVE"
           K=$(( CAP - ACTIVE ))
           [ "$K" -gt "$CANDIDATES" ] && K="$CANDIDATES"
+          # Third term: never send out more lanes than there are Claude accounts
+          # to run them on. A lane whose pool is spent claims an item, discovers
+          # the exhaustion, and hands the item straight back — churn that buys
+          # nothing. Skipped when no fresh probe exists, so an unknown pool
+          # behaves exactly as it did before this term was added.
+          if [ -n "${USABLE_ACCOUNTS:-}" ] && [ "$K" -gt "$USABLE_ACCOUNTS" ]; then
+            echo "· capping K at $USABLE_ACCOUNTS usable Claude account(s) (was $K)"
+            K="$USABLE_ACCOUNTS"
+          fi
           [ "$K" -lt 0 ] && K=0
-          echo "cap=$CAP · active=$ACTIVE · candidates=$CANDIDATES → dispatching $K run(s)"
+          echo "cap=$CAP · active=$ACTIVE · candidates=$CANDIDATES · usable-accounts=${USABLE_ACCOUNTS:-unknown} → dispatching $K run(s)"
           if [ "$K" -eq 0 ]; then
             echo "::notice::pool already at capacity (or no headroom) — nothing dispatched"
             exit 0

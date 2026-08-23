@@ -233,12 +233,63 @@ jobs:
           BARE_REF_MINUTES: ${{ vars.BARE_REF_MINUTES || '15' }}
         run: node .github/scripts/agent-board/claim-todo.mjs
 
+      # ── Pool gate: after the claim, BEFORE the heavy bootstrap ────────────
+      # The CLI install moved up here because the probe below needs `claude` in
+      # PATH. It is cheap (a curl + one --version) next to what it now guards,
+      # and worktree:init's hard requirement that the CLI precede it still holds.
+      - name: Install Claude Code CLI
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version
+
+      # Classify the Claude token pool before spending anything on it.
+      #
+      # This probe used to live INSIDE "Run agent", i.e. after the claim AND
+      # after the whole bootstrap (deps, Playwright, codegraph, worktree:init).
+      # An exhausted pool therefore cost a claimed item plus ~10 min of billed
+      # runner per lane before exit 78 — and then the untouched item was
+      # released, re-claimed by the next lane, and the fleet re-spun at bootstrap
+      # pace until a human flipped the kill switch. Probing here caps the damage
+      # at ~1 min, and publishing what it learned lets the CONTROLLER stop
+      # dispatching lanes entirely until a window reopens.
+      #
+      # Exit 78 (whole pool at its limit) is NOT a job failure: a closed usage
+      # window is a normal operating condition, and failing here would fire
+      # Telegram on every tick. The step goes green, the bootstrap and the agent
+      # are skipped, and the always() salvage path hands the claimed item back to
+      # Todo untouched.
+      - name: Probe Claude pool
+        id: pool
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          PROBE_ONLY: '1'
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          RC=0
+          bash .github/scripts/agent-claude-run.sh || RC=$?
+          # Publishes AGENT_POOL_STATE, and sets a timed pool-exhausted hold when
+          # no account is usable. Runs on BOTH paths: the controller needs the
+          # usable-account count even on a healthy probe, to cap K.
+          node .github/scripts/agent-board/publish-pool.mjs || true
+          if [ "$RC" -eq 78 ]; then
+            echo "exhausted=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::pool exhausted — skipping the bootstrap and releasing the claim; the loop holds until a window resets"
+            exit 0
+          fi
+          echo "exhausted=false" >> "$GITHUB_OUTPUT"
+          exit "$RC"
+
       # A prior interrupted run on this issue left a salvage pointer → restore
       # its Claude session so the agent RESUMES with full context. Best-effort:
       # an expired/missing artifact just means a fresh start from the salvage
       # branch (the code WIP is what matters).
       - name: Restore salvaged session
-        if: steps.claim.outputs.salvage_run_id != '' && steps.claim.outputs.session_artifact != ''
+        if: steps.claim.outputs.salvage_run_id != '' && steps.claim.outputs.session_artifact != '' && steps.pool.outputs.exhausted != 'true'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           SALVAGE_RUN_ID: ${{ steps.claim.outputs.salvage_run_id }}
@@ -268,35 +319,35 @@ jobs:
 
       # ── Heavy bootstrap — skipped entirely on an empty backlog ────────────
       - name: Install dependencies
-        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         uses: ./.github/actions/install
 
       # Same Chromium cache pattern as ci-checks.yml — /browse (headless) and
       # any e2e the agent runs need it.
       - name: Resolve Playwright version
         id: pw
-        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         run: |
           set -euo pipefail
           VER=$(node -e "console.log(require('./node_modules/@playwright/test/package.json').version)")
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
       - name: Cache Playwright browsers
-        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
 
       - name: Install Playwright Chromium
-        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         run: pnpm exec playwright install --with-deps chromium
 
       # Pre-warm the @playwright/mcp npx cache: .mcp.json spawns TWO servers
       # (headed + headless) concurrently at session start, and a cold npx cache
       # races its own install — observed as playwright-headless:failed.
       - name: Pre-warm playwright MCP package
-        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         run: npx -y @playwright/mcp --version
 
       # The codegraph MCP server serves a ~330MB gitignored SQLite index.
@@ -307,21 +358,13 @@ jobs:
       # deliberately NO separate build step (it would run the same script
       # twice).
       - name: Cache codegraph index
-        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         uses: actions/cache@v6
         with:
           path: .codegraph
           key: codegraph-v1-${{ hashFiles('apps/**', 'apis/**', 'packages/**') }}
           restore-keys: |
             codegraph-v1-
-
-      - name: Install Claude Code CLI
-        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
-        run: |
-          set -euo pipefail
-          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/claude" --version
 
       # The same first-time setup a dev worktree gets (pnpm menu →
       # worktree:init): machine check (linux no-op) → pnpm install (no-op —
@@ -335,7 +378,7 @@ jobs:
       # mcp:* scripts hard-require `claude` in PATH. --verbose = plain
       # sequential output for the public job log (no spinner interleaving).
       - name: First-time setup (pnpm worktree:init)
-        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         env:
           # worktree:init runs db:reset, which restores the pre-migrated D1
           # snapshot from a release on the PRIVATE repo (it holds real seeded
@@ -352,7 +395,7 @@ jobs:
       # ANTHROPIC_API_KEY here — ever (it outranks the OAuth pool).
       - name: Run agent
         id: run
-        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
@@ -411,6 +454,32 @@ jobs:
       # item back to Todo (unassign + delete claim ref). A run whose claim
       # branch already has a real PR is left alone (auto-merge lands it).
       # Executor failures are flag-only. Never reds the job further.
+      # Classify WHY this run died, before the salvage path decides what to do
+      # about it. A run that died in its BOOTSTRAP never reached the session at
+      # all, so there is no transcript and no verdict — and treating that as an
+      # item fault is what made the fleet re-spin forever: the untouched item was
+      # released, re-claimed, and killed at the same step by the next lane.
+      #
+      # Outside the session  → hold the FLEET and wake the ambulance (the fault
+      #                        is shared, so every lane would die the same way).
+      # Inside the session   → no fleet hold; the salvage step compares this
+      #                        fingerprint against the item's previous one and
+      #                        holds only the ITEM if it is cursed.
+      #
+      # Ordered before "Salvage or revert" on purpose — salvage reads failure.json.
+      - name: Capture failure
+        id: failure
+        if: always()
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          # Fallback signal only: the jobs API names the failed step, but if that
+          # call fails we still know whether the SESSION was the thing that died.
+          AGENT_RUN_OUTCOME: ${{ steps.run.outcome }}
+          # A green run that never got to work: the item is innocent and nothing
+          # is broken, so the release comment must say so.
+          POOL_EXHAUSTED: ${{ steps.pool.outputs.exhausted }}
+        run: node .github/scripts/agent-board/capture-failure.mjs
+
       - name: Salvage or revert
         id: salvage
         if: always() && steps.claim.outputs.claimed == 'true'
@@ -589,8 +658,14 @@ jobs:
 
       # Failure-only Telegram to the build topic — same bot/secrets/shape as
       # deploy-reusable.yml's notify step; non-fatal, skips when unset.
+      #
+      # `held_first != 'false'` suppresses the duplicates: a shared harness fault
+      # kills every in-flight lane within minutes, and the hold coalesces them by
+      # fingerprint, so only the lane that FIRST tripped it has news. Without
+      # this, one broken worktree:init pages six times per tick. Note a pool-
+      # exhausted run is green and never reaches here at all.
       - name: Notify Telegram on failure
-        if: failure()
+        if: failure() && steps.failure.outputs.held_first != 'false'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

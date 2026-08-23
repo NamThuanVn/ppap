@@ -228,6 +228,19 @@ jobs:
           fi
           echo "✓ coverage complete — every open leaf is rel-planned"
 
+      # A failed planning pass used to be a silent spin: the controller's
+      # rel-planning gate re-finds the same unplanned leaves on its next tick and
+      # re-dispatches this workflow into the identical failure. Capturing it as a
+      # `harness-broken` hold stops that — the gate is now behind the hold, and an
+      # ambulance is sent to fix whatever is breaking the planner.
+      - name: Capture failure
+        id: failure
+        if: always()
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          AGENT_RUN_OUTCOME: ${{ steps.run.outcome }}
+        run: node .github/scripts/agent-board/capture-failure.mjs
+
       # PUBLIC artifact (this is a public repo) — accepted trade-off.
       - name: Upload transcript
         if: always()
@@ -277,7 +290,7 @@ jobs:
           exit 0
 
       - name: Notify Telegram on failure
-        if: failure()
+        if: failure() && steps.failure.outputs.held_first != 'false'
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
