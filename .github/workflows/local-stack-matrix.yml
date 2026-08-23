@@ -45,7 +45,7 @@ name: Local Stack · macOS / Linux / Windows
 # refs/pull/<N>/merge. Three verification runs died at `actions/checkout` that
 # way — one 20s after dispatch, the PR having merged between dispatch and
 # checkout — skipping every real step while looking like a genuine failure.
-# Land the fix, then verify against main. See docs/engineering/platform/ppap.md § Local-stack matrix.
+# Land the fix, then verify against main. See docs/engineering/platform/ppap-local-stack.md § Local-stack matrix.
 
 on:
   workflow_dispatch:
@@ -160,7 +160,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -212,7 +212,7 @@ jobs:
 
       # uv backs mcp-databases.sh (`uvx mcp-server-sqlite`). Official installer
       # rather than a third-party action: the ppap repos run an allowed-actions
-      # policy (docs/engineering/platform/ppap.md § Public-repo security hardening), so adding an
+      # policy (docs/engineering/platform/ppap-secrets.md § Public-repo security hardening), so adding an
       # action would need a policy change; a script needs none. Same command the
       # script itself prints when uv is missing.
       - name: Install uv

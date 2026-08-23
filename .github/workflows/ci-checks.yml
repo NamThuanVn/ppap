@@ -115,7 +115,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -227,6 +227,14 @@ jobs:
       # the PARA move a day earlier.
       - run: node scripts/check-doc-links.mjs
 
+      # docs/engineering had ONE README — a flat hand-written index at the root
+      # covering thirteen folders. A root index is the thing that rots first: it
+      # is edited by whoever remembers it exists, and #2693 moved 42 files
+      # without it. The folder indexes are generated now, so this fails if a doc
+      # was added, renamed or retitled without regenerating them. Same
+      # hand-write-the-judgement/generate-the-inventory split as ba-spine above.
+      - run: node scripts/docs-index.mjs --check
+
       # terraform/ used to be executed for the FIRST time at deploy, inside the
       # deploy job's `terraform apply`. A bad module reference or undeclared
       # variable therefore surfaced mid-deploy, after CI was green and the release
@@ -314,7 +322,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -389,7 +397,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -501,7 +509,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -594,7 +602,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -735,7 +743,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -867,7 +875,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
@@ -961,7 +969,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"

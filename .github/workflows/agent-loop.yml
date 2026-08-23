@@ -40,7 +40,7 @@ name: Agent · loop
 # item and their lanes die (top-up yields 0). Keep the cap conservative: agent
 # jobs occupy an org job slot for up to 330 min each, and NamThuanVn shares a
 # 20-concurrent-job cap with the deploy graph (peaks 12–23 jobs) and fallback
-# PR CI (see docs/engineering/platform/ppap.md § Agent runs).
+# PR CI (see docs/engineering/platform/ppap-agent-runs.md § Agent runs).
 #
 # Hardening: triggers are repository_dispatch + workflow_dispatch ONLY (ppap
 # public-repo rule). repository_dispatch requires a write-capable token, i.e.
@@ -167,7 +167,7 @@ jobs:
             case "$R" in ''|*[!0-9]*) continue ;; esac
             if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
           done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap.md § PAT_TOKEN_POOL"; exit 1; }
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
           LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
