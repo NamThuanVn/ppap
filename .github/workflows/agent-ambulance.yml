@@ -106,7 +106,7 @@ jobs:
           echo "· harness state dir: ${RUNNER_TEMP}/agent-state (outside the checkout)"
 
       # Same inlined pool resolution as the other agent workflows (canonical copy
-      # is .github/scripts/pat-pool.sh — keep them in step). It cannot call that
+      # is scripts/ci/ppap/pat-pool.sh — keep them in step). It cannot call that
       # script here either: the checkout below needs a token first.
       - name: Resolve PAT from pool
         env:
@@ -243,12 +243,12 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           DEPS_OUTCOME: ${{ steps.deps.outcome }}
-        run: bash .github/scripts/agent-claude-run.sh
+        run: bash scripts/agent/run/claude.sh
 
       - name: Parse repair verdict
         id: verdict
         if: always()
-        run: node .github/scripts/agent-board/parse-repair-verdict.mjs
+        run: node scripts/agent/board/verdict/parse-repair.mjs
 
       # The only step that touches the hold. Clearing it is what hands the fleet
       # its lanes back, so it is deliberately deterministic and API-verified
@@ -258,7 +258,7 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node .github/scripts/agent-board/execute-repair.mjs
+        run: node scripts/agent/board/verdict/execute-repair.mjs
 
       - name: Upload transcript
         if: always()

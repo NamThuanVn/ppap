@@ -93,7 +93,7 @@ on:
         required: false
         default: true
       deploy_only_changed:
-        description: 'Build & deploy only the workers/zones that changed between base_sha and checkout_ref. Staging passes true; production leaves the default false (full deploy for a deterministic release baseline). A cross-cutting/shared change or a missing base_sha falls back to a full deploy regardless — see .github/scripts/compute-deploy-targets.sh.'
+        description: 'Build & deploy only the workers/zones that changed between base_sha and checkout_ref. Staging passes true; production leaves the default false (full deploy for a deterministic release baseline). A cross-cutting/shared change or a missing base_sha falls back to a full deploy regardless — see scripts/ci/deploy-targets.sh.'
         type: boolean
         required: false
         default: false
@@ -133,7 +133,7 @@ jobs:
   #    a cross-cutting/shared-package change, or a missing/unreachable base_sha
   #    all fall back to the FULL canonical lists — so the build matrices + deploy
   #    tiers behave exactly as before. Pure git + bash (no install); runs in
-  #    parallel with the CI gate. See .github/scripts/compute-deploy-targets.sh.
+  #    parallel with the CI gate. See scripts/ci/deploy-targets.sh.
   #
   #    When the diff selects nothing at all (a tooling / docs / test-only merge)
   #    it emits nothing_to_deploy=true and the rest of the graph short-circuits:
@@ -161,7 +161,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #
@@ -246,7 +246,7 @@ jobs:
           # Prefer the last-successful-deploy baseline; fall back to the payload's
           # previous-push tip (and compute-deploy-targets.sh full-deploys if empty).
           BASE_SHA: ${{ steps.baseline.outputs.base_sha || inputs.base_sha }}
-        run: .github/scripts/compute-deploy-targets.sh
+        run: scripts/ci/deploy-targets.sh
 
       # A merge that deploys nothing skips tf-outputs + the whole deploy job
       # (terraform apply included), which reads as a silent no-op in the Actions
@@ -369,7 +369,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #
@@ -476,7 +476,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #
@@ -529,7 +529,7 @@ jobs:
       # POST-apply outputs. Hence LENIENT: any output missing from the current
       # state (a resource this commit adds) becomes a dummy ID here.
       - name: Resolve wrangler bindings
-        run: .github/scripts/resolve-wrangler-bindings.sh ${{ matrix.service }} ${{ inputs.environment }}
+        run: scripts/ci/wrangler-bindings.sh ${{ matrix.service }} ${{ inputs.environment }}
         env:
           TF_OUTPUTS_JSON: /tmp/tf-outputs.json
           TF_OUTPUTS_LENIENT: '1'
@@ -581,7 +581,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #
@@ -749,7 +749,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #
@@ -889,7 +889,7 @@ jobs:
         run: |
           set -euo pipefail
           for svc in $WORKERS dashboard; do
-            .github/scripts/resolve-wrangler-bindings.sh "$svc" ${{ inputs.environment }}
+            scripts/ci/wrangler-bindings.sh "$svc" ${{ inputs.environment }}
           done
 
       # Sentry DSN — runtime `--var` for the zone + dispatcher worker wraps.
@@ -1057,7 +1057,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #

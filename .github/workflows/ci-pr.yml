@@ -51,7 +51,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #
@@ -147,7 +147,7 @@ jobs:
       pr_number: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
       head_sha: ${{ github.event.client_payload.head_sha }}
       # PR CI runs only the changed service's e2e specs (broad/shared change →
-      # full; nothing relevant → skip; see scripts/e2e-plan.sh). A manual main
+      # full; nothing relevant → skip; see scripts/e2e/plan.sh). A manual main
       # run has no PR diff to scope against → run the full suite.
       e2e_changed_only: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && true || false }}
     secrets:
@@ -176,7 +176,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #

@@ -36,7 +36,7 @@ name: Agent · clear-todo-issue
 # or any other failure never chains — the loop always terminates.
 #
 # Claude auth is a POOL of subscription accounts (CLAUDE_CODE_OAUTH_TOKENS, one
-# newline-separated secret); .github/scripts/agent-claude-run.sh probes,
+# newline-separated secret); scripts/agent/run/claude.sh probes,
 # rotates, and fails over mid-run. GitHub identity is whichever POOLED account
 # the `Resolve PAT from pool` step picked — NOT a fixed account; the log line
 # `PAT pool -> @<login>` names it, and it is stable for the whole run so a lane
@@ -132,7 +132,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #
@@ -231,7 +231,7 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           STALE_REF_HOURS: ${{ vars.STALE_REF_HOURS || '3.5' }}
           BARE_REF_MINUTES: ${{ vars.BARE_REF_MINUTES || '15' }}
-        run: node .github/scripts/agent-board/claim-todo.mjs
+        run: node scripts/agent/board/claim/todo.mjs
 
       # ── Pool gate: after the claim, BEFORE the heavy bootstrap ────────────
       # The CLI install moved up here because the probe below needs `claude` in
@@ -271,11 +271,11 @@ jobs:
         run: |
           set -uo pipefail
           RC=0
-          bash .github/scripts/agent-claude-run.sh || RC=$?
+          bash scripts/agent/run/claude.sh || RC=$?
           # Publishes AGENT_POOL_STATE, and sets a timed pool-exhausted hold when
           # no account is usable. Runs on BOTH paths: the controller needs the
           # usable-account count even on a healthy probe, to cap K.
-          node .github/scripts/agent-board/publish-pool.mjs || true
+          node scripts/agent/board/loop/publish-pool.mjs || true
           if [ "$RC" -eq 78 ]; then
             echo "exhausted=true" >> "$GITHUB_OUTPUT"
             echo "::notice::pool exhausted — skipping the bootstrap and releasing the claim; the loop holds until a window resets"
@@ -353,7 +353,7 @@ jobs:
       # The codegraph MCP server serves a ~330MB gitignored SQLite index.
       # Content-keyed cache (NOT github.sha — that would be THIS repo's sha).
       # The index BUILD happens inside worktree:init below (its mcp:codegraph
-      # step runs scripts/mcp-codegraph.sh: exact cache hit → skip, stale
+      # step runs scripts/mcp/codegraph.sh: exact cache hit → skip, stale
       # restore → fast `codegraph sync`, miss → full `init -i`) — there is
       # deliberately NO separate build step (it would run the same script
       # twice).
@@ -399,7 +399,7 @@ jobs:
         env:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: bash .github/scripts/agent-claude-run.sh
+        run: bash scripts/agent/run/claude.sh
 
       # ── Typed verdict pipeline (claim-mode runs only) ─────────────────────
       # Parse never fails: no/invalid/mismatched verdict → verdict=NONE, which
@@ -412,28 +412,28 @@ jobs:
         if: always() && steps.claim.outputs.claimed == 'true'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node .github/scripts/agent-board/parse-verdict.mjs
+        run: node scripts/agent/board/verdict/parse.mjs
 
       - name: Finalize merged
         id: finalize
         if: always() && steps.outcome.outputs.verdict == 'MERGED'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node .github/scripts/agent-board/finalize-merged.mjs
+        run: node scripts/agent/board/verdict/finalize-merged.mjs
 
       - name: Execute park
         id: park
         if: always() && steps.outcome.outputs.verdict == 'PARK'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node .github/scripts/agent-board/execute-park.mjs
+        run: node scripts/agent/board/verdict/execute-park.mjs
 
       - name: Execute split
         id: split
         if: always() && steps.outcome.outputs.verdict == 'SPLIT'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node .github/scripts/agent-board/execute-split.mjs
+        run: node scripts/agent/board/verdict/execute-split.mjs
 
       # ABANDONED is a TERMINAL verdict and needs an executor like the other
       # three: without one the run exited success with the item still In
@@ -446,7 +446,7 @@ jobs:
         if: always() && steps.outcome.outputs.verdict == 'ABANDONED'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node .github/scripts/agent-board/execute-abandoned.mjs
+        run: node scripts/agent/board/verdict/execute-abandoned.mjs
 
       # Backstop for a run with no executed verdict (failed / cancelled /
       # timed out / verdict=NONE): preserve WIP on salvage/<issue>-<run_id> +
@@ -478,7 +478,7 @@ jobs:
           # A green run that never got to work: the item is innocent and nothing
           # is broken, so the release comment must say so.
           POOL_EXHAUSTED: ${{ steps.pool.outputs.exhausted }}
-        run: node .github/scripts/agent-board/capture-failure.mjs
+        run: node scripts/agent/board/recover/capture-failure.mjs
 
       - name: Salvage or revert
         id: salvage
@@ -490,7 +490,7 @@ jobs:
           EXECUTOR_FAILED: ${{ steps.finalize.outcome == 'failure' || steps.park.outcome == 'failure' || steps.split.outcome == 'failure' || steps.abandoned.outcome == 'failure' }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           STALE_REF_HOURS: ${{ vars.STALE_REF_HOURS || '3.5' }}
-        run: node .github/scripts/agent-board/salvage-or-revert.mjs
+        run: node scripts/agent/board/recover/salvage-or-revert.mjs
 
       # Board hygiene, EVERY run (backlog-empty and wrapper runs included): a
       # sub-issue can close without its executor running (the PR's `Closes #`
@@ -504,7 +504,7 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node .github/scripts/agent-board/reconcile-parents.mjs
+        run: node scripts/agent/board/claim/reconcile-parents.mjs
 
       # Last thing the run does: sweep every finished BA item out of the active
       # tree into docs/ba/archive/. An IDEMPOTENT sweep, not a move of "the item
@@ -541,7 +541,7 @@ jobs:
           cd "$WORK"
           git config user.name "$(gh api user --jq .login)"
           git config user.email "$(gh api user --jq .login)@users.noreply.github.com"
-          if ! node scripts/ba-archive.mjs; then
+          if ! node scripts/ba/archive.mjs; then
             echo "::warning::ba-archive: sweep failed — nothing pushed, next run retries"; exit 0
           fi
           # No new commit → nothing was finished this round.
@@ -607,7 +607,7 @@ jobs:
             echo "::warning::run ended non-terminal after a claim, but the claimed issue number could not be parsed — check the transcript"
             exit 0
           fi
-          RELEASE_ISSUE="$ISSUE" node .github/scripts/agent-board/release-claim.mjs
+          RELEASE_ISSUE="$ISSUE" node scripts/agent/board/claim/release.mjs
           exit 0
 
       # PUBLIC artifact (this is a public repo) — accepted trade-off.

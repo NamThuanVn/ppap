@@ -99,7 +99,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #
@@ -206,7 +206,7 @@ jobs:
           REL_PLAN: '1'
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: bash .github/scripts/agent-claude-run.sh
+        run: bash scripts/agent/run/claude.sh
 
       # Deterministic enforcement: any leaf still unplanned → red job → no
       # chain (loop stalls safely; Telegram fires). Never label-backfill here —
@@ -239,7 +239,7 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           AGENT_RUN_OUTCOME: ${{ steps.run.outcome }}
-        run: node .github/scripts/agent-board/capture-failure.mjs
+        run: node scripts/agent/board/recover/capture-failure.mjs
 
       # PUBLIC artifact (this is a public repo) — accepted trade-off.
       - name: Upload transcript

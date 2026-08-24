@@ -11,7 +11,7 @@ name: Local Stack · macOS / Linux / Windows
 # the local developer path: worktree:init's bootstrap, db:reset across 13 D1s,
 # link-monolith's ~360 per-file symlinks (Windows needs symlink privilege for
 # FILE links — junctions only cover dirs), and the bash-3.2/Git-Bash assumptions
-# in scripts/serve-monolith.sh. Those break per-OS, silently, and only a real
+# in scripts/dev/serve-monolith.sh. Those break per-OS, silently, and only a real
 # boot finds it.
 #
 # THE MCP WIRING IS IN SCOPE. `worktree:init`'s last three steps register the
@@ -136,7 +136,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #
@@ -358,7 +358,7 @@ jobs:
 
           # probe <url> <deadline-seconds> <label>
           # Liveness via `kill -0` (same idiom as wait_for_port in
-          # scripts/serve-monolith.sh, which already runs on Git Bash) so a dead
+          # scripts/dev/serve-monolith.sh, which already runs on Git Bash) so a dead
           # boot fails in seconds instead of burning the whole deadline.
           # 127.0.0.1, not localhost: the proxy binds dual-stack, but pinning
           # IPv4 removes the ::1-first resolution flake (docs/engineering/platform/testing.md).

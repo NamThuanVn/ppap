@@ -4,7 +4,7 @@ name: DB · Publish local D1 snapshot
 # rolling release asset (tag `db-snapshot`) that every cold-start surface
 # restores instead of replaying all ~350 migrations:
 #
-#   local  `pnpm worktree:init` / `pnpm db:reset`  → scripts/db-reset.sh
+#   local  `pnpm worktree:init` / `pnpm db:reset`  → scripts/db/reset.sh
 #   PR CI  `e2e-seed` job                          → ci-checks.yml
 #   agent  `/clear-todo-issue` runs                 → agent-clear-todo.yml
 #
@@ -79,7 +79,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #
@@ -138,14 +138,14 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          if [ ! -f scripts/db-snapshot-manifest.mjs ]; then
-            echo "::error::scripts/db-snapshot-manifest.mjs is missing at this ref."
+          if [ ! -f scripts/db/snapshot-manifest.mjs ]; then
+            echo "::error::scripts/db/snapshot-manifest.mjs is missing at this ref."
             fail=1
           fi
           # The load-bearing check: without SEEDS support the build silently
           # produces a seeded snapshot instead of a migrations-only one.
-          if ! grep -q 'SEEDS' scripts/db-reset.sh; then
-            echo "::error::scripts/db-reset.sh at this ref has no SEEDS support, so SEEDS=0 would be ignored and the snapshot would contain non-idempotent local-seed rows."
+          if ! grep -q 'SEEDS' scripts/db/reset.sh; then
+            echo "::error::scripts/db/reset.sh at this ref has no SEEDS support, so SEEDS=0 would be ignored and the snapshot would contain non-idempotent local-seed rows."
             fail=1
           fi
           if [ "$fail" != 0 ]; then
@@ -166,7 +166,7 @@ jobs:
           STATE_DIR=.wrangler/state-snapshot \
           SEEDS=0 \
           DB_SNAPSHOT=0 \
-            bash scripts/db-reset.sh
+            bash scripts/db/reset.sh
 
       # The manifest is what makes a restore trustworthy: it records the sha256
       # of every migration baked into the snapshot, so a consumer can detect a
@@ -174,7 +174,7 @@ jobs:
       # d1_migrations' filename-only tracking would silently skip) and cold-run
       # instead. Built from the same checkout that just produced the state.
       - name: Generate manifest
-        run: node scripts/db-snapshot-manifest.mjs > manifest.json
+        run: node scripts/db/snapshot-manifest.mjs > manifest.json
 
       - name: Package snapshot
         run: |

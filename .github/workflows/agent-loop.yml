@@ -149,7 +149,7 @@ jobs:
       # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
       # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
       # probing every token is free. Inlined rather than calling
-      # `.github/scripts/pat-pool.sh` (the canonical copy — keep the two in step)
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
       # because a private-repo checkout itself needs a token, so the pool cannot live
       # behind it.
       #
@@ -265,9 +265,10 @@ jobs:
           ref: main
           token: ${{ env.RESOLVED_PAT }}
           fetch-depth: 1
-          # `.github/scripts` (not just agent-board): the "Resolve PAT pool
-          # logins" step below runs .github/scripts/pat-pool.sh from here.
-          sparse-checkout: .github/scripts
+          # The whole `scripts` tree: this job runs scripts/ci/ppap/pat-pool.sh
+          # ("Resolve PAT pool logins") AND scripts/agent/board/*.mjs, and the
+          # board scripts import a sibling lib.mjs.
+          sparse-checkout: scripts
           persist-credentials: false
 
       # Stranded-claim sweep — release items whose backing run is provably dead
@@ -291,7 +292,7 @@ jobs:
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
         run: |
           set -uo pipefail
-          L=$(bash .github/scripts/pat-pool.sh --logins || true)
+          L=$(bash scripts/ci/ppap/pat-pool.sh --logins || true)
           echo "AGENT_LOGINS=$L" >> "$GITHUB_ENV"
           echo "claim owners: ${L:-<none — sweep uses its own login>}"
 
@@ -302,7 +303,7 @@ jobs:
           STRANDED_HOURS: ${{ vars.STRANDED_HOURS || '6' }}
           AGENT_LOGINS: ${{ env.AGENT_LOGINS }}
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
-        run: node .github/scripts/agent-board/reclaim-stranded.mjs
+        run: node scripts/agent/board/claim/reclaim-stranded.mjs
 
       # ── Loop hold: the FIRST question, before the backlog matters ─────────
       # A lane that died outside its Claude session left a `harness-broken` hold;
@@ -323,7 +324,7 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
-        run: node .github/scripts/agent-board/loop-gate.mjs
+        run: node scripts/agent/board/loop/gate.mjs
 
       - name: Count claimable candidates
         id: count
@@ -333,9 +334,9 @@ jobs:
           COUNT_ONLY: '1'
           # In scope even though COUNT_ONLY never touches the fork: every step
           # that runs a board script passes it, so nothing depends on which code
-          # path happens to avoid it. scripts/check-agent-board-env.mjs enforces.
+          # path happens to avoid it. scripts/check/agent-board-env.mjs enforces.
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
-        run: node .github/scripts/agent-board/claim-todo.mjs
+        run: node scripts/agent/board/claim/todo.mjs
 
       - name: Probe private-repo backlog (exact eligibility)
         id: probe

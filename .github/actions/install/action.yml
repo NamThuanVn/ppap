@@ -43,6 +43,7 @@ runs:
           apps/*/node_modules
           packages/*/node_modules
           monolith/*/node_modules
+          scripts/node_modules
         key: pnpm-modules-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml') }}
       env:
         NODE_OPTIONS: --no-deprecation
