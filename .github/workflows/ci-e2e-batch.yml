@@ -138,9 +138,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
-      # Within a batch this mirrors the coordinator's matrix. Across batches,
-      # ci-fanout.mjs collect plays the same role by cancelling siblings.
-      fail-fast: true
+      # Every shard runs to completion. This was `true`, and together with
+      # `maxFailures: 1` (playwright.config.ts) and the fan-out's cross-batch
+      # cancel (scripts/ci/fanout.mjs) it meant one failing test cancelled the
+      # other 7 shards here AND the other 3 batches — so a 32-shard run
+      # reported exactly ONE failure no matter how many were broken. An agent
+      # driving CI got one failure per round trip and ran out of continuations
+      # before it ran out of bugs. All three layers are gone; the per-shard
+      # budget in playwright.config.ts is what bounds a red run now.
+      #
+      # Costs no extra WALL-CLOCK: the siblings are already running in
+      # parallel, so cancelling them only saved runner-minutes on a run that
+      # was going to be repeated anyway — re-paying e2e-build-zones and
+      # e2e-seed each time. A red run now costs about what a green one does.
+      fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     steps:
@@ -199,9 +210,12 @@ jobs:
       # Retried once, deliberately. This download crosses an org boundary and
       # pulls the full zone-bundle set, which makes it the most
       # network-exposed step in the batch — and a `Connect Timeout Error` here
-      # is an INFRA failure, not a test result. Because the matrix is
+      # is an INFRA failure, not a test result. Back when this matrix was
       # `fail-fast: true`, one such blip took its 7 sibling shards down with it
-      # and reddened the PR (observed: Delta batch 3/4, run 31678948548).
+      # and reddened the PR (observed: Delta batch 3/4, run 31678948548). The
+      # matrix no longer cascades, but the retry still earns its place: without
+      # it the blip fails THIS shard, which silently drops its ~25 specs from
+      # the run.
       # `continue-on-error` on the first attempt keeps the step from ending the
       # job, and the retry re-runs the identical download.
       - name: Restore e2e build + seed from coordinator

@@ -209,6 +209,28 @@ jobs:
           fi
           exit 0
 
+      # Sparse checkout of scripts/ci only. This job otherwise never touches the
+      # repo — the noise scan reads every log through the API — but the digest
+      # step below runs scripts/ci/failure-digest.mjs, and a script belongs in
+      # scripts/ (CLAUDE.md) rather than inlined here where nothing can test it.
+      # One non-cone path keeps this to a few KB, and no `pnpm install` is needed:
+      # the script imports only node: builtins.
+      #
+      # `continue-on-error`: this job's product is the commit status and the
+      # sticky comment. If the checkout blips the digest degrades to absent and
+      # the report still posts — it must never be why a green PR misses its
+      # auto-merge.
+      - name: Check out the digest script
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.RESOLVED_PAT }}
+          ref: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('refs/pull/{0}/merge', github.event.client_payload.pr_number || inputs.pr_number) || 'main' }}
+          sparse-checkout: scripts/ci
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       # The "green is not clean" scan, folded into this job rather than a
       # separate one in ci-checks.yml. It was its own job only because that is
       # where the e2e shards used to live; it reads everything through the API
@@ -233,10 +255,19 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           RUN_ID: ${{ github.run_id }}
           BATCH_RUNS: ${{ needs.checks.outputs.e2e_runs }}
+          # Which categories CI itself calls red. The digest uses this to tell
+          # "this job passed" apart from "this job failed and I could not parse
+          # why" — an unparsed red job must announce itself, not read as silence.
+          R_BIOME: ${{ needs.checks.outputs.biome }}
+          R_TYPE: ${{ needs.checks.outputs.typecheck }}
+          R_LINT: ${{ needs.checks.outputs.lint }}
+          R_TEST: ${{ needs.checks.outputs.test }}
+          R_E2E: ${{ needs.checks.outputs.e2e }}
         run: |
           set +e -uo pipefail   # errexit OFF — zero-match greps below exit non-zero by design
           tmp="$(mktemp -d)"
           : > "$tmp/e2e.log"; : > "$tmp/biome.log"; : > "$tmp/test.log"
+          : > "$tmp/typecheck.log"; : > "$tmp/eslint.log"
           : > "$tmp/runs.tsv"
           printf '%s\t%s\n' "$GITHUB_REPOSITORY" "$RUN_ID" >> "$tmp/runs.tsv"
           if [ -n "${BATCH_RUNS:-}" ] && [ "$BATCH_RUNS" != "[]" ]; then
@@ -250,10 +281,14 @@ jobs:
               --jq '.jobs[]? | [(.id|tostring), .name] | @tsv' 2>/dev/null \
               | while IFS="$(printf '\t')" read -r id name; do
                   [ -n "$id" ] || continue
+                  # `E2E (shard` and not `E2E`: the plan, build-zone and seed
+                  # jobs share the prefix and carry no test output.
                   case "$name" in
                     *"E2E (shard"*)  dest="$tmp/e2e.log" ;;
                     *"Biome"*)       dest="$tmp/biome.log" ;;
                     *"Unit tests"*)  dest="$tmp/test.log" ;;
+                    *"Typecheck"*)   dest="$tmp/typecheck.log" ;;
+                    *"ESLint"*)      dest="$tmp/eslint.log" ;;
                     *)               continue ;;
                   esac
                   gh api "repos/${repo}/actions/jobs/${id}/logs" 2>/dev/null \
@@ -273,14 +308,48 @@ jobs:
           total=$(( flaky + dup + hyd + i18n + font + http404 + biomew + vitest ))
           clean=true; [ "$total" -gt 0 ] && clean=false
           summary=$(printf 'flaky %s · dup %s · hyd %s · i18n %s · font %s · 404 %s · biome %s · vitest %s' "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest")
+          # The counters above say a run is NOISY. They never say what BROKE —
+          # that used to cost a round trip of per-job log-diving before anything
+          # could be fixed, and with the e2e fail-fast layers removed a red run
+          # now carries the whole failure set, so it is worth reading. Same logs,
+          # already downloaded.
+          RED=''
+          for pair in "e2e:${R_E2E:-}" "test:${R_TEST:-}" "typecheck:${R_TYPE:-}" \
+                      "eslint:${R_LINT:-}" "biome:${R_BIOME:-}"; do
+            [ "${pair#*:}" = success ] || RED="${RED:+$RED,}${pair%%:*}"
+          done
+          DIGEST=''
+          echo '[]' > "$tmp/failures.json"
+          if [ -f scripts/ci/failure-digest.mjs ]; then
+            DIGEST=$(node scripts/ci/failure-digest.mjs --dir "$tmp" --red "$RED" 2>/dev/null) || DIGEST=''
+            node scripts/ci/failure-digest.mjs --dir "$tmp" --red "$RED" --json \
+              > "$tmp/failures.json" 2>/dev/null || echo '[]' > "$tmp/failures.json"
+          else
+            echo "::warning::scripts/ci/failure-digest.mjs not on disk — CI report will carry counters but no failure list"
+          fi
+
           {
             echo "clean=$clean"
             echo "summary=$summary"
+            # Multiline, so the delimiter form. Random-ish delimiter is
+            # unnecessary here: the digest is markdown the script generated and
+            # can never contain this token.
+            echo "digest<<__CI_DIGEST__"
+            printf '%s\n' "$DIGEST"
+            echo "__CI_DIGEST__"
           } >> "$GITHUB_OUTPUT"
           mkdir -p ci-noise
           printf '{"flaky":%s,"dup_testid":%s,"hydration":%s,"i18n_missing":%s,"font_preload":%s,"http_4xx":%s,"biome_warnings":%s,"vitest_stderr":%s,"clean":%s}\n' \
-            "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest" "$clean" | tee ci-noise/ci-noise-report.json
+            "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest" "$clean" > ci-noise/ci-noise-report.json
+          # Attach the grouped failures to the SAME artifact /fix-ci already
+          # downloads, so its fast path gets the list without a second fetch.
+          if jq --slurpfile f "$tmp/failures.json" '. + {failures: ($f[0] // [])}' \
+               ci-noise/ci-noise-report.json > "$tmp/report.json" 2>/dev/null; then
+            mv "$tmp/report.json" ci-noise/ci-noise-report.json
+          fi
+          cat ci-noise/ci-noise-report.json
           echo "▶ noise: $summary → clean=$clean"
+          echo "▶ digest: $(jq 'length' "$tmp/failures.json" 2>/dev/null || echo '?') root cause(s); red=${RED:-none}"
           exit 0
 
       - name: Upload noise report
@@ -363,6 +432,7 @@ jobs:
           STATE: ${{ steps.status.outputs.state }}
           NOISE_CLEAN: ${{ steps.noise.outputs.clean }}
           NOISE_SUMMARY: ${{ steps.noise.outputs.summary }}
+          DIGEST: ${{ steps.noise.outputs.digest }}
           DESC: ${{ steps.status.outputs.desc }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -460,6 +530,8 @@ jobs:
           $DESC
 
           **Noise:** $NOISE_SUMMARY → $( [ "$NOISE_CLEAN" = "true" ] && echo "clean ✓" || echo "not clean ✗" )
+
+          $DIGEST
 
           $READY_LINE
 

@@ -136,12 +136,25 @@ jobs:
 
       - uses: ./.github/actions/install
 
+      # Every gate below carries `if: ${{ !cancelled() }}`. These ten checks are
+      # INDEPENDENT — each reads the filesystem (or live DNS) and none consumes
+      # another's output — but Actions skips the rest of a job once a step fails,
+      # so the first one to go red used to hide the other nine. `1 · CI · Biome`
+      # then named a single gate and an agent fixed them one round trip at a
+      # time, which is the same pathology the e2e fail-fast layers had. Guarding
+      # each step makes the job's step list the report: every failing gate is
+      # named in one run. The job still concludes `failure` if any gate fails.
+      #
+      # Resolve-PAT / checkout / install stay UNGUARDED above: if one of those
+      # fails nothing downstream can run, and pretending otherwise would just
+      # produce ten identical cascade errors.
       - run: pnpm biome ci .
 
       # Repo-wide suppression/skip gate: no biome-ignore / eslint-disable /
       # @ts-ignore and no test skip in ANY form may exist in the codebase
       # (.claude/rules.md § "Never skip checks, never suppress").
-      - run: bash scripts/check/no-suppressions.sh
+      - if: ${{ !cancelled() }}
+        run: bash scripts/check/no-suppressions.sh
 
       # Demo/test fixtures must never ship as a schema migration under
       # apis/*/migrations/ — they apply to Staging AND Production with no
@@ -150,7 +163,8 @@ jobs:
       # Diff-scoped to files ADDED by this PR (HEAD^1 = the base parent on
       # refs/pull/N/merge, same convention as scripts/e2e/plan.sh) — the 22
       # already-shipped demo migrations stay in place and must not retrigger.
-      - run: bash scripts/check/demo-migrations.sh
+      - if: ${{ !cancelled() }}
+        run: bash scripts/check/demo-migrations.sh
 
       # Email-authentication gate for the OTP sender domains: DKIM at
       # cf-bounce._domainkey, SPF at cf-bounce, bounce MX, exactly one DMARC
@@ -162,6 +176,7 @@ jobs:
       # missing resolver as a hard failure under CI (see its NO_RESOLVER note),
       # because a gate that silently skips itself is worth no more than no gate.
       - name: Assert sender-domain email DNS
+        if: ${{ !cancelled() }}
         run: |
           command -v dig >/dev/null 2>&1 || {
             sudo apt-get update -qq
@@ -192,7 +207,8 @@ jobs:
       # not run here: ppap runs the mirrored copy of this workflow, so the previous
       # revision still calls `test:hooks` until the next sync lands. Running both
       # would run the same 37 files twice.
-      - run: pnpm test:scripts:bash
+      - if: ${{ !cancelled() }}
+        run: pnpm test:scripts:bash
 
       # The BA tree's ~2,700 relative links, its `status:` vocabulary and its
       # channel READMEs had NO gate at all — `ba:check-links` existed and ran on
@@ -206,14 +222,16 @@ jobs:
       #
       # Seconds, filesystem-only, no network. Not in pre-commit: docs PRs go
       # through /ship-docs, which deliberately runs nothing.
-      - run: pnpm ba:check-links
+      - if: ${{ !cancelled() }}
+        run: pnpm ba:check-links
 
       # The BA hubs carry generated inventory blocks — every use case's stories,
       # shipped packages and bugs in one note. They are generated because the
       # hand-maintained predecessor rotted: story-index.md read `Draft` for all
       # twelve use cases while UC-08, UC-09 and UC-10 had shipped, and had no
       # task or bug column at all. This fails if a block is stale.
-      - run: node scripts/ba/spine.mjs --check
+      - if: ${{ !cancelled() }}
+        run: node scripts/ba/spine.mjs --check
 
       # `ba:check-links` above covers docs/ only, because ba-archive.mjs exists to
       # sweep the BA tree. That left the larger half unchecked: CLAUDE.md, the root
@@ -223,7 +241,8 @@ jobs:
       # of them; without this, nothing could have said whether one was wrong. It
       # found 150 broken links on the first run, and 7 that had been broken since
       # the PARA move a day earlier.
-      - run: node scripts/ba/doc-links.mjs
+      - if: ${{ !cancelled() }}
+        run: node scripts/ba/doc-links.mjs
 
       # docs/engineering had ONE README — a flat hand-written index at the root
       # covering thirteen folders. A root index is the thing that rots first: it
@@ -231,7 +250,8 @@ jobs:
       # without it. The folder indexes are generated now, so this fails if a doc
       # was added, renamed or retitled without regenerating them. Same
       # hand-write-the-judgement/generate-the-inventory split as ba-spine above.
-      - run: node scripts/ba/docs-index.mjs --check
+      - if: ${{ !cancelled() }}
+        run: node scripts/ba/docs-index.mjs --check
 
       # terraform/ used to be executed for the FIRST time at deploy, inside the
       # deploy job's `terraform apply`. A bad module reference or undeclared
@@ -244,11 +264,13 @@ jobs:
       # Pinned to the version the deploy job uses, so this validates against the
       # binary that will later run `apply`.
       - uses: hashicorp/setup-terraform@v4
+        if: ${{ !cancelled() }}
         with:
           terraform_version: '1.9.0'
           terraform_wrapper: false
 
-      - run: bash scripts/check/terraform.sh
+      - if: ${{ !cancelled() }}
+        run: bash scripts/check/terraform.sh
 
   # Typecheck, split across parallel legs — same reasoning as the Vitest matrix
   # above (389s as one job, and the dominant cost on any PR whose e2e is
