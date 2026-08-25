@@ -156,6 +156,13 @@ jobs:
       - if: ${{ !cancelled() }}
         run: bash scripts/check/no-suppressions.sh
 
+      # Export-engine gate: no hand-built SheetJS workbook, no leaf route
+      # streaming a spreadsheet/CSV inside the request, and no dataset in the
+      # registry without its `_export` read. The estate this replaced had seven
+      # exports and seven shapes; without a gate the eighth is the eighth way
+      # (docs/engineering/architecture/exports.md).
+      - run: bash scripts/check/exports.sh
+
       # Demo/test fixtures must never ship as a schema migration under
       # apis/*/migrations/ — they apply to Staging AND Production with no
       # environment filter (this has recurred twice; see
