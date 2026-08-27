@@ -232,13 +232,19 @@ jobs:
       - if: ${{ !cancelled() }}
         run: pnpm ba:check-links
 
-      # The BA hubs carry generated inventory blocks — every use case's stories,
-      # shipped packages and bugs in one note. They are generated because the
-      # hand-maintained predecessor rotted: story-index.md read `Draft` for all
-      # twelve use cases while UC-08, UC-09 and UC-10 had shipped, and had no
-      # task or bug column at all. This fails if a block is stale.
-      - if: ${{ !cancelled() }}
-        run: node scripts/ba/spine.mjs --check
+      # NOTE — the two generator freshness gates that used to sit here
+      # (`spine.mjs --check` and `docs-index.mjs --check`) were REMOVED on
+      # 2026-08-26. They were the reason a lane had to regenerate a SHARED block
+      # inside its own PR: the hubs carry one row per item, so two lanes whose
+      # rows happen to sort adjacently conflicted on a file neither of them was
+      # really editing (measured on UC-09: three rows apart merged clean, adjacent
+      # rows conflicted). Freshness is not lost — `archive.mjs` regenerates the
+      # spine and `archive-to-main.sh` regenerates the folder indexes, both
+      # against `main` after the merge, where a pure function of the tree
+      # converges on a rebase instead of disagreeing.
+      #
+      # The VALIDATORS below stay: they only read, so they never conflict, and
+      # they are what actually catches a broken link or a bad status.
 
       # `ba:check-links` above covers docs/ only, because ba-archive.mjs exists to
       # sweep the BA tree. That left the larger half unchecked: CLAUDE.md, the root
@@ -250,15 +256,6 @@ jobs:
       # the PARA move a day earlier.
       - if: ${{ !cancelled() }}
         run: node scripts/ba/doc-links.mjs
-
-      # docs/engineering had ONE README — a flat hand-written index at the root
-      # covering thirteen folders. A root index is the thing that rots first: it
-      # is edited by whoever remembers it exists, and #2693 moved 42 files
-      # without it. The folder indexes are generated now, so this fails if a doc
-      # was added, renamed or retitled without regenerating them. Same
-      # hand-write-the-judgement/generate-the-inventory split as ba-spine above.
-      - if: ${{ !cancelled() }}
-        run: node scripts/ba/docs-index.mjs --check
 
       # terraform/ used to be executed for the FIRST time at deploy, inside the
       # deploy job's `terraform apply`. A bad module reference or undeclared
