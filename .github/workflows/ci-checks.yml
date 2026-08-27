@@ -33,7 +33,7 @@ on:
         type: boolean
         default: true
       e2e_changed_only:
-        description: 'Scope e2e to the changed service''s specs (broad/shared change → full suite, nothing relevant → skip). PR CI passes true; the production deploy gate leaves the default false → full suite. See scripts/ci/e2e/plan.sh.'
+        description: 'Scope e2e to the changed service''s specs (broad/shared change → full suite, nothing relevant → skip). PR CI passes true; the production deploy gate leaves the default false → full suite. See scripts/e2e/plan.sh.'
         type: boolean
         default: false
     outputs:
@@ -81,7 +81,20 @@ env:
 
 jobs:
   biome:
-    name: 1 · CI · Biome (format + lint)
+    # NAMED for the bundle, not for its first step. As `Biome (format + lint)`
+    # this job described one of its nine gates and mislabelled the other eight:
+    # `pnpm ba:check-links` was the failing step in 7 of 7 measured red runs, and
+    # every one of them showed up on the PR as "biome is red".
+    #
+    # The job ID stays `biome:` — it is the workflow_call output key read as
+    # `needs.checks.outputs.biome` in ci-pr.yml (R_BIOME) and in
+    # deploy-reusable.yml's ci-gate. Renaming the ID breaks both.
+    #
+    # ci-pr.yml's `noise` step routes per-job logs by DISPLAY NAME and must be
+    # changed with this, in the same commit: a rename it does not know about sends
+    # this job's log nowhere, and the run reports `biome_warnings: 0, clean: true`
+    # on a genuinely warning-laden PR — worse than the bad name ever was.
+    name: 1 · CI · Repo gates (biome, BA vault, shell, terraform)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -136,42 +149,60 @@ jobs:
 
       - uses: ./.github/actions/install
 
-      # Every gate below carries `if: ${{ !cancelled() }}`. These ten checks are
-      # INDEPENDENT — each reads the filesystem (or live DNS) and none consumes
-      # another's output — but Actions skips the rest of a job once a step fails,
-      # so the first one to go red used to hide the other nine. `1 · CI · Biome`
-      # then named a single gate and an agent fixed them one round trip at a
-      # time, which is the same pathology the e2e fail-fast layers had. Guarding
-      # each step makes the job's step list the report: every failing gate is
-      # named in one run. The job still concludes `failure` if any gate fails.
+      # Every gate below carries `if: ${{ !cancelled() }}` AND an explicit `name:`.
+      # These nine checks are INDEPENDENT — each reads the filesystem (or live
+      # DNS) and none consumes another's output — but Actions skips the rest of a
+      # job once a step fails, so the first one to go red used to hide the other
+      # eight, and the job then named a single gate while an agent fixed them one
+      # round trip at a time (the same pathology the e2e fail-fast layers had).
+      # Guarding each step makes the job's step list the report: every failing
+      # gate is named in one run. The job still concludes `failure` if any fails.
+      #
+      # The `name:`s are load-bearing for the same reason and were the missing
+      # half. Unnamed, Actions labels a step with its raw command, so the job's
+      # one visible fact stayed its own name — and the name described only the
+      # FIRST gate. Measured across the fleet, `pnpm ba:check-links` was the
+      # failing step in 7 of 7 red runs of this job, every one of which reads as
+      # "biome is red" on the PR. See `.claude/playbooks/ci-failure-catalog.md`
+      # § Repo gates.
+      #
+      # `scripts/check/exports.sh` was the one gate missing the guard the
+      # paragraph above already claimed they all had, so a red no-suppressions
+      # silently skipped it — the precise failure this guarding exists to stop,
+      # living inside the comment describing it.
       #
       # Resolve-PAT / checkout / install stay UNGUARDED above: if one of those
       # fails nothing downstream can run, and pretending otherwise would just
       # produce ten identical cascade errors.
-      - run: pnpm biome ci .
+      - name: Biome — format + lint
+        run: pnpm biome ci .
 
       # Repo-wide suppression/skip gate: no biome-ignore / eslint-disable /
       # @ts-ignore and no test skip in ANY form may exist in the codebase
       # (.claude/rules.md § "Never skip checks, never suppress").
-      - if: ${{ !cancelled() }}
-        run: bash scripts/gate/shape/no-suppressions.sh
+      - name: No suppressions / skipped tests
+        if: ${{ !cancelled() }}
+        run: bash scripts/check/no-suppressions.sh
 
       # Export-engine gate: no hand-built SheetJS workbook, no leaf route
       # streaming a spreadsheet/CSV inside the request, and no dataset in the
       # registry without its `_export` read. The estate this replaced had seven
       # exports and seven shapes; without a gate the eighth is the eighth way
       # (docs/engineering/architecture/exports.md).
-      - run: bash scripts/gate/data/exports.sh
+      - name: Export-engine gate
+        if: ${{ !cancelled() }}
+        run: bash scripts/check/exports.sh
 
       # Demo/test fixtures must never ship as a schema migration under
       # apis/*/migrations/ — they apply to Staging AND Production with no
       # environment filter (this has recurred twice; see
       # docs/ba/4-archive/scnpms/bugs/cross-module/2026-08-04-demo-fixture-data-live-in-staging-and-production.md).
       # Diff-scoped to files ADDED by this PR (HEAD^1 = the base parent on
-      # refs/pull/N/merge, same convention as scripts/ci/e2e/plan.sh) — the 22
+      # refs/pull/N/merge, same convention as scripts/e2e/plan.sh) — the 22
       # already-shipped demo migrations stay in place and must not retrigger.
-      - if: ${{ !cancelled() }}
-        run: bash scripts/gate/data/demo-migrations.sh
+      - name: No demo fixtures in migrations
+        if: ${{ !cancelled() }}
+        run: bash scripts/check/demo-migrations.sh
 
       # Email-authentication gate for the OTP sender domains: DKIM at
       # cf-bounce._domainkey, SPF at cf-bounce, bounce MX, exactly one DMARC
@@ -189,9 +220,9 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y -qq dnsutils
           }
-          bash scripts/gate/data/email-dns.sh
+          bash scripts/check/email-dns.sh
 
-      # The SHELL half of scripts/ — including scripts/gate/hook/**, the change-scoped
+      # The SHELL half of scripts/ — including scripts/hooks/**, the change-scoped
       # resolver (base-ref.sh), the e2e-plan decision that picks which specs THIS
       # workflow runs, the repo-wide gates, and the CI-repo resolver. Every one of
       # them fails silently in the direction that matters: a wrong answer still
@@ -202,7 +233,7 @@ jobs:
       # It runs in CI and not only via lefthook because that carve-out means a hook
       # or script change is never in `test:changed`'s scope, so the pre-commit gate
       # never reaches this suite. Before a step like this existed the suite had gone
-      # red unnoticed (scripts/gate/hook/remind/audit-vocab.sh had no test file, and the completeness
+      # red unnoticed (remind-audit-vocab.sh had no test file, and the completeness
       # check was flagging it into an empty room).
       #
       # Shallow-clone safe: scripts/lib/bash/base-ref.sh falls back to HEAD when no
@@ -214,7 +245,8 @@ jobs:
       # not run here: ppap runs the mirrored copy of this workflow, so the previous
       # revision still calls `test:hooks` until the next sync lands. Running both
       # would run the same 37 files twice.
-      - if: ${{ !cancelled() }}
+      - name: Shell test suite (scripts/)
+        if: ${{ !cancelled() }}
         run: pnpm test:scripts:bash
 
       # The BA tree's ~2,700 relative links, its `status:` vocabulary and its
@@ -231,7 +263,8 @@ jobs:
       #
       # Seconds, filesystem-only, no network. Not in pre-commit: docs PRs go
       # through /ship-docs, which deliberately runs nothing.
-      - if: ${{ !cancelled() }}
+      - name: BA vault — links, statuses, stranded items
+        if: ${{ !cancelled() }}
         run: pnpm ba:check-links
 
       # NOTE — the two generator freshness gates that used to sit here
@@ -248,7 +281,7 @@ jobs:
       # The VALIDATORS below stay: they only read, so they never conflict, and
       # they are what actually catches a broken link or a bad status.
 
-      # `ba:check-links` above covers docs/ only, because scripts/ba/archive.mjs exists to
+      # `ba:check-links` above covers docs/ only, because ba-archive.mjs exists to
       # sweep the BA tree. That left the larger half unchecked: CLAUDE.md, the root
       # README, ONBOARDING.md, all of .claude/, and every apis/*/README.md — 974
       # references with no gate at all. The 2026-08 split that moved seventeen
@@ -256,7 +289,8 @@ jobs:
       # of them; without this, nothing could have said whether one was wrong. It
       # found 150 broken links on the first run, and 7 that had been broken since
       # the PARA move a day earlier.
-      - if: ${{ !cancelled() }}
+      - name: Doc links (CLAUDE.md, .claude/, READMEs)
+        if: ${{ !cancelled() }}
         run: node scripts/ba/doc-links.mjs
 
       # terraform/ used to be executed for the FIRST time at deploy, inside the
@@ -275,8 +309,9 @@ jobs:
           terraform_version: '1.9.0'
           terraform_wrapper: false
 
-      - if: ${{ !cancelled() }}
-        run: bash scripts/gate/ci/terraform.sh
+      - name: Terraform validate
+        if: ${{ !cancelled() }}
+        run: bash scripts/check/terraform.sh
 
   # Typecheck, split across parallel legs — same reasoning as the Vitest matrix
   # above (389s as one job, and the dominant cost on any PR whose e2e is
@@ -580,7 +615,7 @@ jobs:
 
   # Plan the e2e run. Two responsibilities:
   #   1. Decide SCOPE — when e2e_changed_only is true (PR CI), diff the PR
-  #      (HEAD^1..HEAD on refs/pull/N/merge) through scripts/ci/e2e/plan.sh:
+  #      (HEAD^1..HEAD on refs/pull/N/merge) through scripts/e2e/plan.sh:
   #      full | scoped <specs> | skip. Otherwise (deploy gate) → full.
   #   2. Fan the effective shard count into a JSON array (`[1,2,...,N]`) for the
   #      matrix via fromJSON — full → e2e_shards shards; scoped → 1 shard (a
@@ -658,7 +693,7 @@ jobs:
           if [ "$CHANGED_ONLY" = "true" ]; then
             # HEAD^1 on refs/pull/N/merge = the base (main); the diff to HEAD is
             # exactly the PR's delta.
-            DECISION="$(E2E_PLAN_BASE=HEAD^1 bash scripts/ci/e2e/plan.sh)"
+            DECISION="$(E2E_PLAN_BASE=HEAD^1 bash scripts/e2e/plan.sh)"
             MODE="${DECISION%% *}"
             TARGETS="${DECISION#"$MODE"}"; TARGETS="${TARGETS# }"
           fi
@@ -670,7 +705,7 @@ jobs:
             scoped)
               # A scoped run USED to be pinned to exactly one shard, on the
               # assumption that "a handful of specs doesn't need 12 stacks".
-              # That assumption does not hold: scripts/ci/e2e/plan.sh emits spec
+              # That assumption does not hold: e2e-plan.sh emits spec
               # DIRECTORIES as well as files, and the groups are wildly uneven
               # — `sourcing`/`apis/sourcing` map to apps/shell/e2e/scpms, which
               # is 199 of the suite's 327 spec files. Those all ran serially in
@@ -859,7 +894,7 @@ jobs:
 
   # Seed the isolated e2e DB ONCE, in parallel with the zone builds (it only
   # needs the per-service migration scripts, not the dashboard build output).
-  # Isolated-state branch of scripts/dev/db/reset.sh: per-service `wrangler d1 migrations
+  # Isolated-state branch of db-reset.sh: per-service `wrangler d1 migrations
   # apply --persist-to .wrangler/state-e2e`, no ExMS demo seed — exactly the DB
   # each shard would have produced itself. Each shard is a separate runner, so
   # its untarred copy of the state dir is its own mutable DB — shard isolation
@@ -921,13 +956,13 @@ jobs:
 
       - name: Seed e2e database (once)
         env:
-          # scripts/dev/db/reset.sh restores the pre-migrated D1 snapshot, which lives on a
+          # db-reset.sh restores the pre-migrated D1 snapshot, which lives on a
           # release in the PRIVATE repo (it contains real seeded employee/budget
           # data and must not be public). Without a token `gh` cannot read it and
           # this job silently falls back to a full cold migration run — correct,
           # just slower — so the seed step would quietly lose its speedup.
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: STATE_DIR=.wrangler/state-e2e bash scripts/dev/db/reset.sh
+        run: STATE_DIR=.wrangler/state-e2e bash scripts/db/reset.sh
 
       # Mostly-incompressible sqlite — skip artifact gzip.
       - name: Package seed
@@ -1119,7 +1154,7 @@ jobs:
           if [ "$PROCEED" != "true" ]; then
             RESULT="$GATE_RESULT"
           elif [ "$DISPATCH" != "success" ]; then
-            # scripts/ci/fanout.mjs throws rather than dispatch a partial set, so a
+            # ci-fanout.mjs throws rather than dispatch a partial set, so a
             # failed dispatch means an unknown share of the suite never ran.
             RESULT=failure
           elif [ "$COLLECT" != "success" ] || [ "$COLLECT_RESULT" != "success" ]; then

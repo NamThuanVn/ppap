@@ -147,7 +147,7 @@ jobs:
       pr_number: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
       head_sha: ${{ github.event.client_payload.head_sha }}
       # PR CI runs only the changed service's e2e specs (broad/shared change →
-      # full; nothing relevant → skip; see scripts/ci/e2e/plan.sh). A manual main
+      # full; nothing relevant → skip; see scripts/e2e/plan.sh). A manual main
       # run has no PR diff to scope against → run the full suite.
       e2e_changed_only: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && true || false }}
     secrets:
@@ -285,7 +285,12 @@ jobs:
                   # jobs share the prefix and carry no test output.
                   case "$name" in
                     *"E2E (shard"*)  dest="$tmp/e2e.log" ;;
-                    *"Biome"*)       dest="$tmp/biome.log" ;;
+                    # BOTH arms, permanently: sync-workflows-to-ppap.yml rsyncs
+                    # file-by-file across the fleet, so there is a window where a
+                    # repo has the new ci-checks and the old ci-pr (or the
+                    # reverse). A single-arm match during that window silently
+                    # reports `biome_warnings: 0, clean: true`.
+                    *"Biome"*|*"Repo gates"*) dest="$tmp/biome.log" ;;
                     *"Unit tests"*)  dest="$tmp/test.log" ;;
                     *"Typecheck"*)   dest="$tmp/typecheck.log" ;;
                     *"ESLint"*)      dest="$tmp/eslint.log" ;;

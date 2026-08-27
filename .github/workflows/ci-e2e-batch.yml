@@ -8,7 +8,7 @@ name: CI · E2E batch (fan-out worker)
 # workflow runs one. The dispatching repo remains the COORDINATOR — it owns the
 # checkout ref, the zone builds, the DB seed, the commit Status and every PR
 # write. A batch does exactly one thing: run its shard indices and conclude.
-# The coordinator reads that conclusion (scripts/ci/fanout.mjs collect).
+# The coordinator reads that conclusion (ci-fanout.mjs collect).
 #
 # This file MUST keep its `ci-` prefix: sync-workflows-to-ppap.yml mirrors only
 # `ci-*.yml` to the CI fleet, and a fleet repo without this workflow is skipped
@@ -269,7 +269,7 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium
 
       # Same boot + reboot-once-on-infra-failure contract as the coordinator's
-      # shard job. A batch checkout always postdates scripts/ci/e2e/ci-boot.sh
+      # shard job. A batch checkout always postdates scripts/e2e/ci-boot.sh
       # (this workflow is newer), so there is no legacy inline-boot fallback —
       # a missing script is a hard, clearly-labelled error instead.
       - name: Boot e2e stack + run Playwright shard ${{ matrix.shard }}/${{ github.event.client_payload.total }}
@@ -281,8 +281,8 @@ jobs:
           NODE_OPTIONS: --dns-result-order=ipv4first
         run: |
           set -uo pipefail
-          if [ ! -f scripts/ci/e2e/ci-boot.sh ]; then
-            echo "::error::scripts/ci/e2e/ci-boot.sh is missing on this ref — rebase the PR onto main."
+          if [ ! -f scripts/e2e/ci-boot.sh ]; then
+            echo "::error::scripts/e2e/ci-boot.sh is missing on this ref — rebase the PR onto main."
             exit 1
           fi
           serve_alive() { local p; p="$(cat .wrangler/e2e-serve.pid 2>/dev/null || true)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
@@ -292,7 +292,7 @@ jobs:
             kill -TERM -- -"$p" 2>/dev/null || true; sleep 2; kill -KILL -- -"$p" 2>/dev/null || true
           }
           attempt() {
-            bash scripts/ci/e2e/ci-boot.sh || return 70
+            bash scripts/e2e/ci-boot.sh || return 70
             # shellcheck disable=SC2086  # E2E_TARGETS is an intentional path list
             PLAYWRIGHT_BASE_URL="http://localhost:$(cat .wrangler/e2e-port)" \
               pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL" $E2E_TARGETS
