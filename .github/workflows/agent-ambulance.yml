@@ -36,7 +36,7 @@ name: Agent · ambulance
 # under diagnosis.
 #
 # ATTEMPT BUDGET is spent by the CONTROLLER at dispatch, not here (see
-# loop-gate.mjs claimRepairAttempt). An ambulance can die without a verdict —
+# scripts/agent/board/loop/gate.mjs claimRepairAttempt). An ambulance can die without a verdict —
 # spot reclaim, timeout, exit 65 — and the controller is re-triggered on exactly
 # those completions plus every heartbeat tick, so counting at verdict time would
 # make the ambulance the new infinite loop. `attempt` in the payload only selects
