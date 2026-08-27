@@ -11,12 +11,12 @@ name: Local Stack · macOS / Linux / Windows
 # the local developer path: worktree:init's bootstrap, db:reset across 13 D1s,
 # link-monolith's ~360 per-file symlinks (Windows needs symlink privilege for
 # FILE links — junctions only cover dirs), and the bash-3.2/Git-Bash assumptions
-# in scripts/dev/stack/serve-monolith.sh. Those break per-OS, silently, and only a real
+# in scripts/dev/serve-monolith.sh. Those break per-OS, silently, and only a real
 # boot finds it.
 #
 # THE MCP WIRING IS IN SCOPE. `worktree:init`'s last three steps register the
-# Claude Code MCP servers, and scripts/dev/mcp/{sentry,playwright}.sh hard-fail
-# without the `claude` CLI while scripts/dev/mcp/databases.sh needs `uv` (it skips with a
+# Claude Code MCP servers, and scripts/mcp-{sentry,playwright}.sh hard-fail
+# without the `claude` CLI while mcp-databases.sh needs `uv` (it skips with a
 # hint otherwise). So this workflow installs BOTH toolchains up front and then
 # asserts, per OS, that every expected server actually landed in the registry —
 # a missing tool must be a red job, never a quiet skip. That is deliberately
@@ -202,7 +202,7 @@ jobs:
       #
       # Claude Code via npm, not the native installer: npm also drops an
       # extensionless `claude` sh shim, which is what `command -v claude` in
-      # scripts/dev/mcp/*.sh needs to find under Git Bash on Windows. Registration
+      # scripts/mcp-*.sh needs to find under Git Bash on Windows. Registration
       # (`claude mcp add/get/list`) is config-file work — no login required, and
       # no token is used anywhere in this workflow.
       - name: Install Claude Code CLI
@@ -210,7 +210,7 @@ jobs:
           npm install -g @anthropic-ai/claude-code
           claude --version
 
-      # uv backs scripts/dev/mcp/databases.sh (`uvx mcp-server-sqlite`). Official installer
+      # uv backs mcp-databases.sh (`uvx mcp-server-sqlite`). Official installer
       # rather than a third-party action: the ppap repos run an allowed-actions
       # policy (docs/engineering/platform/ppap-secrets.md § Public-repo security hardening), so adding an
       # action would need a policy change; a script needs none. Same command the
@@ -262,7 +262,7 @@ jobs:
           DB_SNAPSHOT: '0'
         run: pnpm worktree:init --verbose
 
-      # worktree:init exits 0 on a SKIPPED mcp step (scripts/dev/mcp/databases.sh prints a
+      # worktree:init exits 0 on a SKIPPED mcp step (mcp-databases.sh prints a
       # hint and exits 0 when uv is missing), so green init is not proof the
       # registry was written. Assert it directly, per OS.
       - name: Assert MCP servers registered
@@ -276,10 +276,10 @@ jobs:
           claude mcp list 2>&1 | tee mcp-list.txt || true
           echo ""
 
-          # sentry     → user scope   (scripts/dev/mcp/sentry.sh)
-          # playwright → local scope  (scripts/dev/mcp/playwright.sh)
+          # sentry     → user scope   (mcp-sentry.sh)
+          # playwright → local scope  (mcp-playwright.sh)
           # codegraph  → project scope, from the committed .mcp.json
-          # sqlite-*   → one per D1-backed service (scripts/dev/mcp/databases.sh, needs uv
+          # sqlite-*   → one per D1-backed service (mcp-databases.sh, needs uv
           #              AND the sqlite files db:reset just created)
           missing=""
           for server in sentry playwright codegraph sqlite-auth sqlite-hris; do
@@ -302,7 +302,7 @@ jobs:
           if [ -n "$missing" ]; then
             echo ""
             echo "❌  worktree:init finished green but these did not register:$missing"
-            echo "    (scripts/dev/mcp/databases.sh exits 0 when uv is absent — check the uv step above)"
+            echo "    (mcp-databases.sh exits 0 when uv is absent — check the uv step above)"
             exit 1
           fi
 
@@ -310,7 +310,7 @@ jobs:
           # `claude mcp list` health check spawns each server, so one line with a
           # connected status is end-to-end evidence: uv resolved, `uvx
           # mcp-server-sqlite` launched, and the D1 file db:reset produced is
-          # readable at the absolute path scripts/dev/mcp/databases.sh recorded.
+          # readable at the absolute path mcp-databases.sh recorded.
           #
           # Only sqlite-auth is gated. `sentry` legitimately reports "Needs
           # authentication" (no OAuth in CI, by design) and the npx-backed
@@ -358,7 +358,7 @@ jobs:
 
           # probe <url> <deadline-seconds> <label>
           # Liveness via `kill -0` (same idiom as wait_for_port in
-          # scripts/dev/stack/serve-monolith.sh, which already runs on Git Bash) so a dead
+          # scripts/dev/serve-monolith.sh, which already runs on Git Bash) so a dead
           # boot fails in seconds instead of burning the whole deadline.
           # 127.0.0.1, not localhost: the proxy binds dual-stack, but pinning
           # IPv4 removes the ::1-first resolution flake (docs/engineering/platform/testing.md).
