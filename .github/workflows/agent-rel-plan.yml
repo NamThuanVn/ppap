@@ -60,7 +60,7 @@ concurrency:
 env:
   PRIVATE_REPO: NamThuanVn/erp-namthuan
   # The agent fork — ONE shared namespace on purpose, and not because any one
-  # account is special. `claim-todo.mjs` creates the claim ref here
+  # account is special. `scripts/agent/board/claim/todo.mjs` creates the claim ref here
   # (`repos/<fork>/git/refs`) and that ref IS the atomic cross-lane lock: split
   # it per account and two lanes could claim the same issue. Which account owns
   # the fork is arbitrary, so it lives in ONE place — the ppap repo variable
