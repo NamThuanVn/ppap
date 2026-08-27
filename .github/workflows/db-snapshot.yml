@@ -4,7 +4,7 @@ name: DB · Publish local D1 snapshot
 # rolling release asset (tag `db-snapshot`) that every cold-start surface
 # restores instead of replaying all ~350 migrations:
 #
-#   local  `pnpm worktree:init` / `pnpm db:reset`  → scripts/db/reset.sh
+#   local  `pnpm worktree:init` / `pnpm db:reset`  → scripts/dev/db/reset.sh
 #   PR CI  `e2e-seed` job                          → ci-checks.yml
 #   agent  `/clear-todo-issue` runs                 → agent-clear-todo.yml
 #
@@ -125,7 +125,7 @@ jobs:
       # The checkout above is the TARGET REF, and this job runs THAT ref's copy of
       # the snapshot tooling — not main's. A ref from before the tooling landed
       # therefore fails in a genuinely dangerous way: `SEEDS=0` is just an unknown
-      # env var to an older db-reset.sh, so it silently applies the local-seed
+      # env var to an older scripts/dev/db/reset.sh, so it silently applies the local-seed
       # files and builds a SEEDED state. Publishing that would be actively harmful,
       # because local-seed/*.sql are non-idempotent INSERTs — every consumer would
       # restore the seeded rows and then insert them again.
@@ -138,14 +138,14 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          if [ ! -f scripts/db/snapshot-manifest.mjs ]; then
-            echo "::error::scripts/db/snapshot-manifest.mjs is missing at this ref."
+          if [ ! -f scripts/dev/db/snapshot-manifest.mjs ]; then
+            echo "::error::scripts/dev/db/snapshot-manifest.mjs is missing at this ref."
             fail=1
           fi
           # The load-bearing check: without SEEDS support the build silently
           # produces a seeded snapshot instead of a migrations-only one.
-          if ! grep -q 'SEEDS' scripts/db/reset.sh; then
-            echo "::error::scripts/db/reset.sh at this ref has no SEEDS support, so SEEDS=0 would be ignored and the snapshot would contain non-idempotent local-seed rows."
+          if ! grep -q 'SEEDS' scripts/dev/db/reset.sh; then
+            echo "::error::scripts/dev/db/reset.sh at this ref has no SEEDS support, so SEEDS=0 would be ignored and the snapshot would contain non-idempotent local-seed rows."
             fail=1
           fi
           if [ "$fail" != 0 ]; then
@@ -158,7 +158,7 @@ jobs:
 
       # DB_SNAPSHOT=0 is load-bearing: the producer must build from scratch and
       # never from its own previous output, or any drift would compound forever.
-      # SEEDS=0 stops db-reset.sh right after the migrations — local-seed/*.sql
+      # SEEDS=0 stops scripts/dev/db/reset.sh right after the migrations — local-seed/*.sql
       # are non-idempotent INSERTs and must not be baked into the artifact.
       - name: Build migrations-only D1 state (cold)
         run: |
@@ -166,7 +166,7 @@ jobs:
           STATE_DIR=.wrangler/state-snapshot \
           SEEDS=0 \
           DB_SNAPSHOT=0 \
-            bash scripts/db/reset.sh
+            bash scripts/dev/db/reset.sh
 
       # The manifest is what makes a restore trustworthy: it records the sha256
       # of every migration baked into the snapshot, so a consumer can detect a
@@ -174,7 +174,7 @@ jobs:
       # d1_migrations' filename-only tracking would silently skip) and cold-run
       # instead. Built from the same checkout that just produced the state.
       - name: Generate manifest
-        run: node scripts/db/snapshot-manifest.mjs > manifest.json
+        run: node scripts/dev/db/snapshot-manifest.mjs > manifest.json
 
       - name: Package snapshot
         run: |

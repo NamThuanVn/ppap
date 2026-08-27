@@ -88,7 +88,7 @@ env:
   # the agent account's own fork — push works without a cross-account grant. Must
   # exist before the first run (gh repo fork NamThuanVn/erp-namthuan
   # The agent fork — ONE shared namespace on purpose, and not because any one
-  # account is special. `claim-todo.mjs` creates the claim ref here
+  # account is special. `scripts/agent/board/claim/todo.mjs` creates the claim ref here
   # (`repos/<fork>/git/refs`) and that ref IS the atomic cross-lane lock: split
   # it per account and two lanes could claim the same issue. Which account owns
   # the fork is arbitrary, so it lives in ONE place — the ppap repo variable
@@ -353,7 +353,7 @@ jobs:
       # The codegraph MCP server serves a ~330MB gitignored SQLite index.
       # Content-keyed cache (NOT github.sha — that would be THIS repo's sha).
       # The index BUILD happens inside worktree:init below (its mcp:codegraph
-      # step runs scripts/mcp/codegraph.sh: exact cache hit → skip, stale
+      # step runs scripts/dev/mcp/codegraph.sh: exact cache hit → skip, stale
       # restore → fast `codegraph sync`, miss → full `init -i`) — there is
       # deliberately NO separate build step (it would run the same script
       # twice).
@@ -582,7 +582,7 @@ jobs:
       # It used to merely COMMENT "may be stranded", leaving the item In
       # Progress + assigned — invisible to the claim sweep, which wants Todo +
       # unassigned — until agent-loop's stranded pass noticed hours later. It
-      # now RELEASES it (unassign + board → Todo, via release-claim.mjs) so
+      # now RELEASES it (unassign + board → Todo, via scripts/agent/board/claim/release.mjs) so
       # every path out of this workflow hands the item back for the next pick.
       # Open PRs and claim branches stay put: the next claim resumes the PR and
       # the stale-ref rule owns a dead branch.
