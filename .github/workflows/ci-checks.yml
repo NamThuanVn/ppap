@@ -223,9 +223,11 @@ jobs:
       # seven-word vocabulary (a value in neither set neither mints nor archives:
       # `status: open` hid a critical data-loss report for 26 days), on a channel
       # folder with no README (git does not track empty dirs, so the channel
-      # vanishes), on a finished item still sitting in 1-projects/, and on any
-      # link a move broke. It also asserts the sweep can still SEE the tree —
-      # point it one level off and every other check passes vacuously.
+      # vanishes), on a finished item STRANDED in 1-projects/ (terminal at the
+      # change's base too — a PR flipping its OWN item to `done` is exempt, since
+      # the post-merge sweep on main archives it), and on any link a move broke.
+      # It also asserts the sweep can still SEE the tree — point it one level
+      # off and every other check passes vacuously.
       #
       # Seconds, filesystem-only, no network. Not in pre-commit: docs PRs go
       # through /ship-docs, which deliberately runs nothing.
