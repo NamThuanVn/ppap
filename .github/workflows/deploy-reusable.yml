@@ -244,7 +244,7 @@ jobs:
         env:
           DEPLOY_ONLY_CHANGED: ${{ inputs.deploy_only_changed }}
           # Prefer the last-successful-deploy baseline; fall back to the payload's
-          # previous-push tip (and compute-deploy-targets.sh full-deploys if empty).
+          # previous-push tip (and scripts/ci/deploy-targets.sh full-deploys if empty).
           BASE_SHA: ${{ steps.baseline.outputs.base_sha || inputs.base_sha }}
         run: scripts/ci/deploy-targets.sh
 
@@ -466,7 +466,7 @@ jobs:
       fail-fast: false
       matrix:
         # The changed subset (full canonical list on a full/production deploy) —
-        # computed by the `changes` job. See compute-deploy-targets.sh.
+        # computed by the `changes` job. See scripts/ci/deploy-targets.sh.
         service: ${{ fromJSON(needs.changes.outputs.workers) }}
 
     steps:

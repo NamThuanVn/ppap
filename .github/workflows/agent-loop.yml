@@ -78,7 +78,7 @@ on:
   # An "Agent · ambulance" completion is in this list for the same reason a lane
   # completion is: an ambulance that dies without a verdict must still re-arm the
   # controller. That cannot loop, because the attempt is charged at DISPATCH
-  # (loop-gate.mjs), not at verdict.
+  # (scripts/agent/board/loop/gate.mjs), not at verdict.
   # "Agent · loop heartbeat" is the 15-min BACKSTOP (controller-self-reclaim
   # gap), kept in its own workflow so it can be enabled/disabled from the Actions
   # UI without touching this controller. It does nothing but complete on
@@ -267,7 +267,7 @@ jobs:
           fetch-depth: 1
           # The whole `scripts` tree: this job runs scripts/ci/ppap/pat-pool.sh
           # ("Resolve PAT pool logins") AND scripts/agent/board/*.mjs, and the
-          # board scripts import a sibling lib.mjs.
+          # board scripts import a sibling lib/api.mjs.
           sparse-checkout: scripts
           persist-credentials: false
 
@@ -334,7 +334,7 @@ jobs:
           COUNT_ONLY: '1'
           # In scope even though COUNT_ONLY never touches the fork: every step
           # that runs a board script passes it, so nothing depends on which code
-          # path happens to avoid it. scripts/check/agent-board-env.mjs enforces.
+          # path happens to avoid it. scripts/gate/ci/agent-board-env.mjs enforces.
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
         run: node scripts/agent/board/claim/todo.mjs
 
