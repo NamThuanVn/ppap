@@ -305,6 +305,21 @@ jobs:
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
         run: node scripts/agent/board/claim/reclaim-stranded.mjs
 
+      # A salvage PR is dead the moment its issue closes — the work either
+      # landed through a later claim or was decided against, and the branch is
+      # protecting nothing. Left open they accumulate one per interrupted run
+      # and, because a PR is a board item too, they bury the In-Progress column:
+      # after the 2026-08-28…30 pool-exhaustion burst, 21 of 24 open PRs and 21
+      # of 31 In-Progress cards were superseded salvages. Swept here rather than
+      # from finalize-merged because most items close with no executor at all
+      # (a `Closes #` trailer, a lost verdict, a human).
+      - name: Reap superseded salvage PRs
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+        run: node scripts/agent/board/recover/reap-salvage.mjs
+
       # ── Loop hold: the FIRST question, before the backlog matters ─────────
       # A lane that died outside its Claude session left a `harness-broken` hold;
       # a spent token pool left a timed `pool-exhausted` one. Either way no lane
