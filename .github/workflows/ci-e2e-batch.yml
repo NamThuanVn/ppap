@@ -297,8 +297,8 @@ jobs:
             PLAYWRIGHT_BASE_URL="http://localhost:$(cat .wrangler/e2e-port)" \
               pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL" $E2E_TARGETS
           }
-          attempt
-          rc=$?
+          rc=0
+          attempt || rc=$?
           [ "$rc" -eq 0 ] && exit 0
           if [ "$rc" -ne 70 ] && serve_alive; then
             echo "::error::shard $SHARD/$TOTAL failed with the stack still alive — a genuine test failure, not retrying"
