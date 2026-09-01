@@ -16,6 +16,34 @@ name: Agent · loop heartbeat
 # repository_dispatch call, no token needed here). Frequent (15 min) is fine
 # because this workflow is independently disableable — turn it off if it ever
 # gets noisy; the event-driven loop keeps running either way.
+#
+# WHY SELF-HOSTED (panda). On GitHub-hosted runners this "15-minute" backstop was
+# firing every 3-6 HOURS: observed ticks at 00:32, 20:59, 15:19, 07:26, 01:15 —
+# gaps of hours against a `*/15` cron. NamThuanVn shares a 20-concurrent-job cap
+# across the deploy graph, PR CI and up to six 330-minute agent lanes, and a
+# scheduled run that cannot get a hosted runner in time is dropped rather than
+# queued forever. The panda pool has its own capacity and does not compete for
+# that cap, so a tick lands when it is due.
+#
+# Honest limitation: this does NOT fix cron drift itself. GitHub delays the
+# `schedule` EVENT at the scheduler, upstream of runner assignment, and no
+# `runs-on` can change that. What panda removes is the capacity half — the
+# dropped-because-no-runner-was-free case, which is what the hour-long gaps above
+# actually were. Expect better, not perfect: if ticks are still missed, the fix
+# is an external trigger, not another runner.
+#
+# Self-hosted on a PUBLIC repo is normally a serious footgun — a fork PR can run
+# arbitrary code on your machine. It is safe HERE, and only here, because this
+# workflow has no `pull_request` trigger (schedule + manual dispatch only), no
+# checkout, no secrets and `permissions: {}`. It runs one `echo`. Do not copy
+# this `runs-on` into a ppap workflow that builds or tests a contributor's code.
+#
+# If the panda pool is ever down, this backstop stops ticking silently. That is
+# survivable by design — the loop's PRIMARY trigger is every lane completion, and
+# this only covers the controller-self-reclaim gap — but if panda is down for
+# long, set a REPO-level `USE_SELF_HOSTED_RUNNER=false` on ppap — a repo variable
+# overrides the org one — to fall straight back to hosted runners. No PR needed;
+# that is the point of routing this through the variable.
 
 on:
   schedule:
@@ -24,15 +52,35 @@ on:
 
 permissions: {}
 
-# One heartbeat at a time.
+# One heartbeat at a time, and NEVER a queue of them. On hosted runners a tick
+# that could not start was simply dropped, so `cancel-in-progress: false` cost
+# nothing. A self-hosted pool queues instead: three panda runners are shared with
+# the private repo's own workflows, so a busy pool plus a `*/15` cron would stack
+# pending ticks and then fire them in a burst. Superseding is safe precisely
+# because the SIGNAL is the completion, not the work — agent-loop triggers on
+# `workflow_run: [completed]`, which fires for a cancelled run too, so a
+# superseded tick still re-probes the controller. Nothing is lost.
 concurrency:
   group: agent-loop-heartbeat
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   tick:
     name: Heartbeat tick
-    runs-on: ubuntu-latest
+    # Same gate the private repo's workflows use, so panda is one variable away
+    # from being switched off everywhere it is used. Driven by the ORG-level
+    # `USE_SELF_HOSTED_RUNNER=true` (visibility=all), which is what makes it reach
+    # ppap — the variable had previously only ever been set per-repo on
+    # erp-namthuan, and this workflow runs in ppap. Unset or any other value falls
+    # back to `ubuntu-latest`, i.e. exactly today's behaviour, so a missing
+    # variable degrades to the status quo rather than to a job that queues
+    # forever. Org runner group `panda` is visibility=all with
+    # allows_public_repositories=true, so ppap is permitted to use it.
+    #
+    # This workflow is currently the ONLY ppap-synced one reading that variable —
+    # deliberately. Adding it to a workflow that builds or tests contributor code
+    # would put fork PRs on your own machines; see the security note above.
+    runs-on: ${{ vars.USE_SELF_HOSTED_RUNNER == 'true' && fromJSON('["self-hosted", "panda"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Tick
