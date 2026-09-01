@@ -318,6 +318,45 @@ jobs:
           exit 0
 
       # ── Heavy bootstrap — skipped entirely on an empty backlog ────────────
+      # ── Runner headroom ───────────────────────────────────────────────────
+      # A lane runs a Next build, the monolith worker stack, Playwright Chromium
+      # and the agent's own tooling on one hosted runner, and it was losing: SIX
+      # of the seven agent failures in the 2026-08-31…09-01 window were the
+      # RUNNER dying under the job — exit 137 (OOM kill), exit 143 (teardown) and
+      # "the hosted runner lost communication with the server" — not the agent
+      # failing at its item. Every one of those also skipped the whole `always()`
+      # recovery tail, so the claimed item stranded In Progress and nothing
+      # alerted (scripts/agent/board/recover/sweep-dead-lanes.mjs now catches that; this step is the half
+      # that stops it happening).
+      #
+      # Reclaiming the preinstalled toolchains this job never touches, and giving
+      # the kernel real swap to fall back on, is what lets a lane survive its own
+      # peak. Swapping is slow; being killed is slower. Best-effort throughout —
+      # a runner image that has moved things around must not fail the lane.
+      - name: Give the runner headroom (disk + swap)
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          echo "· before"; df -h / /mnt 2>/dev/null | sed 's/^/  /'; free -h | sed 's/^/  /'
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/powershell 2>/dev/null || true
+          # The image ships a 4 GB swapfile on /mnt (the large temp disk). A
+          # lane's peak needs more than that sitting on top of the runner's RAM.
+          SWAP=/mnt/swapfile
+          if sudo swapoff "$SWAP" 2>/dev/null; sudo rm -f "$SWAP" 2>/dev/null && \
+             sudo fallocate -l 16G "$SWAP" && sudo chmod 600 "$SWAP" && \
+             sudo mkswap "$SWAP" >/dev/null && sudo swapon "$SWAP"; then
+            echo "· swap enlarged to 16G"
+          else
+            echo "::warning::could not enlarge the swapfile — this lane runs on stock swap and may be OOM-killed"
+          fi
+          # Swap is only insurance if the kernel reaches for it before the OOM
+          # killer does.
+          sudo sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
+          echo "· after"; df -h / /mnt 2>/dev/null | sed 's/^/  /'; free -h | sed 's/^/  /'
+          exit 0
+
       - name: Install dependencies
         if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         uses: ./.github/actions/install

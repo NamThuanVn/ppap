@@ -143,6 +143,17 @@ jobs:
       CAP_VAR: ${{ vars.AGENT_MAX_PARALLEL || '' }}
       TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
     steps:
+      # The board scripts keep their run state here (dead-lanes.json is handed
+      # from the dead-lane sweep to the stranded sweep through it). Set at STEP
+      # level, never in `jobs.<id>.env`: `runner` is not a context there, and
+      # GitHub rejects the whole workflow file rather than evaluating it to empty
+      # — see the same note in agent-clear-todo.yml.
+      - name: Pin the harness state dir
+        run: |
+          set -euo pipefail
+          echo "AGENT_STATE_DIR=${RUNNER_TEMP}/agent-state" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/agent-state"
+
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
       # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
       # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
@@ -295,6 +306,56 @@ jobs:
           L=$(bash scripts/ci/ppap/pat-pool.sh --logins || true)
           echo "AGENT_LOGINS=$L" >> "$GITHUB_ENV"
           echo "claim owners: ${L:-<none — sweep uses its own login>}"
+
+      # ── Dead-lane sweep: the EXTERNAL dead-man's switch ───────────────────
+      # A lane the RUNNER killed (OOM 137, SIGTERM 143, lost communication) never
+      # runs its own `always()` steps — not "Capture failure", not "Salvage or
+      # revert", not even "Notify Telegram on failure". So the fleet used to lose
+      # the item AND the alert AND the classification on exactly the failure mode
+      # that was killing most lanes. Classifying from out here is the only place
+      # it can be done, and it must run BEFORE the stranded sweep, which consumes
+      # its dead-lanes.json to release those claims without a grace period.
+      - name: Sweep dead lanes
+        id: dead
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+          DEAD_LANE_LOOKBACK_H: ${{ vars.DEAD_LANE_LOOKBACK_H || '3' }}
+        run: node scripts/agent/board/recover/sweep-dead-lanes.mjs
+
+      # The alert the dead lane could not send for itself. Gated on held_first so
+      # a teardown that kills six lanes at once pages once — the hold coalesces
+      # them by fingerprint, exactly as the in-lane notify does.
+      - name: Notify Telegram on a torn-down lane
+        if: steps.dead.outputs.held_first == 'true'
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          CLASSES: ${{ steps.dead.outputs.classes }}
+          DEAD_RUN_URL: ${{ steps.dead.outputs.run_url }}
+        run: |
+          set -uo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured — skipping notify."
+            exit 0
+          fi
+          TEXT="🤖🚨 <b>Agent lane torn down by the runner</b> — ${CLASSES:-unknown}"
+          TEXT="${TEXT}"$'\n'"The loop is held; an ambulance is being dispatched."
+          TEXT="${TEXT}"$'\n'"<a href=\"${DEAD_RUN_URL}\">View the killed run</a>"
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" \
+            -d parse_mode=HTML \
+            -d disable_web_page_preview=true \
+            && echo "✓ Telegram torn-down alert sent." \
+            || echo "::warning::Telegram notify failed."
+          exit 0
 
       - name: Reclaim stranded items
         continue-on-error: true
@@ -486,3 +547,36 @@ jobs:
           # counts them and can't over-provision past the cap.
           echo "settling 20s for run-creation visibility…"
           sleep 20
+
+      # The controller's own death used to be the quietest failure in the system:
+      # no lane is dispatched, no hold is written (the hold step may never have
+      # run), and every board and dashboard stays green. The NEXT tick's
+      # control-plane sweep holds the fleet and calls an ambulance for it; this
+      # step is the immediate human-facing half, because "the fleet stopped" is
+      # worth knowing before the next tick.
+      - name: Notify Telegram on controller failure
+        if: failure()
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured — skipping notify."
+            exit 0
+          fi
+          TEXT="🤖🚨 <b>Agent loop CONTROLLER failed</b>"
+          TEXT="${TEXT}"$'\n'"No lanes can be dispatched until this clears."
+          TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" -d parse_mode=HTML \
+            -d disable_web_page_preview=true >/dev/null \
+            && echo "✓ Telegram controller-failure alert sent." \
+            || echo "::warning::Telegram notify failed."
+          exit 0
