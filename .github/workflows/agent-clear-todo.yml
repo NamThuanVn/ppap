@@ -306,15 +306,22 @@ jobs:
             echo "::notice::session artifact unavailable/expired — fresh start from the salvage branch"
             exit 0
           fi
-          PROJECT_DIR=$(RESTORE="$RESTORE" node -e "console.log(JSON.parse(require('fs').readFileSync(process.env.RESTORE + '/session-meta.json','utf8')).project_dir || '')" 2>/dev/null)
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "::notice::no project_dir in session-meta — fresh start"
-            exit 0
-          fi
+          # claude --resume only finds a session under the project dir matching
+          # the CURRENT cwd, and it is invoked from this checkout root (the "Run
+          # agent" step never cd's before starting claude). The salvaged
+          # session's own recorded project_dir is frequently the WORKTREE it
+          # ended in (solve sessions EnterWorktree mid-run — CLAUDE.md's
+          # worktree-only rule), which is a different project dir than this
+          # checkout root and so was never found on resume ("No conversation
+          # found with session ID: …", reproduced locally). Placing it under the
+          # dir Claude derives from $PWD — the same dir "Run agent" resumes
+          # from — is what makes it findable; the file's own transcript still
+          # carries the worktree paths it needs once resumed.
+          PROJECT_DIR="${PWD//\//-}"
           mkdir -p "$HOME/.claude/projects/$PROJECT_DIR"
           cp "${RESTORE}/${SESSION_ID}.jsonl" "$HOME/.claude/projects/$PROJECT_DIR/"
           echo "RESUME_SESSION_ID=$SESSION_ID" >> "$GITHUB_ENV"
-          echo "✓ session $SESSION_ID restored for resume"
+          echo "✓ session $SESSION_ID restored for resume (project dir: $PROJECT_DIR)"
           exit 0
 
       # ── Heavy bootstrap — skipped entirely on an empty backlog ────────────
