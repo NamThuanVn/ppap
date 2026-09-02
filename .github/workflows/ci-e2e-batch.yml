@@ -136,7 +136,14 @@ jobs:
     needs: plan
     if: ${{ needs.plan.outputs.run == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 30 was exhausted twice by cumulative shard runtime under fan-out
+    # contention (PR #3093, two dispatches, shard 8: test 71/73 — MSG-88's
+    # own 420s test.setTimeout, apps/shell/e2e/messenger-mute-duration.spec.ts
+    # — only got to START at ~26min into the job). The job ceiling killed the
+    # run, not any one test's own timeout; widen rather than rerun-dodge, per
+    # that spec's own history of widening its test timeout for the same
+    # symptom.
+    timeout-minutes: 40
     strategy:
       # Every shard runs to completion. This was `true`, and together with
       # `maxFailures: 1` (playwright.config.ts) and the fan-out's cross-batch
