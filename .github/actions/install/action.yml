@@ -5,18 +5,123 @@ runs:
   using: composite
   # NODE_OPTIONS=--no-deprecation on every node-running setup step drops Node
   # deprecation warnings (e.g. "[DEP0169] DeprecationWarning: url.parse()")
-  # emitted by the third-party setup tooling (pnpm/action-setup, setup-node) —
-  # CI-log noise we can't fix at the source. Scoped to setup only, so genuine
-  # deprecations in our own build / test / e2e steps still surface.
+  # emitted by the third-party setup tooling (setup-node) — CI-log noise we
+  # can't fix at the source. Scoped to setup only, so genuine deprecations in
+  # our own build / test / e2e steps still surface.
   steps:
-    - uses: pnpm/action-setup@v6
-      env:
-        NODE_OPTIONS: --no-deprecation
+    # pnpm comes from its own standalone release binary, NOT pnpm/action-setup.
+    #
+    # action-setup@v6 caches nothing. Every job ran `npm ci` in ~/setup-pnpm to
+    # fetch a BOOTSTRAP pnpm — v11.19.0, hardcoded in the action's own committed
+    # lockfile — and then `pnpm self-update`d that down to our `packageManager`
+    # version. Two registry.npmjs.org round-trips per job, on the critical path
+    # of all 13 jobs that use this action. When ~32 e2e shards start in the same
+    # second they all hit npm at once and get throttled: in ppap run
+    # 33861353394 that `npm ci` took 24s on shards 3 and 15 but 4-7 MINUTES on
+    # shards 7, 11, 19, 23, 27 and 31 — and shards 7/23/31 unblocked within the
+    # same second of each other, the signature of one shared throttle releasing.
+    # 100% of the spread in that job's install step (43s vs 447s) was inside it.
+    #
+    # Neither of action-setup's knobs fixes this. `version:` only changes which
+    # version self-update targets, not the bootstrap, so the `npm ci` still runs;
+    # `standalone: true` swaps the bootstrap for @pnpm/exe, which is BIGGER and
+    # carries an install script. The npm hop is unavoidable through that action.
+    #
+    # A GitHub release asset plus actions/cache takes npm off the hot path
+    # entirely: ~1-2s restored from cache, a few seconds on a miss, and the
+    # download retries instead of queueing behind a registry rate limit.
+    - name: Resolve pnpm version
+      id: pnpm
+      shell: bash
+      run: |
+        set -euo pipefail
+        version="$(grep -o '"packageManager"[[:space:]]*:[[:space:]]*"pnpm@[^"+]*' package.json | sed 's/.*pnpm@//')"
+        if [ -z "$version" ]; then
+          echo "::error::could not read a pnpm version from package.json \"packageManager\""
+          exit 1
+        fi
+        # Only linux runners use this action (all 13 callers are ubuntu-latest).
+        # Anything else fails here with a clear message rather than 404ing on an
+        # asset name that doesn't exist.
+        if [ "$(uname -s)" != "Linux" ]; then
+          echo "::error::this action only provides a pnpm binary for Linux, got $(uname -s)"
+          exit 1
+        fi
+        case "$(uname -m)" in
+          x86_64) arch=x64 ;;
+          aarch64 | arm64) arch=arm64 ;;
+          *)
+            echo "::error::no pnpm standalone binary for arch $(uname -m)"
+            exit 1
+            ;;
+        esac
+        {
+          echo "version=$version"
+          echo "arch=$arch"
+          echo "dir=$HOME/.cache/pnpm-bin"
+        } >> "$GITHUB_OUTPUT"
 
+    # Single-line `path:` on purpose. scripts/gate/ci/cache-paths.mjs finds the
+    # node_modules cache step by scanning for the first block-scalar path entry,
+    # so a second block scalar above it would make the gate audit the wrong
+    # step. (Don't write that marker literally anywhere above it either — the
+    # scan is line-based and will happily match a comment.)
+    - name: Restore pnpm binary
+      id: pnpm-bin
+      uses: actions/cache@v6
+      with:
+        path: ${{ steps.pnpm.outputs.dir }}
+        key: pnpm-bin-${{ runner.os }}-${{ steps.pnpm.outputs.arch }}-${{ steps.pnpm.outputs.version }}
+
+    - name: Download pnpm binary
+      if: steps.pnpm-bin.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        PNPM_DIR: ${{ steps.pnpm.outputs.dir }}
+        PNPM_VERSION: ${{ steps.pnpm.outputs.version }}
+        PNPM_ARCH: ${{ steps.pnpm.outputs.arch }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$PNPM_DIR"
+        curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --max-time 300 \
+          -o "$PNPM_DIR/pnpm" \
+          "https://github.com/pnpm/pnpm/releases/download/v${PNPM_VERSION}/pnpm-linux-${PNPM_ARCH}"
+        chmod +x "$PNPM_DIR/pnpm"
+
+    - name: Put pnpm on PATH
+      shell: bash
+      env:
+        PNPM_DIR: ${{ steps.pnpm.outputs.dir }}
+        PNPM_VERSION: ${{ steps.pnpm.outputs.version }}
+      run: |
+        set -euo pipefail
+        echo "$PNPM_DIR" >> "$GITHUB_PATH"
+        # Assert the binary is the version we asked for. A cache entry that was
+        # evicted mid-save, or truncated, otherwise surfaces much later as an
+        # unrelated-looking lockfile or engine error.
+        actual="$("$PNPM_DIR/pnpm" --version)"
+        if [ "$actual" != "$PNPM_VERSION" ]; then
+          echo "::error::pnpm reports $actual, expected $PNPM_VERSION"
+          exit 1
+        fi
+        echo "pnpm $actual"
+
+    # No `cache: pnpm` here, deliberately. setup-node keys its pnpm-store cache
+    # on hashFiles('pnpm-lock.yaml') and restores with the primary key only (no
+    # restore-keys — see actions/setup-node src/cache-restore.ts, which passes
+    # restoreKeys for yarn berry and nothing else). So it could never help us:
+    #
+    #   - lockfile unchanged → the node_modules cache below HITS, `pnpm install`
+    #     is skipped, and the store is never read. ~447MB and ~10s of download
+    #     per job, for nothing.
+    #   - lockfile changed → node_modules misses AND the store key misses too,
+    #     so `pnpm install` runs against an empty store either way.
+    #
+    # It only paid off when pnpm-workspace.yaml changed while the lockfile did
+    # not, which is a workspace-root edit — rare, and cheap to eat.
     - uses: actions/setup-node@v7
       with:
         node-version: '22'
-        cache: pnpm
       env:
         NODE_OPTIONS: --no-deprecation
 
