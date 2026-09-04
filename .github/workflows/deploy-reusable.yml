@@ -124,6 +124,13 @@ permissions: read-all
 
 env:
   PRIVATE_REPO: NamThuanVn/erp-namthuan
+  # Every wrangler call in this workflow is one-shot (build --dry-run, vectorize,
+  # deploy) and must exit. Wrangler's banner runs an npm version check whose
+  # request it abandons after 3s without destroying it, leaving a ref'd socket to
+  # registry.npmjs.org that keeps node alive. If the registry is ever slow from
+  # the runner, the deploy would SUCCEED and then hang until the job timeout —
+  # reported as a failed deploy. Hiding the banner skips the check entirely.
+  WRANGLER_HIDE_BANNER: "true"
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
