@@ -543,13 +543,15 @@ jobs:
         run: node scripts/agent/board/recover/salvage-or-revert.mjs
 
       # Board hygiene, EVERY run (backlog-empty and wrapper runs included): a
-      # sub-issue can close without its executor running (the PR's `Closes #`
+      # child can close without its executor running (the PR's `Closes #`
       # trailer fired but the run died before finalize-merged — run
       # 29796598866 left batch-main #1182 open with every child closed), and
       # the claim-time sweep only runs on the NEXT claim, which a
-      # non-chaining failed run never triggers. Close any batch-main whose
-      # children are all closed + board Done. Idempotent, a handful of API
-      # calls, never reds the job.
+      # non-chaining failed run never triggers. Close any PARENT whose children
+      # are all closed + board Done — a SPLIT-decomposed original (the normal
+      # case: a split now leaves the original open In Progress parenting its own
+      # slices) or a legacy per-PR batch main still draining. Idempotent, a
+      # handful of API calls, never reds the job.
       - name: Reconcile parent issues
         if: always()
         env:

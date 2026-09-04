@@ -162,22 +162,23 @@ jobs:
           echo "✓ workspace on upstream main $(git rev-parse --short HEAD) · acting as @$LOGIN"
 
       # The SAME query as agent-loop.yml's gate and the recount below: open
-      # leaf (by leaf marker — batch mains never plan) lacking `rel-planned`.
-      # The batch exclusion runs FIRST and is not optional: a batch main can
+      # leaf (by leaf marker — parents never plan) lacking `rel-planned`.
+      # The parent exclusion runs FIRST and is not optional: a batch main can
       # QUOTE a leaf marker in its body (e.g. #2252 pasting the re-mint guard
-      # marker into its PR description), which matches the leaf regex and
-      # would make this query see a leaf the planner correctly refuses to plan
-      # — gate says 1, planner says 0, recount fails forever.
+      # marker into its PR description), and a SPLIT-decomposed original
+      # (`ba-decomposed-into:`) genuinely carries one — both match the leaf
+      # regex and would make this query see a leaf the planner correctly
+      # refuses to plan — gate says 1, planner says 0, recount fails forever.
       - name: Detect unplanned leaves
         id: sweep
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -euo pipefail
-          UNPLANNED=$(for L in ba-bug ba-task ba-change ba-feature; do
+          UNPLANNED=$(for L in bug task slice feature ba-bug ba-task ba-slice ba-change ba-change-package ba-feature; do
             gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
               --json number,body,labels --limit 200 \
-              --jq '.[] | select(.body | test("<!--\\s*ba-(bugs|change-packages|features)-batch:") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
+              --jq '.[] | select(.body | test("<!--\\s*ba-((bugs|change-packages|features)-batch|decomposed-into):") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
           done | sort -u | wc -l | tr -d ' ')
           echo "unplanned=$UNPLANNED" >> "$GITHUB_OUTPUT"
           if [ "$UNPLANNED" -eq 0 ]; then
@@ -217,10 +218,10 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -euo pipefail
-          LEFT=$(for L in ba-bug ba-task ba-change ba-feature; do
+          LEFT=$(for L in bug task slice feature ba-bug ba-task ba-slice ba-change ba-change-package ba-feature; do
             gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
               --json number,body,labels --limit 200 \
-              --jq '.[] | select(.body | test("<!--\\s*ba-(bugs|change-packages|features)-batch:") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
+              --jq '.[] | select(.body | test("<!--\\s*ba-((bugs|change-packages|features)-batch|decomposed-into):") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
           done | sort -u | wc -l | tr -d ' ')
           if [ "$LEFT" -gt 0 ]; then
             echo "::error::$LEFT leaf/leaves still unplanned after the session — failing (the loop will not chain; re-dispatch agent-rel-plan after investigating)"

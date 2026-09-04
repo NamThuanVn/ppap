@@ -10,7 +10,7 @@ name: Agent · loop
 #   · manually — workflow_dispatch on this workflow (gh workflow run
 #     agent-loop.yml -R NamThuanVn/ppap);
 #   · by ba-to-issues.yml in the private repo after a merged BA-docs PR minted
-#     at least one sweepable (ba-bug/ba-task) issue;
+#     at least one sweepable (`bug`/`task`) issue;
 #   · by each agent run that EXECUTED a solve-verdict (MERGED / PARK / SPLIT /
 #     ABANDONED with green executor steps) — the "Continue loop" step in
 #     agent-clear-todo.yml chains the next lane immediately (lowest latency);
@@ -259,7 +259,7 @@ jobs:
       # label count treated batch mains, parked (Pending) leaves, and blocked
       # leaves as candidates — observed 6 lanes dispatched for 2 claimable
       # tasks, 4 dying at the claim step. It also counts genuinely-Todo
-      # ba-feature leaves now (a human promoting a feature to Todo makes it
+      # `feature` leaves now (a human promoting a feature to Todo makes it
       # claimable — the old blanket exclusion was an artifact of the dumb
       # count). Still racy vs in-flight sibling lanes by design: the atomic
       # claim stays the authority; a raced candidate costs one cheap
@@ -442,7 +442,10 @@ jobs:
       # before the leaf test: a batch main can QUOTE a leaf marker in its body
       # (#2252 pasted the re-mint guard marker into its PR description), and
       # without that exclusion this gate counts a "leaf" the planner refuses
-      # to plan — dispatch → plan nothing → recount fails, forever.
+      # to plan — dispatch → plan nothing → recount fails, forever. A
+      # SPLIT-decomposed original (`ba-decomposed-into:`) is excluded by the
+      # same clause and for the same reason: it KEEPS its own leaf marker, but
+      # it is a parent — its slices are the plannable work.
       # Duplicate gate dispatches coalesce
       # in agent-rel-plan's concurrency group (the extra run no-ops + chains).
       - name: Rel-planning gate
@@ -453,10 +456,10 @@ jobs:
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
         run: |
           set -euo pipefail
-          UNPLANNED=$(for L in ba-bug ba-task ba-change ba-feature; do
+          UNPLANNED=$(for L in bug task slice feature ba-bug ba-task ba-slice ba-change ba-change-package ba-feature; do
             gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
               --json number,body,labels --limit 200 \
-              --jq '.[] | select(.body | test("<!--\\s*ba-(bugs|change-packages|features)-batch:") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
+              --jq '.[] | select(.body | test("<!--\\s*ba-((bugs|change-packages|features)-batch|decomposed-into):") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
           done | sort -u | wc -l | tr -d ' ')
           if [ "$UNPLANNED" -gt 0 ]; then
             echo "::notice::$UNPLANNED unplanned leaf/leaves — dispatching agent-rel-plan, deferring lane dispatch to its chain"
