@@ -183,12 +183,39 @@ jobs:
       # node-linker=hoisted .npmrc BEFORE installing) and then `pnpm install`,
       # exactly like a new developer's first run. Here we only put pnpm + Node
       # on PATH; `cache: pnpm` warms the pnpm STORE, which speeds the install up
-      # without skipping it.
+      # without skipping it. The action's pnpm INSTALL METHOD is shared, though —
+      # both go through scripts/ci/pnpm-binary.sh.
+      # pnpm from its own release binary, not pnpm/action-setup — see
+      # scripts/ci/pnpm-binary.sh. This is the ONE caller that runs on all three
+      # OSes, so it is also the only place the script's macos-* and win-*
+      # branches execute for real; the mapping itself is unit-tested at
+      # scripts/tests/ci/pnpm-binary.test.sh via the PNPM_BINARY_UNAME_*
+      # overrides, because five of its six branches never run on one machine.
+      #
+      # `path-entry` rather than a bare `dirname`: on windows-latest the runner
+      # builds the step's native PATH from $GITHUB_PATH, so a Git Bash /c/… line
+      # would resolve for nothing. It is a passthrough everywhere else.
+      #
+      # Cached by the runner image only — no actions/cache here. This job's whole
+      # subject is a cold `pnpm worktree:init`, and it runs weekly, so a cache
+      # entry would be evicted between runs more often than not.
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        env:
-          NODE_OPTIONS: --no-deprecation
+        run: |
+          set -euo pipefail
+          bin="$(bash scripts/ci/pnpm-binary.sh install "$HOME/.cache/pnpm-bin")"
+          bash scripts/ci/pnpm-binary.sh path-entry "$(dirname "$bin")" >> "$GITHUB_PATH"
+          echo "pnpm $("$bin" --version) → $bin"
 
+      # `cache: pnpm` STAYS here, unlike the CI install composite: this job
+      # deliberately runs a real `pnpm install`, so warming the store genuinely
+      # speeds it up without skipping the thing under test.
+      #
+      # One-time effect of the switch above: pnpm/action-setup set PNPM_HOME, and
+      # pnpm derived the store from it, so `pnpm store path` now answers with the
+      # platform default instead. Existing entries are keyed on the lockfile hash
+      # and were saved under the OLD path, so the first run per OS restores a hit
+      # that lands nowhere and installs against a cold store. It self-corrects on
+      # the next lockfile change, which saves a fresh entry at the new path.
       - name: Setup Node
         uses: actions/setup-node@v7
         with:

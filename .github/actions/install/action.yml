@@ -10,54 +10,26 @@ runs:
   # our own build / test / e2e steps still surface.
   steps:
     # pnpm comes from its own standalone release binary, NOT pnpm/action-setup.
-    #
-    # action-setup@v6 caches nothing. Every job ran `npm ci` in ~/setup-pnpm to
-    # fetch a BOOTSTRAP pnpm — v11.19.0, hardcoded in the action's own committed
-    # lockfile — and then `pnpm self-update`d that down to our `packageManager`
-    # version. Two registry.npmjs.org round-trips per job, on the critical path
-    # of all 13 jobs that use this action. When ~32 e2e shards start in the same
-    # second they all hit npm at once and get throttled: in ppap run
-    # 33861353394 that `npm ci` took 24s on shards 3 and 15 but 4-7 MINUTES on
-    # shards 7, 11, 19, 23, 27 and 31 — and shards 7/23/31 unblocked within the
-    # same second of each other, the signature of one shared throttle releasing.
-    # 100% of the spread in that job's install step (43s vs 447s) was inside it.
-    #
-    # Neither of action-setup's knobs fixes this. `version:` only changes which
-    # version self-update targets, not the bootstrap, so the `npm ci` still runs;
-    # `standalone: true` swaps the bootstrap for @pnpm/exe, which is BIGGER and
-    # carries an install script. The npm hop is unavoidable through that action.
-    #
-    # A GitHub release asset plus actions/cache takes npm off the hot path
-    # entirely: ~1-2s restored from cache, a few seconds on a miss, and the
-    # download retries instead of queueing behind a registry rate limit.
-    - name: Resolve pnpm version
+    # The reasoning, the measurements and the platform matrix all live in
+    # scripts/ci/pnpm-binary.sh — one copy, shared with release.yml and
+    # local-stack-matrix.yml, and unit-tested at
+    # scripts/tests/ci/pnpm-binary.test.sh (the platform branches cannot be
+    # proven on any single runner).
+    - name: Resolve pnpm
       id: pnpm
       shell: bash
       run: |
         set -euo pipefail
-        version="$(grep -o '"packageManager"[[:space:]]*:[[:space:]]*"pnpm@[^"+]*' package.json | sed 's/.*pnpm@//')"
-        if [ -z "$version" ]; then
-          echo "::error::could not read a pnpm version from package.json \"packageManager\""
+        # Same guard as ci-checks.yml's e2e dispatch: this action is mirrored to
+        # the ppap repos, but the script comes from the erp-namthuan checkout, so
+        # a stale ref would otherwise fail with a bare "No such file".
+        if [ ! -f scripts/ci/pnpm-binary.sh ]; then
+          echo "::error::scripts/ci/pnpm-binary.sh is missing on this ref — rebase the PR onto main."
           exit 1
         fi
-        # Only linux runners use this action (all 13 callers are ubuntu-latest).
-        # Anything else fails here with a clear message rather than 404ing on an
-        # asset name that doesn't exist.
-        if [ "$(uname -s)" != "Linux" ]; then
-          echo "::error::this action only provides a pnpm binary for Linux, got $(uname -s)"
-          exit 1
-        fi
-        case "$(uname -m)" in
-          x86_64) arch=x64 ;;
-          aarch64 | arm64) arch=arm64 ;;
-          *)
-            echo "::error::no pnpm standalone binary for arch $(uname -m)"
-            exit 1
-            ;;
-        esac
         {
-          echo "version=$version"
-          echo "arch=$arch"
+          echo "version=$(bash scripts/ci/pnpm-binary.sh version)"
+          echo "platform=$(bash scripts/ci/pnpm-binary.sh platform)"
           echo "dir=$HOME/.cache/pnpm-bin"
         } >> "$GITHUB_OUTPUT"
 
@@ -71,40 +43,20 @@ runs:
       uses: actions/cache@v6
       with:
         path: ${{ steps.pnpm.outputs.dir }}
-        key: pnpm-bin-${{ runner.os }}-${{ steps.pnpm.outputs.arch }}-${{ steps.pnpm.outputs.version }}
+        key: pnpm-bin-${{ steps.pnpm.outputs.platform }}-${{ steps.pnpm.outputs.version }}
 
-    - name: Download pnpm binary
-      if: steps.pnpm-bin.outputs.cache-hit != 'true'
+    # No `if: cache-hit != true` — the script is idempotent, and letting it run
+    # unconditionally is what makes it self-healing: a cache entry that was
+    # evicted mid-save or truncated gets replaced here instead of being trusted.
+    - name: Install pnpm
       shell: bash
       env:
         PNPM_DIR: ${{ steps.pnpm.outputs.dir }}
-        PNPM_VERSION: ${{ steps.pnpm.outputs.version }}
-        PNPM_ARCH: ${{ steps.pnpm.outputs.arch }}
       run: |
         set -euo pipefail
-        mkdir -p "$PNPM_DIR"
-        curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --max-time 300 \
-          -o "$PNPM_DIR/pnpm" \
-          "https://github.com/pnpm/pnpm/releases/download/v${PNPM_VERSION}/pnpm-linux-${PNPM_ARCH}"
-        chmod +x "$PNPM_DIR/pnpm"
-
-    - name: Put pnpm on PATH
-      shell: bash
-      env:
-        PNPM_DIR: ${{ steps.pnpm.outputs.dir }}
-        PNPM_VERSION: ${{ steps.pnpm.outputs.version }}
-      run: |
-        set -euo pipefail
-        echo "$PNPM_DIR" >> "$GITHUB_PATH"
-        # Assert the binary is the version we asked for. A cache entry that was
-        # evicted mid-save, or truncated, otherwise surfaces much later as an
-        # unrelated-looking lockfile or engine error.
-        actual="$("$PNPM_DIR/pnpm" --version)"
-        if [ "$actual" != "$PNPM_VERSION" ]; then
-          echo "::error::pnpm reports $actual, expected $PNPM_VERSION"
-          exit 1
-        fi
-        echo "pnpm $actual"
+        bin="$(bash scripts/ci/pnpm-binary.sh install "$PNPM_DIR")"
+        bash scripts/ci/pnpm-binary.sh path-entry "$(dirname "$bin")" >> "$GITHUB_PATH"
+        echo "pnpm $("$bin" --version) → $bin"
 
     # No `cache: pnpm` here, deliberately. setup-node keys its pnpm-store cache
     # on hashFiles('pnpm-lock.yaml') and restores with the primary key only (no
