@@ -184,6 +184,17 @@ jobs:
         if: ${{ !cancelled() }}
         run: bash scripts/gate/shape/no-suppressions.sh
 
+      # Timeout ratchet: the number of hand-written waits in the test suite may
+      # go DOWN, never up. Widening a timeout until CI goes green masks the
+      # defect and the number never comes back down — messenger-group-manage
+      # went 15s to 150s across five PRs before anyone noticed the assertion was
+      # waiting on a toast that expires after 4s. The gate counts rather than
+      # judging; a stale baseline fails too, because slack is where a re-added
+      # timeout hides (.claude/skills/no-timeout-waits).
+      - name: Timeout ratchet
+        if: ${{ !cancelled() }}
+        run: bash scripts/gate/shape/no-timeouts.sh
+
       # Export-engine gate: no hand-built SheetJS workbook, no leaf route
       # streaming a spreadsheet/CSV inside the request, and no dataset in the
       # registry without its `_export` read. The estate this replaced had seven

@@ -272,8 +272,30 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
 
+      # NOT `--with-deps`, and NOT unconditional. Both are deliberate.
+      #
+      # `--with-deps` runs apt REGARDLESS of the browser cache, and what it
+      # installs is mostly FONTS — fonts-ipafont-gothic, fonts-wqy-zenhei,
+      # xfonts-cyrillic, fonts-tlwg-loma. On 2026-09-04 that step took 30m28s on
+      # a shard whose browser cache had HIT, with 3-7 minute stalls on individual
+      # 300KB files and `Ign:` retries, because the fan-out starts 32 shards at
+      # once and they all hit the same azure.archive.ubuntu.com mirror in the
+      # same instant. The job was then cancelled having run tests for 2 minutes.
+      #
+      # This suite needs none of it: zero toHaveScreenshot/toMatchSnapshot
+      # assertions, no CJK/Thai/Cyrillic text asserted anywhere, and the app is
+      # EN/VI — Latin plus Vietnamese diacritics, which the ubuntu-latest image
+      # already renders. That image also ships the shared libraries Chromium
+      # links against, which is the only part of `--with-deps` that was ever
+      # load-bearing here.
+      #
+      # If a shard ever dies on a missing .so, the runner image dropped a lib and
+      # `playwright install-deps chromium` is the answer — that fails fast and
+      # loudly. If someone adds visual-regression snapshots, restore the fonts
+      # FIRST: missing glyphs change rendering silently.
       - name: Install Playwright Chromium
-        run: pnpm exec playwright install --with-deps chromium
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install chromium
 
       # Same boot + reboot-once-on-infra-failure contract as the coordinator's
       # shard job. A batch checkout always postdates scripts/ci/e2e/ci-boot.sh

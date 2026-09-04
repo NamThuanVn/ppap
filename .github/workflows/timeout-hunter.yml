@@ -1,0 +1,188 @@
+name: Hunter · Timeouts
+
+# Daily bite out of the inline-timeout stock: delete the `{ timeout: N }`
+# overrides that playwright.config.ts's global defaults already cover, and open a
+# PR with the batch. The full e2e suite on that PR is what judges whether the
+# batch was safe — nothing here decides that.
+#
+# The backlog is already drained — the suite sits at zero inline overrides and
+# zero per-test budgets — so on a healthy repo this reports "the stock is
+# drained" and exits without opening anything. Expected, not a fault.
+#
+# It earns its keep as the second half of a pair that fail differently: the
+# per-turn/per-PR gate refuses an INCREASE, while this re-derives the count from
+# the tree, catching anything that landed by a path the gate never saw (a direct
+# push, a merge of two individually-clean branches, a revert). Batching exists
+# for that case: one unreviewable PR's e2e run cannot be bisected, a batch names
+# the module.
+#
+# It shares BOTH its scanner and its codemod with the per-turn gate
+# (scripts/gate/shape/no-timeouts.sh, scripts/dev/strip-timeouts.mjs) rather
+# than reimplementing either — a second copy would drift, and the drift would
+# show up as the hunter cheerfully reporting nothing to do.
+#
+# Filename is deliberately NOT ci-*.yml → the sync mirrors it to
+# NamThuanVn/ppap only, never to the CI fleet's 20-job budget
+# (docs/engineering/platform/ppap.md § To which workflows ppap runs).
+
+on:
+  schedule:
+    # 04:41 UTC daily — off the top of the hour to dodge cron congestion, and
+    # well clear of prune-stale-branches at 03:17 so two jobs never contend for
+    # the same pooled PAT's quota at the same minute.
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview the batch without opening a PR'
+        type: boolean
+        default: true
+      batch_max:
+        description: 'Approximate number of overrides to remove in one PR'
+        type: string
+        default: '400'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: timeout-hunter
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    name: Hunt timeouts
+    runs-on: ubuntu-latest
+    # Generous but finite. The work is a checkout, an install and an AST pass
+    # over ~450 files; anything approaching this cap means something hung, and a
+    # hung job with no cap burns six hours of billed time saying nothing.
+    timeout-minutes: 30
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. Inlined
+      # rather than calling scripts/ci/ppap/pat-pool.sh (the canonical copy —
+      # keep the two in step) because the private-repo checkout itself needs a
+      # token, so the pool cannot live behind it. GET /rate_limit does not count
+      # against the limit, so probing every token is free.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      # The checkout is the UPSTREAM repo — always the freshest main, so the
+      # planner reads current BA spec files (the fork's main is only as fresh
+      # as its last sync). The next step rewires remotes into the fork layout
+      # the skill expects for upstream-slug resolution. No fork sync here —
+      # planning creates no claim refs (sync-agent-fork.yml + the solve job's
+      # own freshen keep the fork current).
+
+      - name: Checkout upstream main
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Never stack two batches. The previous PR's e2e run is the ONLY evidence
+      # that the codemod's judgement holds on real specs, so opening tomorrow's
+      # batch before today's has landed would compound an unverified change —
+      # and a red suite could then no longer be attributed to one batch.
+      - name: Skip while a hunter PR is still open
+        id: guard
+        run: |
+          set -uo pipefail
+          OPEN=$(gh pr list --repo NamThuanVn/erp-namthuan \
+                   --state open --head-prefix chore/strip-timeouts \
+                   --json number --jq 'length' 2>/dev/null || echo 0)
+          # --head-prefix is not universally available; fall back to a listing.
+          if [ "$OPEN" = "0" ] || [ -z "$OPEN" ]; then
+            OPEN=$(gh pr list --repo NamThuanVn/erp-namthuan --state open \
+                     --json number,headRefName \
+                     --jq '[.[] | select(.headRefName | startswith("chore/strip-timeouts"))] | length')
+          fi
+          if [ "${OPEN:-0}" -gt 0 ]; then
+            echo "::notice::a timeout-hunter PR is still open — skipping today's batch"
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'skip=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: ./.github/actions/install
+        if: steps.guard.outputs.skip == 'false'
+
+      - name: Take a batch
+        id: hunt
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          BATCH_MAX: ${{ inputs.batch_max || '400' }}
+        # --apply is REQUIRED to write; the script is dry by default so that a bare
+        # invocation (an operator checking, a harness running it with no args)
+        # cannot rewrite 35 spec files as a side effect. On the schedule trigger
+        # `inputs.dry_run` is null, so the daily run takes the --apply branch.
+        run: bash scripts/ci/timeout-hunter.sh ${{ inputs.dry_run && '--dry-run' || '--apply' }}
+
+      # The gate must agree before the PR is opened. If the codemod and the
+      # baseline disagree here, the PR would land red on its own repo-gates job —
+      # better to fail the hunter and leave main untouched.
+      - name: Verify the ratchet agrees
+        if: steps.guard.outputs.skip == 'false' && steps.hunt.outputs.found == 'true'
+        run: bash scripts/gate/shape/no-timeouts.sh
+
+      - name: Open the PR
+        if: steps.guard.outputs.skip == 'false' && steps.hunt.outputs.found == 'true' && !inputs.dry_run
+        env:
+          REMOVED: ${{ steps.hunt.outputs.removed }}
+          FILES: ${{ steps.hunt.outputs.files }}
+          SCOPE: ${{ steps.hunt.outputs.scope }}
+          REMAINING: ${{ steps.hunt.outputs.remaining }}
+        run: |
+          set -euo pipefail
+          BRANCH="chore/strip-timeouts-$(date -u +%Y%m%d)"
+          git config user.name  'timeout-hunter'
+          git config user.email 'noreply@github.com'
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -F - <<EOF
+          chore(e2e): drop $REMOVED redundant timeouts ($SCOPE)
+
+          Removes inline { timeout: N } overrides that playwright.config.ts's
+          global defaults already cover, across $FILES file(s). Each removal is
+          a value at or below the global backing that exact call shape, so no
+          wait gets shorter.
+
+          Left alone on purpose: values ABOVE their global, per-test budgets,
+          and any call that inherits no global at all (waitForEvent) — those are
+          judgement calls, not boilerplate. $REMAINING removable site(s) remain.
+
+          Generated by .github/ppap/workflows/timeout-hunter.yml.
+          The full e2e suite on this PR is the evidence that the batch is safe.
+          EOF
+          git push "https://x-access-token:${RESOLVED_PAT}@github.com/NamThuanVn/erp-namthuan.git" "$BRANCH"
+          gh pr create --repo NamThuanVn/erp-namthuan \
+            --base main --head "$BRANCH" \
+            --title "chore(e2e): drop $REMOVED redundant timeouts ($SCOPE)" \
+            --body "Automated batch from the timeout hunter. $REMOVED override(s) across $FILES file(s); $REMAINING removable site(s) remain.
+
+          Every removal is a value at or below the global that backs its call shape (\`expect.timeout\` 15s, \`expect.toPass.timeout\` 30s, \`use.actionTimeout\` 15s, \`use.navigationTimeout\` 15s), so no wait gets shorter. Values above their global, \`test.setTimeout\`, and calls inheriting no global are deliberately untouched — see [\`no-timeout-waits\`](.claude/skills/no-timeout-waits/SKILL.md).
+
+          **The full e2e suite on this PR is the evidence.** A failure here is a real finding: it names a spec that was relying on a hand-typed budget."
