@@ -209,7 +209,11 @@ jobs:
           }
           git remote rename origin upstream
           git remote add origin "https://github.com/${FORK_REPO}.git"
-          gh repo sync "$FORK_REPO" -b main
+          # NOT `gh repo sync` — that is merge-upstream, which fails hard once the
+          # fork's main has diverged (HTTP 409), and `set -e` then kills every lane
+          # the controller dispatched. The script repairs the mirror instead; see
+          # its header and sync-agent-fork.yml.
+          bash scripts/ci/ppap/sync-fork-main.sh "$FORK_REPO"
           gh auth setup-git
           # Pin gh's default repo to the fork: with origin+upstream remotes and
           # no default, bare `gh repo view` resolves ambiguously in CI.
