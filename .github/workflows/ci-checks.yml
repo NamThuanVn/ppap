@@ -304,6 +304,21 @@ jobs:
         if: ${{ !cancelled() }}
         run: node scripts/ba/doc-links.mjs
 
+      # scripts/README.md's Quick reference is generated, and until now nothing
+      # in CI checked it was current — it ran only in `audit.sh full/preflight`,
+      # i.e. locally. So #3125 landed scripts/dev/ops/bom-cleanup-candidates.mjs
+      # without its row and main went stale, which made `pnpm preflight` RED on a
+      # clean checkout for EVERY agent lane: S5 reads a red preflight as "CI is
+      # about to be red", so each lane either chased a failure its change did not
+      # cause or pushed unrelated README churn. One of the two generator
+      # freshness gates the NOTE above retired for shared-block conflicts — this
+      # one has none of that: the block is one row per script, so two lanes only
+      # collide by adding adjacent scripts in the same window, and the row is
+      # THEIRS to add.
+      - name: scripts/README.md Quick reference is current
+        if: ${{ !cancelled() }}
+        run: node scripts/gate/shape/scripts-index.mjs --check
+
       # terraform/ used to be executed for the FIRST time at deploy, inside the
       # deploy job's `terraform apply`. A bad module reference or undeclared
       # variable therefore surfaced mid-deploy, after CI was green and the release
