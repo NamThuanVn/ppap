@@ -51,10 +51,20 @@ name: Hunter · Timeouts + CI noise
 
 on:
   schedule:
-    # 04:41 UTC daily — off the top of the hour to dodge cron congestion, and
-    # well clear of prune-stale-branches at 03:17 so two jobs never contend for
-    # the same pooled PAT's quota at the same minute.
-    - cron: '41 4 * * *'
+    # 02:00 Vietnam time (ICT) daily = 19:00 UTC. Actions cron is UTC-only, and
+    # ICT is UTC+7 with NO daylight saving, so this one offset holds all year —
+    # no seasonal drift to re-check.
+    #
+    # EXPECT IT LATE. Actions does not honour a schedule to the minute; a
+    # scheduled run is queued and commonly starts minutes to tens of minutes
+    # after its cron time, more so on a busy hour. A run appearing at 02:25 ICT
+    # is the platform behaving normally, not a broken schedule — don't "fix" the
+    # cron over it. The corollary is that shifting this by a few minutes to
+    # dodge another job's minute buys nothing: with that much jitter, the actual
+    # start minute is not the cron's to decide. The time here says WHEN WE WANT
+    # IT, and the middle of the Vietnam night is the point — the fleet is idle,
+    # so a ~1.5k-call REST sweep competes with nobody's PR CI.
+    - cron: '0 19 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
