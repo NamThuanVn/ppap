@@ -22,6 +22,11 @@ on:
         description: 'Manual override actor handle (for run-name)'
         required: false
         default: ''
+      fleet:
+        description: 'Comma-separated owner/repo ppap list for the CI gate to borrow idle e2e capacity from (erp-namthuan variable PPAP_CI_REPOS). A release-triggered deploy gets it in client_payload; supply it here for a manual deploy, or leave empty to run every shard on this repo.'
+        required: false
+        default: ''
+        type: string
 
 permissions: read-all
 
@@ -66,6 +71,9 @@ jobs:
       status_context: deploy-production
       triggered_by: ${{ github.event.client_payload.triggered_by || inputs.triggered_by || github.actor }}
       run_title: ${{ github.event.client_payload.title }}
+      # release.yml forwards PPAP_CI_REPOS so the gate's full-suite e2e fans out
+      # instead of collapsing onto this repo's 14-shard fallback.
+      fleet: ${{ github.event.client_payload.fleet || inputs.fleet }}
     secrets:
       TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
       PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}

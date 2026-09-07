@@ -49,6 +49,10 @@ on:
         description: 'Private-repo ref to deploy (sha for staging, refs/tags/<tag> for production).'
         type: string
         required: true
+      fleet:
+        description: 'Comma-separated owner/repo ppap list the CI gate may borrow idle e2e capacity from (the erp-namthuan variable PPAP_CI_REPOS, forwarded by the dispatching wrapper). Empty ⇒ no fan-out, every shard lands on this repo. Only meaningful when run_e2e_gate is true.'
+        type: string
+        default: ''
       deploy_script_suffix:
         description: 'Suffix applied to `deploy` pnpm scripts for gateway + dashboard (":staging" | ":production").'
         type: string
@@ -318,6 +322,13 @@ jobs:
       # infra touches Cloudflare. A failing job fails ci-gate, which blocks
       # tf-outputs — and with it the builds + deploy (needs: [ci-gate]).
       run_e2e: ${{ inputs.run_e2e_gate }}
+      # Forwarded so the production gate's e2e FANS OUT across the fleet like PR
+      # CI does. Before this it was empty here, so fanout found no pool, logged
+      # "no idle worker" and self-dispatched every shard back to this one repo
+      # capped at COORD_FALLBACK_SLOTS (14) — a release tag ran the full suite on
+      # 14 shards while a PR got 48. deploy-staging passes nothing because it
+      # sets run_e2e_gate=false and so runs no e2e at all.
+      fleet: ${{ inputs.fleet }}
     secrets:
       PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
 

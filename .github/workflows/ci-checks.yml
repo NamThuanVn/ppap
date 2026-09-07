@@ -1119,8 +1119,9 @@ jobs:
           COORD_FALLBACK_SLOTS: '14'
           # 8 per worker: a worker also runs its own `plan` job, so this sits at
           # 9 of the org's 20 concurrent jobs — loose enough to leave room for a
-          # second PR's batch. Paired with the 32-shard default it fans out over
-          # exactly four workers.
+          # second PR's batch. Paired with the 48-shard default it fans out over
+          # exactly six workers — for PR CI and the production deploy gate alike,
+          # which scripts/gate/ci/e2e-shards.mjs holds in step.
           WORKER_SLOTS: '8'
         run: |
           set -euo pipefail
