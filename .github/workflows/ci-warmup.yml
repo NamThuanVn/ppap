@@ -1,0 +1,229 @@
+name: CI · Warm-up (prove this org's concurrency)
+
+# Measures how many jobs this org can ACTUALLY run at once, and records the
+# answer in its own E2E_HOST_CEILING repo variable so scripts/ci/fanout.mjs can
+# size that host's e2e batch instead of guessing.
+#
+# WHY THIS EXISTS. GitHub Free is documented at 20 concurrent jobs, but a NEW
+# free org starts near 5 and the ceiling climbs with accumulated Actions usage —
+# not with age. Measured 2026-09-07 across the ten orgs created within ten
+# minutes of each other on 2026-09-04:
+#
+#   Pi     14 jobs run →  5      Eta    46 jobs →  9
+#   Iota   23 jobs run →  6      Mu    184 jobs → 16
+#   Theta  23 jobs run →  7      Delta 767 jobs → 19
+#   Kappa  16 jobs run →  8      Alpha 629 jobs → 19
+#
+# Mu and Pi were created FOUR MINUTES apart and sit at 16 and 5, so waiting does
+# nothing — an org with no runs never ripens. There is no API for the limit and
+# GitHub does not document the reduction at all, so the only way to know a host's
+# ceiling is to ask for more than it can give and count what starts.
+#
+# The cost of NOT knowing: fanout used a flat WORKER_SLOTS=8, so a 5-slot host
+# was handed 8 shards, 3 queued strictly 1-in-1-out, and because the e2e stage
+# waits on the SLOWEST batch that one host set the whole leg. Theta run
+# 33836951661 queued 3 of 8 for ~5.5 minutes in an org with no other run in its
+# entire history.
+#
+# SELF-TERMINATING. The `check` job exits the whole workflow the moment
+# E2E_HOST_CEILING reports the target, so a proven org stops burning minutes
+# forever. Only unproven orgs keep probing hourly.
+
+on:
+  schedule:
+    # Hourly, on the half hour to stay clear of the :00 cron stampede.
+    - cron: '30 * * * *'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Concurrency to prove (default 20 = the documented GitHub Free ceiling).'
+        required: false
+        default: '20'
+        type: string
+      force:
+        description: 'Re-probe even if this org is already marked proven.'
+        required: false
+        default: false
+        type: boolean
+
+permissions: read-all
+
+concurrency:
+  # Never let two warm-ups overlap: they would compete for the very slots being
+  # measured and each would read the other's jobs as its own ceiling.
+  group: ci-warmup
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: 0 · Already proven?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.gate.outputs.proceed }}
+      target: ${{ steps.gate.outputs.target }}
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Read E2E_HOST_CEILING
+        id: gate
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          TARGET: ${{ inputs.target || '20' }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          CUR=$(gh api "repos/${{ github.repository }}/actions/variables/E2E_HOST_CEILING" \
+                  --jq '.value' 2>/dev/null || echo '')
+          case "$CUR" in ''|*[!0-9]*) CUR=0 ;; esac
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" = "true" ]; then
+            echo "▶ force: re-probing even though E2E_HOST_CEILING=$CUR"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$CUR" -ge "$TARGET" ]; then
+            echo "✓ already proven at $CUR (target $TARGET) — nothing to do, and this"
+            echo "  workflow will keep no-op'ing until someone raises the target."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "▶ ceiling is ${CUR:-0}, want $TARGET — probing."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Ask for `target` jobs at once and let GitHub decide how many actually start.
+  # Each one just sleeps: the point is to OCCUPY a slot long enough that the
+  # overlap is unambiguous, not to compute anything. ~3 min is comfortably longer
+  # than the runner acquisition spread, so a job that starts late was queued by
+  # the org limit rather than by a slow pickup.
+  burn:
+    name: 1 · Probe (${{ matrix.slot }})
+    needs: [check]
+    if: needs.check.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      # 1..20. Written out because a matrix cannot be built from a range, and
+      # `fromJSON` of a computed list would need another job just to emit it.
+      matrix:
+        slot:
+          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    steps:
+      - name: Hold a slot
+        run: |
+          echo "slot ${{ matrix.slot }} started at $(date -u +%H:%M:%S)"
+          sleep 170
+          echo "slot ${{ matrix.slot }} done at $(date -u +%H:%M:%S)"
+
+  # Count how many of those actually overlapped, and record it.
+  record:
+    name: 2 · Record the ceiling
+    needs: [check, burn]
+    if: always() && needs.check.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Measure and record
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          TARGET: ${{ needs.check.outputs.target }}
+        run: |
+          set -euo pipefail
+          JOBS=$(gh api --paginate \
+            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=100")
+
+          MAX=$(printf '%s' "$JOBS" | jq -s '
+            [ .[].jobs[]
+              | select(.name | startswith("1 · Probe"))
+              | select(.started_at != null and .completed_at != null)
+              | {s: (.started_at | fromdate), e: (.completed_at | fromdate)} ] as $J
+            | ( [$J[] | {t: .s, d: 1}] + [$J[] | {t: .e, d: -1}] )
+            | sort_by(.t, .d)
+            | reduce .[] as $x ({c: 0, m: 0}; {c: (.c + $x.d), m: ([.m, (.c + $x.d)] | max)})
+            | .m')
+
+          case "$MAX" in ''|*[!0-9]*) MAX=0 ;; esac
+          echo "▶ measured ceiling: $MAX concurrent job(s) (target $TARGET)"
+
+          # A probe that measured NOTHING must not overwrite a good value with 0.
+          # That is the one way this workflow could actively harm the fleet:
+          # fanout reads 0 as "unmeasured" and would drop a proven host back to
+          # the warm-up batch.
+          if [ "$MAX" -le 0 ]; then
+            echo "::warning::measured 0 — leaving E2E_HOST_CEILING untouched"
+            exit 0
+          fi
+
+          CUR=$(gh api "repos/${{ github.repository }}/actions/variables/E2E_HOST_CEILING" \
+                  --jq '.value' 2>/dev/null || echo '')
+          case "$CUR" in ''|*[!0-9]*) CUR=0 ;; esac
+
+          # Monotonic: only ever raise it. A single run can be throttled by
+          # unrelated load in the org, and one unlucky probe must not undo a
+          # ceiling we have already demonstrated.
+          if [ "$MAX" -le "$CUR" ]; then
+            echo "✓ ceiling already $CUR ≥ measured $MAX — unchanged"
+            exit 0
+          fi
+
+          if gh api "repos/${{ github.repository }}/actions/variables/E2E_HOST_CEILING" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${{ github.repository }}/actions/variables/E2E_HOST_CEILING" \
+              -f name=E2E_HOST_CEILING -f value="$MAX"
+          else
+            gh api -X POST "repos/${{ github.repository }}/actions/variables" \
+              -f name=E2E_HOST_CEILING -f value="$MAX"
+          fi
+          echo "✓ E2E_HOST_CEILING: $CUR → $MAX"
+
+          if [ "$MAX" -ge "$TARGET" ]; then
+            echo "🎉 proven at the target — the hourly schedule will no-op from now on."
+          else
+            echo "… still below $TARGET; the next hourly run probes again."
+          fi
