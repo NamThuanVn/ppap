@@ -351,12 +351,26 @@ jobs:
 
       # Flaky-passed-on-retry still leaves evidence in test-results/; upload it
       # alongside genuine failures so the coordinator's noise scan and /fix-ci
-      # can see it. See the same step in ci-checks.yml for the full rationale.
+      # can see it. Every Playwright shard in the fleet runs here — the
+      # coordinator has held no shards since the fan-out landed — so this is the
+      # only place the signal exists.
+      #
+      # The test is for a retained ARTIFACT, not for a non-empty directory, and
+      # the difference is the whole step. Playwright ALWAYS writes
+      # `<outputDir>/.last-run.json` (runner/index.js `_lastRunFile`), so
+      # `[ -n "$(ls -A test-results)" ]` — which this was — is true on every
+      # green shard: the "flaky first attempt" notice fired on 48 of 48 shards
+      # of a spotless run and uploaded 48 artifacts holding nothing but
+      # e2e-serve.log. A detector that fires always says exactly as much as one
+      # that never fires. A real retained attempt is a screenshot/trace FILE, so
+      # match on any file that is not the bookkeeping one — which stays correct
+      # whether or not a caller passes `--output` (shard.sh does, this job does
+      # not, and both nest .last-run.json inside whatever dir they chose).
       - name: Detect retained failure artifacts (covers flaky-passed-on-retry)
         id: pw_artifacts
         if: always()
         run: |
-          if [ -d test-results ] && [ -n "$(ls -A test-results 2>/dev/null)" ]; then
+          if [ -n "$(find test-results -mindepth 1 -type f ! -name '.last-run.json' -print -quit 2>/dev/null)" ]; then
             echo "present=true" >>"$GITHUB_OUTPUT"
             echo "::notice::shard ${{ matrix.shard }} retained failure artifacts (flaky first attempt) — uploading"
           else
