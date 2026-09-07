@@ -13,9 +13,9 @@ on:
         type: string
         required: true
       e2e_shards:
-        description: 'DESIRED number of parallel Playwright shards. The effective count is min(this, available capacity) — see the e2e job. 32 = 4 workers x 8 shards at the default WORKER_SLOTS. Both PR CI and the deploy gate inherit it.'
+        description: 'DESIRED number of parallel Playwright shards. The effective count is min(this, available capacity) — see the e2e job. 48 = 6 workers x 8 shards at the default WORKER_SLOTS. Both PR CI and the deploy gate inherit it.'
         type: number
-        default: 32
+        default: 48
       fleet:
         description: 'Comma-separated owner/repo list of ppap CI repos this run may borrow idle e2e capacity from (the erp-namthuan variable PPAP_CI_REPOS). Empty ⇒ no fan-out; every shard runs on this repo.'
         type: string

@@ -27,6 +27,11 @@ on:
         description: 'Override default Playwright shard count for a manual re-run (leave empty to use ci-checks.yml default).'
         required: false
         type: number
+      fleet:
+        description: 'Comma-separated owner/repo ppap list to borrow idle e2e capacity from (the erp-namthuan variable PPAP_CI_REPOS). Empty on a manual run ⇒ no fan-out, every shard lands on this repo.'
+        required: false
+        default: ''
+        type: string
 
 permissions: read-all
 
@@ -139,11 +144,25 @@ jobs:
       # ci-checks.yml's e2e job borrows idle fleet repos for the surplus,
       # so this can exceed one org's ~14-shard ceiling. Empty ⇒ ci-checks.yml's
       # own default.
-      e2e_shards: ${{ fromJSON(inputs.e2e_shards || '32') }}
+      # 48, not 32: fan-out recruits ceil(total/WORKER_SLOTS) hosts, so this is
+      # 6 of the ~15 idle fleet repos and leaves the rest for concurrent PRs.
+      # Measured at 32 (ppap run 33893945508): 32 shards, mean 240s, max 376s,
+      # e2e leg 413s of a 700s run. Going 14 → 32 scaled nearly linearly
+      # (per-shard ~520s → ~240s), so there is headroom left; the floor is each
+      # shard's fixed cost (~30s of install + artifact restore, plus the stack
+      # boot), which is why this stops at 48 rather than 64. Shorter shards also
+      # shrink the slow-shard tail that sets the batch job's 40-minute ceiling.
+      # Revert to 32 here if concurrent PRs start finding the fleet busy.
+      e2e_shards: ${{ fromJSON(inputs.e2e_shards || '48') }}
       # The fleet this run may borrow e2e capacity from, forwarded by the
       # private dispatcher (which owns PPAP_CI_REPOS). Absent on a manual
       # workflow_dispatch → no fan-out, every shard stays here.
-      fleet: ${{ github.event.client_payload.fleet }}
+      # A repository_dispatch carries the list; a manual run has to be given it,
+      # otherwise fanout finds no pool, logs "no idle worker" and collapses every
+      # shard onto this one repo (up to COORD_FALLBACK_SLOTS). That made manual
+      # main smoke tests unrepresentative of real PR CI — and unusable for
+      # measuring a shard-count change.
+      fleet: ${{ github.event.client_payload.fleet || inputs.fleet }}
       pr_number: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
       head_sha: ${{ github.event.client_payload.head_sha }}
       # PR CI runs only the changed service's e2e specs (broad/shared change →
