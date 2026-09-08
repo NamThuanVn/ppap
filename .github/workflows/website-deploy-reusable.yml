@@ -172,6 +172,19 @@ jobs:
       - name: Build (OpenNext — Cloudflare Workers)
         run: pnpm build:pages
 
+      # The runner has no terraform binary. Without this the very next step
+      # dies with `terraform: command not found` (exit 127) -- which is exactly
+      # how the first deploy failed (ppap run 34202508014). Matches the ERP's
+      # deploy-reusable.yml, which sets this up before each of its two inits.
+      #
+      # The pin is the CLI floor from terraform/versions.tf, not the workspace's
+      # version: execution is remote, so HCP runs the apply on the version the
+      # workspace declares (1.14.9) and the local CLI only has to speak the
+      # cloud backend protocol.
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: '1.9.0'
+
       - name: Terraform Init
         working-directory: terraform
         run: terraform init
