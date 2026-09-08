@@ -203,6 +203,13 @@ jobs:
           # missing output yields "" rather than the string "null".
           STORE_ID="$(jq -r '.secrets_store_id.value // empty' /tmp/tf-outputs.json)"
           SECRET_NAME="$(jq -r '.contact_webhook_secret_name.value // empty' /tmp/tf-outputs.json)"
+          # Telegram is the decided delivery target (#7). The bot TOKEN is a
+          # Secrets Store secret; the chat and thread ids are plain worker vars
+          # (identifiers, not credentials), so they are not masked. All three
+          # empty is valid — the route degrades to the webhook, then to logging.
+          TG_SECRET_NAME="$(jq -r '.telegram_secret_name.value // empty' /tmp/tf-outputs.json)"
+          TG_CHAT_ID="$(jq -r '.telegram_chat_id.value // empty' /tmp/tf-outputs.json)"
+          TG_THREAD_ID="$(jq -r '.telegram_thread_id.value // empty' /tmp/tf-outputs.json)"
           rm -f /tmp/tf-outputs.json
           echo "::add-mask::$ACC"
           echo "::add-mask::$TOKEN"
@@ -226,11 +233,20 @@ jobs:
             echo "SITE_HOSTNAME=$HOST"
             echo "SECRETS_STORE_ID=$STORE_ID"
             echo "CONTACT_WEBHOOK_SECRET_NAME=$SECRET_NAME"
+            echo "CONTACT_TELEGRAM_SECRET_NAME=$TG_SECRET_NAME"
+            echo "CONTACT_TELEGRAM_CHAT_ID=$TG_CHAT_ID"
+            echo "CONTACT_TELEGRAM_THREAD_ID=$TG_THREAD_ID"
           } >> "$GITHUB_ENV"
-          if [ -n "$SECRET_NAME" ]; then
-            echo "CONTACT_WEBHOOK_URL will be bound from the Secrets Store"
+          # Mirrors the route's own precedence: Telegram, then the generic
+          # webhook, then log-only. The last case gets a warning rather than a
+          # notice because it is silent data loss in production — the form still
+          # shows the visitor a success state.
+          if [ -n "$TG_SECRET_NAME" ] && [ -n "$TG_CHAT_ID" ]; then
+            echo "enquiries → Telegram chat $TG_CHAT_ID${TG_THREAD_ID:+ thread $TG_THREAD_ID}"
+          elif [ -n "$SECRET_NAME" ]; then
+            echo "enquiries → CONTACT_WEBHOOK_URL (bound from the Secrets Store)"
           else
-            echo "::warning::CONTACT_WEBHOOK_URL is not configured for this environment — enquiries will be logged, not forwarded (see the CONTACT_WEBHOOK_URL workspace variable)"
+            echo "::warning::no enquiry delivery target configured for this environment — POST /api/contact will LOG and return delivered:false while still showing the visitor success. Set telegram_bot_token + telegram_chat_id (or contact_webhook_url) on the ${TF_WORKSPACE} workspace."
           fi
           echo "host=$HOST" >> "$GITHUB_OUTPUT"
           echo "deploying to $HOST"
