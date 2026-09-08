@@ -20,7 +20,11 @@ name: Agent · ambulance
 #      which is what /repair-harness reads. Refuses to run without one.
 #   2. /repair-harness       — reproduce the fault on this runner, fix the root
 #      cause, prove it by re-running, land it as a merged PR. The harness owns
-#      the PR-CI wait (REPAIR_BRANCH), so the session never polls its own CI.
+#      the PR-CI wait (REPAIR_BRANCH), so the session never polls its own CI —
+#      and it now owns it even when the session emits REPAIRED early, because a
+#      verdict whose PR is still open does not end the run (claude.sh
+#      repaired_pr_unmerged). Before that, two correct repairs on 2026-09-08
+#      were downgraded for being 5 minutes ahead of ppap's own squash.
 #   3. parse-repair-verdict  — the machine contract: exactly one fenced
 #      `json repair-verdict` block; anything off degrades to STUCK, never a step
 #      failure. STUCK is the safe direction — it KEEPS the hold, so a garbled
@@ -164,12 +168,22 @@ jobs:
           FP=$(jq -r '.fingerprint // "unknown"' "${AGENT_STATE_DIR}/hold.json")
           STEP=$(jq -r '.step // "unknown"' "${AGENT_STATE_DIR}/hold.json")
           REASON=$(jq -r '.reason // "unknown"' "${AGENT_STATE_DIR}/hold.json")
+          # What earlier attempts on this fingerprint already LANDED. The
+          # fingerprint is coarse by design (see recover/capture-failure.mjs), so
+          # this repair may have been dispatched against a fault a prior one
+          # already fixed — run 34204389291 spent its whole session digging that
+          # out of the previous run's job logs. The session reads the same trail
+          # from hold.json; this line is so a human reading the run sees it too.
+          jq -r '(.repairs // [])[] | "· prior attempt \(.attempt): \(.outcome)\(if .pr then " on PR #\(.pr)" else "" end)\(if .merged then " (merged)" else "" end)"' \
+            "${AGENT_STATE_DIR}/hold.json"
           if [ "$REASON" != "harness-broken" ]; then
             echo "::error::the standing hold is '$REASON', not 'harness-broken' — a timed pool-exhausted hold needs a clock, not a repair"
             exit 1
           fi
           # The repair branch is chosen HERE, not by the session, so the wrapper
-          # can own the PR-CI wait on it (REPAIR_BRANCH → open_pr_for_claim).
+          # can own the PR-CI wait on it (REPAIR_BRANCH → open_pr_for_claim,
+          # for the turn that ends with no verdict at all; a turn that emitted
+          # REPAIRED is waited out on the PR the verdict itself named).
           echo "REPAIR_BRANCH=fix/ambulance-${FP}-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
           echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
           echo "· repairing fingerprint $FP — died in \"$STEP\" (attempt ${ATTEMPT})"
@@ -253,11 +267,18 @@ jobs:
       # The only step that touches the hold. Clearing it is what hands the fleet
       # its lanes back, so it is deliberately deterministic and API-verified
       # rather than trusted from the session.
+      # REPAIR_MERGE_WAIT_S is stated here rather than left to the script's
+      # default so it sits next to the `timeout-minutes` it has to fit inside.
+      # It is the SAFETY NET: claude.sh's repair-mode wait (55 min) normally
+      # settles the PR before the verdict is ever parsed, and this covers the
+      # case where the session emitted REPAIRED without waiting — which used to
+      # be downgraded outright, burning a repair attempt on a landed fix.
       - name: Execute repair verdict
         id: execute
         if: always()
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          REPAIR_MERGE_WAIT_S: '600'
         run: node scripts/agent/board/verdict/execute-repair.mjs
 
       - name: Upload transcript
