@@ -658,6 +658,9 @@ jobs:
       targets: ${{ steps.plan.outputs.targets }}
       shards: ${{ steps.plan.outputs.shards }}
       total: ${{ steps.plan.outputs.total }}
+      # The zone build matrix, DISCOVERED rather than hardcoded — see the
+      # `zones` step below and scripts/ci/e2e/zones.mjs.
+      zones: ${{ steps.zones.outputs.matrix }}
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
       # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
@@ -769,6 +772,22 @@ jobs:
           echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
           echo "▶ e2e plan: mode=$MODE targets=[$TARGETS]" >&2
 
+      # Which zones to build, DISCOVERED from apps/*/wrangler.jsonc — the same
+      # scan serve-parity.sh and ci-boot.sh use to decide which zones to BOOT.
+      #
+      # This used to be a hardcoded matrix below, and the two drifted the moment
+      # a zone was added: apps/mail was booted but never built, so under BUILD=0
+      # it crashed and took the whole stack down — every shard red. Worse, the
+      # fix could not reach the PR that caused it, because this file only
+      # arrives in the satellite repos on a push to main. Deriving it means
+      # adding a zone needs no workflow edit at all.
+      - id: zones
+        run: |
+          set -euo pipefail
+          MATRIX="$(node scripts/ci/e2e/zones.mjs)"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "▶ e2e zones: $(node scripts/ci/e2e/zones.mjs --names | tr '\n' ' ')" >&2
+
   # Build each dashboard zone on its OWN runner, in parallel. The 6 OpenNext
   # zones are fully independent (no cross-zone deps; dashboard-shell exports raw
   # `src/` so there's no prebuild step), so a per-zone matrix turns the old
@@ -788,17 +807,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        zone:
-          - { name: shell, pkg: '@namthuanvn/shell' }
-          - { name: expense, pkg: '@namthuanvn/zone-expense' }
-          - { name: exms, pkg: '@namthuanvn/zone-exms' }
-          - { name: oms, pkg: '@namthuanvn/zone-oms' }
-          - { name: sourcing, pkg: '@namthuanvn/zone-sourcing' }
-          - { name: bom, pkg: '@namthuanvn/zone-bom' }
-          - { name: quotation, pkg: '@namthuanvn/zone-quotation' }
-          - { name: procurement, pkg: '@namthuanvn/zone-procurement' }
-          - { name: hris, pkg: '@namthuanvn/zone-hris' }
-          - { name: utilities, pkg: '@namthuanvn/zone-utilities' }
+        # DERIVED from apps/*/wrangler.jsonc by scripts/ci/e2e/zones.mjs — the
+        # same discovery serve-parity.sh and ci-boot.sh use to decide which
+        # zones to BOOT. Never hardcode this list again: a zone booted but not
+        # built crashes the whole e2e stack, and the fix cannot reach the PR
+        # that introduced it. scripts/gate/ci/zone-matrix.mjs keeps it derived.
+        zone: ${{ fromJSON(needs.e2e-plan.outputs.zones) }}
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
       # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
