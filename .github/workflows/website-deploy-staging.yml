@@ -1,0 +1,56 @@
+name: Deploy · Staging
+
+# Triggered cross-repo from NamThuanVn/website-namthuan on every commit to main.
+# Runs on the SHARED NamThuanVn/ppap.
+# `workflow_dispatch` is the manual escape hatch (smoke tests, hand re-runs).
+# All deploy logic lives in deploy-reusable.yml; this file is just the trigger.
+run-name: "${{ github.event.client_payload.title || format('Deploy Staging — triggered by @{0}', inputs.triggered_by || github.actor) }}"
+
+on:
+  repository_dispatch:
+    # `deploy-website-staging`, NOT `deploy-staging`: the event fires EVERY
+    # workflow in the shared repo listening for that type, so reusing the ERP's
+    # name would make a website commit deploy the ERP (#1, rule 1).
+    types: [deploy-website-staging]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private-repo ref to deploy (sha or branch). Default: main'
+        required: false
+        default: 'main'
+      triggered_by:
+        description: 'Manual override actor handle (for run-name)'
+        required: false
+        default: ''
+
+permissions: read-all
+
+# `website-` prefix: the ERP's deploy-staging.yml is `group: deploy-staging`
+# with cancel-in-progress, so sharing the name would CANCEL an in-flight ERP
+# deploy (#1, rule 2).
+concurrency:
+  group: website-deploy-staging
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/website-deploy-reusable.yml
+    with:
+      environment: staging
+      tf_workspace: namthuanvn-website-staging
+      # No `domain:` on purpose. The host comes from `terraform output -raw
+      # hostname` for this workspace — terraform/locals.tf is its single source
+      # of truth, per rule 1 of #1. Pass one only to redirect a manual run.
+      checkout_ref: ${{ github.event.client_payload.sha || inputs.ref || 'main' }}
+      deploy_script_suffix: ':staging'
+      deployment_id: ${{ github.event.client_payload.deployment_id }}
+      commit_sha: ${{ github.event.client_payload.sha }}
+      status_context: deploy-staging
+      triggered_by: ${{ github.event.client_payload.triggered_by || inputs.triggered_by || github.actor }}
+      run_title: ${{ github.event.client_payload.title }}
+    secrets:
+      TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+      PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}

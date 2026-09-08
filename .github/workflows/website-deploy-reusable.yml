@@ -1,0 +1,381 @@
+name: Deploy · Reusable
+
+# The deploy graph for website-namthuan. Runs on the PUBLIC repo
+# NamThuanVn/ppap -- SHARED with erp-namthuan (free Actions minutes). This repo
+# holds the source of truth under .github/ppap/workflows/ and the sync workflow
+# mirrors it.
+#
+# SHARED REPO RULES (#1). Two projects, one workflows directory:
+#   * every file here is named website-*.yml, which is what the prefix-scoped
+#     rsync keys on. NEVER ci-*.yml -- the ERP's fleet leg globs those out to
+#     16 CI repos.
+#   * dispatch event types and concurrency groups must not collide with the
+#     ERP's. An event type fires EVERY workflow listening for it.
+#   * the install action is .github/actions/install-website/, not the ERP's
+#     shared install/ -- the ERP is on pnpm 9.15.9 and this repo on 11.1.3, so
+#     one shared action breaks whichever synced last.
+#
+# Gutted from erp-namthuan's deploy-reusable.yml, which plans a changed-subset
+# deploy across 18 workers and 10 zone apps. This repo has ONE worker, so the
+# change-planning job, the build matrices, the tiered ordered deploy, the CI/e2e
+# gate, the separate tf-outputs job and the fleet fan-out are all gone. What is
+# left is one deploy job and one report job.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'staging | production — selects the wrangler env and the HCP workspace.'
+        type: string
+        required: true
+      tf_workspace:
+        description: 'HCP Terraform workspace (namthuanvn-website-staging | namthuanvn-website-production).'
+        type: string
+        required: true
+      domain:
+        description: >-
+          Optional public-host override. Normally EMPTY: the host is read from
+          `terraform output -raw hostname`, which is its single source of truth
+          (see terraform/locals.tf). Passing a literal here re-introduces the
+          duplication rule 1 of #1 exists to prevent — use it only to point a
+          one-off manual dispatch somewhere else.
+        type: string
+        required: false
+        default: ''
+      checkout_ref:
+        description: 'Private-repo ref to deploy (sha for staging, refs/tags/<tag> for production).'
+        type: string
+        required: true
+      deploy_script_suffix:
+        description: 'Suffix on the deploy pnpm script (":staging" | ":production").'
+        type: string
+        required: true
+      release_tag:
+        description: 'Release tag (production only). Used in pingback descriptions.'
+        type: string
+        required: false
+        default: ''
+      deployment_id:
+        description: 'Pre-created GitHub Deployment id in the private repo; pinged at the end. Empty on manual dispatch.'
+        type: string
+        required: false
+        default: ''
+      commit_sha:
+        description: 'Commit sha to attach a commit status to in the private repo. Empty on manual dispatch.'
+        type: string
+        required: false
+        default: ''
+      status_context:
+        description: 'Commit-status context name (deploy-staging | deploy-production).'
+        type: string
+        required: true
+      triggered_by:
+        description: 'Actor handle that initiated the deploy. Used in the Telegram failure alert.'
+        type: string
+        required: false
+        default: ''
+      run_title:
+        description: 'Human title for the deploy. Used in the Telegram failure alert.'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      TF_API_TOKEN:
+        required: true
+      # The multi-account PAT pool — the ONLY token source. No single-PAT
+      # fallback, deliberately: a fallback means a mis-set pool silently reverts
+      # to one account's quota and looks healthy doing it.
+      PAT_TOKEN_POOL:
+        required: true
+      # Telegram failure alerts — all optional so a partially-configured run
+      # degrades to "skip notify" instead of failing the report job.
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+      TELEGRAM_BUILD_THREAD_ID:
+        required: false
+
+permissions: read-all
+
+env:
+  PRIVATE_REPO: NamThuanVn/website-namthuan
+  # Every wrangler call here is one-shot and must exit. Wrangler's banner runs
+  # an npm version check whose request it abandons after 3s without destroying
+  # it, leaving a ref'd socket to registry.npmjs.org that keeps node alive. If
+  # the registry is slow from the runner, the deploy would SUCCEED and then hang
+  # until the job timeout — reported as a failed deploy.
+  WRANGLER_HIDE_BANNER: "true"
+
+jobs:
+  deploy:
+    name: 1 · Deploy · Terraform apply + wrangler
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      # The resolved host, so the report job can build environment_url without
+      # re-reading Terraform (and without a literal).
+      host: ${{ steps.tf.outputs.host }}
+    # Serializes the apply per environment across runs. `tf-website-` prefix,
+    # NOT the ERP's `tf-<env>`: a shared group would serialize this against the
+    # ERP's own apply, and worse, let one project's run queue behind the other's.
+    concurrency:
+      group: tf-website-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+      TF_WORKSPACE: ${{ inputs.tf_workspace }}
+
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota.
+      # `GET /rate_limit` does not count against the limit, so probing every
+      # token is free. Inlined rather than factored into a script because a
+      # private-repo checkout itself needs the token this step produces — the
+      # pool cannot live behind the thing it unlocks.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.RESOLVED_PAT }}
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Capture deploy SHA
+        id: sha
+        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/install-website
+
+      - name: Build (OpenNext — Cloudflare Workers)
+        run: pnpm build:pages
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      # apply BEFORE wrangler deploy, always. The worker's Terraform-managed
+      # secrets (CONTACT_WEBHOOK_URL) must exist on the account before the
+      # script that reads them is uploaded.
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve -no-color
+
+      # Cloudflare credentials come from Terraform state, not from an Actions
+      # secret. Mask before exporting — `terraform output -json` prints them in
+      # the clear and $GITHUB_ENV is echoed in debug logs.
+      - name: Export Terraform outputs
+        id: tf
+        working-directory: terraform
+        env:
+          DOMAIN_OVERRIDE: ${{ inputs.domain }}
+        run: |
+          set -euo pipefail
+          terraform output -json > /tmp/tf-outputs.json
+          ACC="$(jq -r '.cloudflare_account_id.value' /tmp/tf-outputs.json)"
+          TOKEN="$(jq -r '.cloudflare_api_token.value' /tmp/tf-outputs.json)"
+          HOST="$(jq -r '.hostname.value' /tmp/tf-outputs.json)"
+          # Secrets Store wiring for CONTACT_WEBHOOK_URL. Both empty is valid:
+          # until the endpoint decision lands the secret is not created, and the
+          # contact route falls back to logging the enquiry. `// empty` so a
+          # missing output yields "" rather than the string "null".
+          STORE_ID="$(jq -r '.secrets_store_id.value // empty' /tmp/tf-outputs.json)"
+          SECRET_NAME="$(jq -r '.contact_webhook_secret_name.value // empty' /tmp/tf-outputs.json)"
+          rm -f /tmp/tf-outputs.json
+          echo "::add-mask::$ACC"
+          echo "::add-mask::$TOKEN"
+          if [ -z "$ACC" ] || [ "$ACC" = "null" ] || [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::terraform outputs carry no Cloudflare credentials — check the ${TF_WORKSPACE} workspace variables"
+            exit 1
+          fi
+          # The hostname's single source of truth is terraform/locals.tf. The
+          # `domain` input is an override for one-off manual dispatches only.
+          if [ -n "${DOMAIN_OVERRIDE:-}" ]; then
+            echo "::notice::domain overridden by workflow input: $DOMAIN_OVERRIDE (terraform says $HOST)"
+            HOST="$DOMAIN_OVERRIDE"
+          fi
+          if [ -z "$HOST" ] || [ "$HOST" = "null" ]; then
+            echo "::error::no hostname output from terraform and no domain input — nothing to attach the worker to"
+            exit 1
+          fi
+          {
+            echo "CLOUDFLARE_ACCOUNT_ID=$ACC"
+            echo "CLOUDFLARE_API_TOKEN=$TOKEN"
+            echo "SITE_HOSTNAME=$HOST"
+            echo "SECRETS_STORE_ID=$STORE_ID"
+            echo "CONTACT_WEBHOOK_SECRET_NAME=$SECRET_NAME"
+          } >> "$GITHUB_ENV"
+          if [ -n "$SECRET_NAME" ]; then
+            echo "CONTACT_WEBHOOK_URL will be bound from the Secrets Store"
+          else
+            echo "::warning::CONTACT_WEBHOOK_URL is not configured for this environment — enquiries will be logged, not forwarded (see the CONTACT_WEBHOOK_URL workspace variable)"
+          fi
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+          echo "deploying to $HOST"
+
+      # `pnpm deploy:<env>` renders wrangler.jsonc into wrangler.generated.jsonc
+      # with SITE_HOSTNAME as a custom_domain route, then runs wrangler deploy.
+      # See scripts/wrangler-config.mjs — wrangler has no config interpolation
+      # and custom_domain cannot be set via --route.
+      - name: Deploy worker
+        run: pnpm "deploy${{ inputs.deploy_script_suffix }}"
+
+  report-deployment:
+    name: 2 · Report · deployment status
+    needs: [deploy]
+    # `!cancelled()` rather than `always()`: a run cancelled by concurrency
+    # (superseded staging deploy) is expected, not an error — no alert, and its
+    # pending Deployment is marked inactive when the superseding run reports.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Compute outcome
+        id: outcome
+        env:
+          R_DEPLOY: ${{ needs.deploy.result }}
+        run: |
+          if [ "$R_DEPLOY" = "success" ]; then
+            echo "state=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ping Deployment status on private repo
+        if: inputs.deployment_id != ''
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          STATE: ${{ steps.outcome.outputs.state }}
+          ENV_URL: https://${{ needs.deploy.outputs.host || inputs.domain }}
+          TAG_SUFFIX: ${{ inputs.release_tag && format(' ({0})', inputs.release_tag) || '' }}
+        run: |
+          gh api "repos/${PRIVATE_REPO}/deployments/${{ inputs.deployment_id }}/statuses" \
+            -f state="$STATE" \
+            -f environment_url="$ENV_URL" \
+            -f log_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="ppap run #${{ github.run_id }}${TAG_SUFFIX}"
+
+      - name: Ping commit status on private repo
+        if: inputs.commit_sha != ''
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          STATE: ${{ steps.outcome.outputs.state }}
+          CONTEXT: ${{ inputs.status_context }}
+          TAG_SUFFIX: ${{ inputs.release_tag && format(' ({0})', inputs.release_tag) || '' }}
+        run: |
+          gh api "repos/${PRIVATE_REPO}/statuses/${{ inputs.commit_sha }}" \
+            -f state="$STATE" \
+            -f context="$CONTEXT" \
+            -f target_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="ppap deploy $STATE${TAG_SUFFIX}"
+
+      - name: Summary
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          STATE: ${{ steps.outcome.outputs.state }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          HOST: ${{ needs.deploy.outputs.host }}
+        run: |
+          {
+            echo "Environment: $ENVIRONMENT"
+            echo "Outcome: $STATE"
+            echo "Tag: $RELEASE_TAG"
+            echo "Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "URL: https://$HOST"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Failure-only Telegram alert. Last step and non-fatal, so a Telegram
+      # outage can never disturb the pingbacks above.
+      - name: Notify Telegram on failure
+        if: steps.outcome.outputs.state == 'failure'
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TRIGGERED_BY: ${{ inputs.triggered_by }}
+          RUN_TITLE: ${{ inputs.run_title }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          R_DEPLOY: ${{ needs.deploy.result }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID empty) — skipping notify."
+            exit 0
+          fi
+          TAG_SUFFIX=""
+          if [ -n "${RELEASE_TAG:-}" ]; then TAG_SUFFIX=" (${RELEASE_TAG})"; fi
+          ENV_UPPER=$(printf '%s' "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
+          # Commit subjects are user-controlled text inside parse_mode=HTML — escape.
+          SAFE_TITLE=$(printf '%s' "${RUN_TITLE:-}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+          META=""
+          if [ -n "${TRIGGERED_BY:-}" ]; then META="by @${TRIGGERED_BY}"; fi
+          if [ -n "${COMMIT_SHA:-}" ]; then
+            META="${META:+$META · }commit <a href=\"https://github.com/${PRIVATE_REPO}/commit/${COMMIT_SHA}\">${COMMIT_SHA:0:7}</a>"
+          fi
+          TEXT="🚨 <b>Deploy failed</b> — <b>${ENV_UPPER}</b>${TAG_SUFFIX}"
+          if [ -n "$SAFE_TITLE" ]; then TEXT="${TEXT}: ${SAFE_TITLE}"; fi
+          if [ -n "$META" ]; then TEXT="${TEXT}"$'\n'"${META}"; fi
+          TEXT="${TEXT}"$'\n'"Ref: <code>${CHECKOUT_REF}</code>"
+          TEXT="${TEXT}"$'\n'"Jobs: deploy ${R_DEPLOY}"
+          TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" \
+            -d parse_mode=HTML \
+            -d disable_web_page_preview=true; then
+            echo "✓ Telegram failure alert sent."
+          else
+            echo "::warning::Telegram notify failed (deploy failure alert not delivered)."
+          fi
