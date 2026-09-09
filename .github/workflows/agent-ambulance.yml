@@ -267,8 +267,14 @@ jobs:
       # The only step that touches the hold. Clearing it is what hands the fleet
       # its lanes back, so it is deliberately deterministic and API-verified
       # rather than trusted from the session.
-      # REPAIR_MERGE_WAIT_S is stated here rather than left to the script's
-      # default so it sits next to the `timeout-minutes` it has to fit inside.
+      # Waits out an armed auto-merge before judging a REPAIRED verdict —
+      # api.mjs's MERGE_LANDS_WITHIN_S (10 min), comfortably inside this job's
+      # timeout-minutes. Deliberately NOT pinned here with an env override: a
+      # copy of the number in this file would shadow the shared constant, so
+      # raising the measured ceiling would silently never reach the ambulance,
+      # which is the same drift that left the solve path on 180s. Override
+      # REPAIR_MERGE_WAIT_S only to debug one run.
+      #
       # It is the SAFETY NET: claude.sh's repair-mode wait (55 min) normally
       # settles the PR before the verdict is ever parsed, and this covers the
       # case where the session emitted REPAIRED without waiting — which used to
@@ -278,7 +284,6 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          REPAIR_MERGE_WAIT_S: '600'
         run: node scripts/agent/board/verdict/execute-repair.mjs
 
       - name: Upload transcript
