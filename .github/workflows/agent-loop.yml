@@ -537,11 +537,31 @@ jobs:
             # -F: it would send a real JSON boolean and the consumer's
             # `client_payload.loop == 'true'` gate would silently stop
             # matching.
-            GH_TOKEN="$POOL_PAT" gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
+            #
+            # The pooled PAT is shared with every concurrently-running lane
+            # (each resolves its own "best" token the same way, so several can
+            # converge on the same account), and its 5,000/hr core budget can
+            # run out mid-job even though "Resolve PAT from pool" saw headroom
+            # at job start (observed: 5000 remaining, then rate-limited 12s
+            # later — ppap run 34333799888). That is weather, not a defect: no
+            # lane and no ambulance can fix an hourly quota. Failing the whole
+            # job here used to make sweep-dead-lanes.mjs misclassify it as
+            # `harness-broken` and spend a repair-attempt budget on it, so a
+            # rate-limited dispatch stops the loop for THIS tick only — the
+            # next lane completion or the 15-min heartbeat re-probes with
+            # (likely) a fresh "best" token.
+            if ! OUT=$(GH_TOKEN="$POOL_PAT" gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
               -f event_type=agent-todo \
               -f client_payload[item]="" \
               -f client_payload[loop]="true" \
-              -f client_payload[triggered_by]="${TRIGGERED_BY}"
+              -f client_payload[triggered_by]="${TRIGGERED_BY}" 2>&1); then
+              if printf '%s' "$OUT" | grep -qi "API rate limit exceeded"; then
+                echo "::warning::pooled PAT rate-limited after dispatching $((I - 1))/$K — stopping this tick rather than failing the job; the next trigger re-probes"
+                break
+              fi
+              echo "$OUT" >&2
+              exit 1
+            fi
             echo "✓ dispatched agent run $I/$K"
             sleep 0.5
           done
