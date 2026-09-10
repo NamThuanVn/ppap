@@ -1,8 +1,16 @@
 name: CI · Warm-up (prove this org's concurrency)
 
-# Measures how many jobs this org can ACTUALLY run at once, and records the
+# Measures how many jobs THIS org can ACTUALLY run at once, and records the
 # answer in its own E2E_HOST_CEILING repo variable so scripts/ci/fanout.mjs can
 # size that host's e2e batch instead of guessing.
+#
+# DISPATCH-ONLY. This workflow has no schedule of its own: one scheduler on the
+# deploy repo — fleet-warmup.yml, hourly — reads every host's ceiling and
+# dispatches this to the hosts that still need proving. It used to carry its own
+# hourly cron, which meant seventeen copies woke up every hour to each read one
+# variable and each conclude it had nothing to do, and nothing anywhere held the
+# fleet-wide view: on a fresh fleet every unproven org saturated itself in the
+# same minute, and a PR landing then could recruit nobody.
 #
 # WHY THIS EXISTS. GitHub Free is documented at 20 concurrent jobs, but a NEW
 # free org starts near 5 and the ceiling climbs with accumulated Actions usage —
@@ -25,14 +33,13 @@ name: CI · Warm-up (prove this org's concurrency)
 # 33836951661 queued 3 of 8 for ~5.5 minutes in an org with no other run in its
 # entire history.
 #
-# SELF-TERMINATING. The `check` job exits the whole workflow the moment
-# E2E_HOST_CEILING reports the target, so a proven org stops burning minutes
-# forever. Only unproven orgs keep probing hourly.
+# RUNNING IT BY HAND saturates this org for ~3 minutes on purpose, so it is safe
+# but not free: fanout treats a warming host as busy and will not recruit it. The
+# scheduler exists so nobody has to think about that — prefer dispatching
+# fleet-warmup.yml on NamThuanVn/ppap, which only probes hosts that are idle and
+# unproven.
 
 on:
-  schedule:
-    # Hourly, on the half hour to stay clear of the :00 cron stampede.
-    - cron: '30 * * * *'
   workflow_dispatch:
     inputs:
       target:
@@ -40,11 +47,6 @@ on:
         required: false
         default: '20'
         type: string
-      force:
-        description: 'Re-probe even if this org is already marked proven.'
-        required: false
-        default: false
-        type: boolean
 
 permissions: read-all
 
@@ -55,70 +57,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  check:
-    name: 0 · Already proven?
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      proceed: ${{ steps.gate.outputs.proceed }}
-      target: ${{ steps.gate.outputs.target }}
-    steps:
-      - name: Resolve PAT from pool
-        env:
-          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
-        run: |
-          set -uo pipefail
-          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
-          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
-          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
-          # account reads 5000 — so one account served every job while the rest idled,
-          # which is the concentration the pool exists to prevent. Jobs shuffle
-          # independently, so a fan-out spreads instead of stampeding onto one token.
-          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
-          BEST=''; BEST_REM=-1
-          while IFS= read -r T; do
-            [ -n "$T" ] || continue
-            echo "::add-mask::$T"
-            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
-                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
-            case "$R" in ''|*[!0-9]*) continue ;; esac
-            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
-          done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
-          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
-          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
-          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
-          if [ "$BEST_REM" -lt 500 ]; then
-            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
-          fi
-          exit 0
-
-      - name: Read E2E_HOST_CEILING
-        id: gate
-        env:
-          GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          TARGET: ${{ inputs.target || '20' }}
-          FORCE: ${{ inputs.force }}
-        run: |
-          set -euo pipefail
-          CUR=$(gh api "repos/${{ github.repository }}/actions/variables/E2E_HOST_CEILING" \
-                  --jq '.value' 2>/dev/null || echo '')
-          case "$CUR" in ''|*[!0-9]*) CUR=0 ;; esac
-          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
-          if [ "$FORCE" = "true" ]; then
-            echo "▶ force: re-probing even though E2E_HOST_CEILING=$CUR"
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [ "$CUR" -ge "$TARGET" ]; then
-            echo "✓ already proven at $CUR (target $TARGET) — nothing to do, and this"
-            echo "  workflow will keep no-op'ing until someone raises the target."
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "▶ ceiling is ${CUR:-0}, want $TARGET — probing."
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          fi
-
   # Ask for `target` jobs at once and let GitHub decide how many actually start.
   # Each one just sleeps: the point is to OCCUPY a slot long enough that the
   # overlap is unambiguous, not to compute anything. ~3 min is comfortably longer
@@ -126,8 +64,6 @@ jobs:
   # the org limit rather than by a slow pickup.
   burn:
     name: 1 · Probe (${{ matrix.slot }})
-    needs: [check]
-    if: needs.check.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -147,8 +83,10 @@ jobs:
   # Count how many of those actually overlapped, and record it.
   record:
     name: 2 · Record the ceiling
-    needs: [check, burn]
-    if: always() && needs.check.outputs.proceed == 'true'
+    needs: [burn]
+    # `always()` so a probe whose slots all timed out still records what DID
+    # overlap; the measurement is the timestamps, not the jobs' conclusions.
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -185,7 +123,7 @@ jobs:
       - name: Measure and record
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          TARGET: ${{ needs.check.outputs.target }}
+          TARGET: ${{ inputs.target || '20' }}
         run: |
           set -euo pipefail
           JOBS=$(gh api --paginate \
@@ -235,7 +173,7 @@ jobs:
           echo "✓ E2E_HOST_CEILING: $CUR → $MAX"
 
           if [ "$MAX" -ge "$TARGET" ]; then
-            echo "🎉 proven at the target — the hourly schedule will no-op from now on."
+            echo "🎉 proven at the target — fleet-warmup.yml will stop dispatching to this host."
           else
-            echo "… still below $TARGET; the next hourly run probes again."
+            echo "… still below $TARGET; the scheduler queues this host again."
           fi

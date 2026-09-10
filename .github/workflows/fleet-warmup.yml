@@ -1,0 +1,148 @@
+name: Fleet · Warm-up scheduler
+
+# ONE hourly run that decides which CI-fleet orgs still need their concurrency
+# ceiling proven, and dispatches ci-warmup.yml to just those.
+#
+# WHY IT IS CENTRAL. ci-warmup.yml measures an org's real concurrent-job ceiling
+# into that org's own E2E_HOST_CEILING variable, which is what lets
+# scripts/ci/fanout.mjs size the host's e2e batch instead of guessing (see
+# ppap-ci-fleet.md § CI fan-out). It used to carry its OWN hourly cron, so all
+# seventeen copies — sixteen fleet repos plus this one — woke every hour to read
+# one variable each and each conclude it had nothing to do. Seventeen schedules
+# to run zero probes is the STEADY state, because a proven org never needs
+# another probe.
+#
+# The waste was the smaller half. Nothing owned the fleet-wide view, and two
+# rules only exist once something does:
+#
+#   · Never probe a BUSY org. A probe fills the org on purpose — that is how it
+#     measures — so firing one into a repo running someone's PR shards steals
+#     those slots AND mismeasures, because the PR's jobs hold the very slots the
+#     probe wants to count. (The monotonic guard in `record` stops a low reading
+#     from being written down, so the cost is a wasted burn plus a queued PR,
+#     not a corrupted variable.)
+#   · Probe at most MAX_HOSTS per hour, weakest first. A probe removes a host
+#     from the recruitable pool for ~4 minutes; on a fresh fleet every unproven
+#     org used to saturate itself at :30 simultaneously, so a PR landing in that
+#     window could recruit nobody. Ascending-ceiling order spends the budget
+#     where it buys most — an unmeasured host is sized at WARMUP_SLOTS (5)
+#     however roomy it really is, and probing is itself the Actions usage that
+#     lifts a young org's ceiling.
+#
+# Filename is deliberately NOT ci-*.yml → the sync mirrors it to
+# NamThuanVn/ppap only, never to the CI fleet's 20-job budget
+# (docs/engineering/platform/ppap.md § What lives where). That is also what
+# makes it a scheduler rather than a seventeenth copy of the thing it schedules.
+#
+# This repo is not in PPAP_CI_REPOS and never probes ITSELF: its own e2e
+# fallback is sized by COORD_FALLBACK_SLOTS, a constant, so nothing here reads a
+# ceiling for it.
+
+on:
+  schedule:
+    # Hourly, on the half hour to stay clear of the :00 cron stampede — the same
+    # slot the per-host crons used to occupy, now for one run instead of
+    # seventeen. EXPECT IT LATE: Actions queues a schedule and commonly starts it
+    # minutes after its cron time. Nothing here is time-critical; an hour that
+    # slips just probes an hour later.
+    - cron: '30 * * * *'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Ceiling to prove (default 20 = the documented GitHub Free ceiling).'
+        required: false
+        default: '20'
+        type: string
+      max_hosts:
+        description: 'How many hosts may be probed in this run.'
+        required: false
+        default: '4'
+        type: string
+      dry_run:
+        description: 'Plan and report which hosts WOULD be probed, dispatch nothing.'
+        required: false
+        default: false
+        type: boolean
+
+permissions: read-all
+
+concurrency:
+  # Two schedulers would each read the fleet before either dispatched, and both
+  # would pick the same weakest hosts.
+  group: fleet-warmup
+  cancel-in-progress: false
+
+jobs:
+  schedule:
+    name: Probe the hosts that need it
+    runs-on: ubuntu-latest
+    # A whole fleet sweep is ~1 REST call per proven host and ~9 per unproven
+    # one, then one dispatch each. Minutes, not tens of them; anything near this
+    # cap means a call is hanging.
+    timeout-minutes: 15
+    steps:
+      # Same inlined PAT pool as every other ppap workflow, and for the same
+      # reason: the private-repo checkout below needs a token, so the pool
+      # cannot live behind it. scripts/ci/ppap/pat-pool.sh is the canonical copy
+      # — scripts/gate/ci/pat-pool-drift.mjs fails the build if these diverge.
+      #
+      # This token needs Actions WRITE on every fleet org, not just read: the
+      # dispatch below is a POST. A read-only pool member fails the dispatch for
+      # every selected host, which the script turns into a red run rather than a
+      # quiet no-op.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+      - name: Checkout upstream main
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Dispatch warm-up to the unproven hosts
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          TARGET: ${{ inputs.target || '20' }}
+          MAX_HOSTS: ${{ inputs.max_hosts || '4' }}
+          DRY_RUN: ${{ inputs.dry_run == true && '1' || '0' }}
+        run: |
+          set -uo pipefail
+          # The fleet list is read from the repo VARIABLE, never inlined here:
+          # PPAP_CI_REPOS grew from 3 repos to 16, and a stale literal would
+          # probe a fraction of the fleet while reporting it proven. The script
+          # itself refuses an empty list rather than reporting success.
+          REPOS="$(gh api repos/NamThuanVn/erp-namthuan/actions/variables/PPAP_CI_REPOS --jq .value 2>/dev/null || true)"
+          if [ -z "$REPOS" ]; then
+            echo "::error::PPAP_CI_REPOS is unset on NamThuanVn/erp-namthuan — there is no fleet to warm up"
+            exit 1
+          fi
+          PPAP_CI_REPOS="$REPOS" node scripts/ci/warmup-fleet.mjs

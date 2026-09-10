@@ -60,7 +60,7 @@ on:
       claude_version:
         description: 'Claude Code CLI version to install (pin; bump deliberately).'
         required: false
-        default: '2.1.211'
+        default: '2.1.267'
         type: string
       model:
         description: 'Optional --model override. Empty = the account default on attempt 1, and the escalated model from attempt 2 onward.'
@@ -94,7 +94,7 @@ jobs:
     timeout-minutes: 120
     env:
       ATTEMPT: ${{ github.event.client_payload.attempt || '1' }}
-      CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.211' }}
+      CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.267' }}
     steps:
       # AGENT_STATE_DIR must be set HERE, not in the job-level `env:` block.
       # `runner` is not an available context for `jobs.<id>.env` — only from step
