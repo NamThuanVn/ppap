@@ -227,7 +227,7 @@ jobs:
             --title "chore(e2e): drop $REMOVED redundant timeouts ($SCOPE)" \
             --body "Automated batch from the timeout hunter. $REMOVED override(s) across $FILES file(s); $REMAINING removable site(s) remain.
 
-          Every removal is a value at or below the global that backs its call shape (\`expect.timeout\` 15s, \`expect.toPass.timeout\` 30s, \`use.actionTimeout\` 15s, \`use.navigationTimeout\` 15s), so no wait gets shorter. Values above their global, \`test.setTimeout\`, and calls inheriting no global are deliberately untouched — see [\`no-timeout-waits\`](.claude/skills/no-timeout-waits/SKILL.md).
+          Every removal is a value at or below the global that backs its call shape (\`expect.timeout\` 15s, \`expect.toPass.timeout\` 30s, \`use.actionTimeout\` 15s, \`use.navigationTimeout\` 15s), so no wait gets shorter. Values above their global, \`test.setTimeout\`, and calls inheriting no global are deliberately untouched — see [\`remove-test-waits\`](.claude/skills/remove-test-waits/SKILL.md).
 
           **The full e2e suite on this PR is the evidence.** A failure here is a real finding: it names a spec that was relying on a hand-typed budget."
 
@@ -475,7 +475,7 @@ jobs:
             printf 'Per-category fix guidance: '
             printf '[hydration double-mount race](https://github.com/NamThuanVn/erp-namthuan/blob/main/docs/engineering/runbooks/hydration-double-mount-race.md) '
             printf 'for `dup`/`hyd`, '
-            printf '[`no-timeout-waits`](https://github.com/NamThuanVn/erp-namthuan/blob/main/.claude/skills/no-timeout-waits/SKILL.md) '
+            printf '[`remove-test-waits`](https://github.com/NamThuanVn/erp-namthuan/blob/main/.claude/skills/remove-test-waits/SKILL.md) '
             printf 'for a wait you are tempted to widen.\n\n'
             printf 'This issue closes itself the day the sweep comes back clean.\n'
           } > noise/issue-body.md

@@ -3,8 +3,8 @@ name: Agent · rel-plan
 # Relationship-planning run for the agent loop: assesses ordering across all
 # open BA leaves and wires GitHub issue dependencies (blocked-by edges) BEFORE
 # any solve lane claims — the scripted claim respects blockedBy edges, but
-# planning is what SETS them. This is /clear-todo-issue's Phase 0-pre planning
-# half, running the shared /rel-plan-todo skill headless (LOCAL wrapper ticks
+# planning is what SETS them. This is /clear-todo's Phase 0-pre planning
+# half, running the shared /order-todo-queue skill headless (LOCAL wrapper ticks
 # invoke the same skill — keep them in lockstep).
 #
 # Dispatched by agent-loop.yml's rel-planning gate whenever any open leaf
@@ -203,7 +203,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/claude" --version
 
-      # REL_PLAN=1 → the wrapper runs `/rel-plan-todo` (MCP stripped, token
+      # REL_PLAN=1 → the wrapper runs `/order-todo-queue` (MCP stripped, token
       # pool probe/rotation/failover as usual). Planning writes ONLY
       # addBlockedBy edges + the rel-planned label — no assign/board/close.
       - name: Run planner

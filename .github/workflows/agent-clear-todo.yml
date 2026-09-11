@@ -26,7 +26,7 @@ name: Agent · clear-todo-issue
 #
 # A manual `item` input (issue URL / PR number / docs-ba folder) takes the
 # LEGACY WRAPPER path instead: no scripted claim; the session runs
-# /clear-todo-issue <item>, which does its own claim + board writes.
+# /clear-todo <item>, which does its own claim + board writes.
 #
 # Parallelism + repetition are owned by agent-loop.yml: loop-spawned runs carry
 # client_payload.loop='true', and the final "Continue loop" step chains back to
@@ -61,7 +61,7 @@ on:
   workflow_dispatch:
     inputs:
       item:
-        description: 'Optional: issue URL/number, PR number, or docs/ba folder path → one-shot LEGACY /clear-todo-issue <item> run. Empty = scripted board claim + /solve-issue.'
+        description: 'Optional: issue URL/number, PR number, or docs/ba folder path → one-shot LEGACY /clear-todo <item> run. Empty = scripted board claim + /solve-issue.'
         required: false
         default: ''
         type: string
@@ -378,7 +378,7 @@ jobs:
         if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         uses: ./.github/actions/install
 
-      # Same Chromium cache pattern as ci-checks.yml — /browse (headless) and
+      # Same Chromium cache pattern as ci-checks.yml — /verify-in-browser (headless) and
       # any e2e the agent runs need it.
       - name: Resolve Playwright version
         id: pw
@@ -447,7 +447,7 @@ jobs:
       # The same first-time setup a dev worktree gets (pnpm menu →
       # worktree:init): machine check (linux no-op) → pnpm install (no-op —
       # the install action already ran) → db:reset (local D1 wipe +
-      # migrations + demo seeds: the agent's dev:serve//browse stack needs
+      # migrations + demo seeds: the agent's dev:serve//verify-in-browser stack needs
       # them ready instead of burning session turns seeding) → codegraph
       # build/sync (against the cache restored above) → MCP wiring (sentry /
       # playwright / databases; databases skips cleanly when uv is absent,
@@ -469,7 +469,7 @@ jobs:
       # session (board GraphQL reads, PR create, /watch-ci across the fleet
       # orgs). The wrapper owns workspace trust, token-pool selection,
       # mid-run failover, mode detection (claim.json → /solve-issue; ITEM_ARG
-      # → legacy /clear-todo-issue), and the salvaged-session resume. No
+      # → legacy /clear-todo), and the salvaged-session resume. No
       # ANTHROPIC_API_KEY here — ever (it outranks the OAuth pool).
       - name: Run agent
         id: run
@@ -614,7 +614,7 @@ jobs:
           # this token staying valid is the only thing keeping the sweep alive.
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         # One line, because the whole sweep now lives in a script the LOCAL
-        # caller runs too (`/clear-todo-issue` Phase 4). This block and that doc
+        # caller runs too (`/clear-todo` Phase 4). This block and that doc
         # used to be two copies of the same procedure kept in sync by a comment
         # asking a human to "keep the two in lockstep" — and the local copy
         # drifted anyway, growing an "or fold it into your next push" option.

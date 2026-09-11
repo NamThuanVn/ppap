@@ -6,7 +6,7 @@ name: DB · Publish local D1 snapshot
 #
 #   local  `pnpm worktree:init` / `pnpm db:reset`  → scripts/dev/db/reset.sh
 #   PR CI  `e2e-seed` job                          → ci-checks.yml
-#   agent  `/clear-todo-issue` runs                 → agent-clear-todo.yml
+#   agent  `/clear-todo` runs                 → agent-clear-todo.yml
 #
 # Triggered by the private repo's release.yml on a PRODUCTION RELEASE (version
 # bump + tag), pinned to the released commit — NOT on every migration merge. So

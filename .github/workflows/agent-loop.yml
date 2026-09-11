@@ -1,6 +1,6 @@
 name: Agent · loop
 
-# Top-up controller for the self-perpetuating /clear-todo-issue agent loop.
+# Top-up controller for the self-perpetuating /clear-todo agent loop.
 # Level-triggered: EVERY invocation recomputes K = min(candidates, cap − active)
 # from live API state and fires K repository_dispatch[agent-todo] events at its
 # own repo (agent-clear-todo.yml). It never carries state between invocations,
@@ -439,7 +439,7 @@ jobs:
       # Rel-planning gate: lanes must not start while ANY open BA leaf lacks
       # the `rel-planned` marker — the scripted claim respects blockedBy edges
       # but PLANNING is what sets them (Phase 0-pre's planning half, shared
-      # skill /rel-plan-todo). Unplanned leaves → dispatch ONE agent-rel-plan
+      # skill /order-todo-queue). Unplanned leaves → dispatch ONE agent-rel-plan
       # run INSTEAD of lanes; on success it re-dispatches agent-loop, and this
       # gate then passes. All three kinds are swept (a bug can be blocked by a
       # feature) with the SAME leaf-marker query as the planner's sweep and

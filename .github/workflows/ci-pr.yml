@@ -452,11 +452,11 @@ jobs:
       # Post/refresh a sticky CI report comment on the source PR; flip ANY draft
       # ready-for-review once CI is green + noise-clean; and — for PRs labeled
       # `auto-merge` — squash-merge them on the same green+clean bar. The auto-ready
-      # is unconditional (this is the single owner of draft → ready — the /ship,
-      # /ship-docs, /create-pull-request commands no longer flip it themselves); the
+      # is unconditional (this is the single owner of draft → ready — the /ship-pr,
+      # /ship-docs, /open-pr commands no longer flip it themselves); the
       # merge is label-gated. Best-effort: `set +e` + `exit 0` so a comment/ready/merge
       # hiccup (or a PAT missing contents/PR write) never reds this job after the
-      # status posted. `/clear-todo-issue` adds the `auto-merge` label, so its PRs
+      # status posted. `/clear-todo` adds the `auto-merge` label, so its PRs
       # merge here on green+clean (which is also why its own classifier-blocked
       # `gh pr merge` is no longer needed — CI lands the merge).
       - name: Report to PR + auto-ready + auto-merge when clean
@@ -531,7 +531,7 @@ jobs:
 
           # Decide the auto-merge action + human-readable reason. Merging requires the
           # `auto-merge` label (unlike the auto-ready above, which is unconditional).
-          # `/clear-todo-issue` adds the label, so its PRs merge here on green+clean.
+          # `/clear-todo` adds the label, so its PRs merge here on green+clean.
           MERGE_LINE=""
           if [ "$MERGED" = "true" ]; then
             MERGE_LINE="✅ Already merged."

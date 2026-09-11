@@ -196,7 +196,7 @@ jobs:
       # went 15s to 150s across five PRs before anyone noticed the assertion was
       # waiting on a toast that expires after 4s. The gate counts rather than
       # judging; a stale baseline fails too, because slack is where a re-added
-      # timeout hides (.claude/skills/no-timeout-waits).
+      # timeout hides (.claude/skills/remove-test-waits).
       - name: Timeout ratchet
         if: ${{ !cancelled() }}
         run: bash scripts/gate/shape/no-timeouts.sh
