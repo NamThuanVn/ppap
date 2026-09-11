@@ -765,15 +765,16 @@ jobs:
               # A scoped run USED to be pinned to exactly one shard, on the
               # assumption that "a handful of specs doesn't need 12 stacks".
               # That assumption does not hold: scripts/ci/e2e/plan.sh emits spec
-              # DIRECTORIES as well as files, and the groups are wildly uneven
-              # — `sourcing`/`apis/sourcing` map to apps/shell/e2e/scpms, which
-              # is 199 of the suite's 327 spec files. Those all ran serially in
-              # ONE job, so the most common kind of PR in this repo got the
-              # slowest possible e2e.
+              # DIRECTORIES as well as files, and the directories are uneven.
+              # It used to be far worse — `sourcing` mapped to a single
+              # 232-spec `scpms` folder shared by four zones — but even now
+              # apps/procurement/e2e is ~99 specs against apps/mail/e2e's 1,
+              # and the big ones ran serially in ONE job, so the most common
+              # kind of PR in this repo got the slowest possible e2e.
               #
               # Size the matrix to the number of specs actually selected, at
-              # the same ~25-specs-per-shard density the full run uses (327
-              # specs / 12 shards). Capped at 8 so a scoped run still leaves
+              # the same ~25-specs-per-shard density the full run uses (467
+              # specs / 18 shards). Capped at 8 so a scoped run still leaves
               # room in the org's 20-job budget for the rest of the graph.
               SPEC_COUNT=0
               for t in $TARGETS; do
