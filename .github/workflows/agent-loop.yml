@@ -491,6 +491,11 @@ jobs:
           # How many Claude accounts the last pool probe found usable. Empty when
           # no probe is fresh enough to trust, in which case K is not capped by it.
           USABLE_ACCOUNTS: ${{ steps.hold.outputs.usable_accounts }}
+          # How many lanes the pool's REMAINING QUOTA can actually fund — the
+          # per-account 5h/7d headroom divided by one lane's assumed cost. Empty
+          # when the probe predates this field (or is stale), in which case K is
+          # not capped by it and the loop behaves exactly as it did before.
+          CAPACITY: ${{ steps.hold.outputs.capacity }}
         run: |
           set -euo pipefail
           # The runs-list `status` param is single-valued → two calls. The list
@@ -532,8 +537,23 @@ jobs:
             echo "· capping K at $USABLE_ACCOUNTS usable Claude account(s) (was $K)"
             K="$USABLE_ACCOUNTS"
           fi
+          # Fourth term: never send out more lanes than the pool's remaining
+          # quota can pay for. The account COUNT above is a floor, not a budget —
+          # three accounts at 89% used are three usable accounts and about one
+          # lane's worth of headroom, so the count said 3, the controller
+          # dispatched 3, and all three hit the wall mid-flight. This term reads
+          # the real 5h/7d percentages instead.
+          #
+          # Same null-guard as above, and for the same reason: an empty value
+          # (no fresh probe, or a probe written before the field existed) must
+          # leave K alone. It can only ever make K smaller, never larger, so the
+          # worst case of a wrong estimate is a slower loop — not a dead one.
+          if [ -n "${CAPACITY:-}" ] && [ "$K" -gt "$CAPACITY" ]; then
+            echo "· capping K at $CAPACITY lane(s) of real pool headroom (was $K)"
+            K="$CAPACITY"
+          fi
           [ "$K" -lt 0 ] && K=0
-          echo "cap=$CAP · active=$ACTIVE · candidates=$CANDIDATES · usable-accounts=${USABLE_ACCOUNTS:-unknown} → dispatching $K run(s)"
+          echo "cap=$CAP · active=$ACTIVE · candidates=$CANDIDATES · usable-accounts=${USABLE_ACCOUNTS:-unknown} · capacity=${CAPACITY:-unknown} → dispatching $K run(s)"
           if [ "$K" -eq 0 ]; then
             echo "::notice::pool already at capacity (or no headroom) — nothing dispatched"
             exit 0
