@@ -1,0 +1,82 @@
+name: ERP · Deploy · Production
+
+# Triggered cross-repo from NamThuanVn/erp-namthuan when `release.yml` cuts a
+# new release. `workflow_dispatch` requires typing PRODUCTION into the confirm
+# input as a tripwire against fat-fingered clicks. All deploy logic lives in
+# deploy.yml (reusable workflow_call). See docs/engineering/platform/ppap.md for the architecture.
+run-name: "ERP · ${{ github.event.client_payload.title || format('Deploy Production — triggered by @{0} ({1})', inputs.triggered_by || github.actor, inputs.tag) }}"
+
+on:
+  repository_dispatch:
+    types: [deploy-production]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to deploy (e.g. v1.2.3). Required.'
+        required: true
+      confirm:
+        description: 'Type PRODUCTION to confirm.'
+        required: true
+        default: ''
+      triggered_by:
+        description: 'Manual override actor handle (for run-name)'
+        required: false
+        default: ''
+      fleet:
+        description: 'Comma-separated owner/repo ppap list for the CI gate to borrow idle e2e capacity from (erp-namthuan variable PPAP_CI_REPOS). A release-triggered deploy gets it in client_payload; supply it here for a manual deploy, or leave empty to run every shard on this repo.'
+        required: false
+        default: ''
+        type: string
+
+permissions: read-all
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # Tripwire: workflow_dispatch must type PRODUCTION exactly. Skipped for
+  # repository_dispatch where confirmation is implicit (release.yml fired it).
+  confirm:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard — confirm tripwire
+        run: |
+          if [ "${{ inputs.confirm }}" != "PRODUCTION" ]; then
+            echo "Confirmation input must be exactly 'PRODUCTION' (got '${{ inputs.confirm }}')."
+            exit 1
+          fi
+          if [ -z "${{ inputs.tag }}" ]; then
+            echo "Tag input is required for manual production deploys."
+            exit 1
+          fi
+
+  deploy:
+    needs: [confirm]
+    if: |
+      always() &&
+      (needs.confirm.result == 'success' || needs.confirm.result == 'skipped')
+    uses: ./.github/workflows/erp-deploy-reusable.yml
+    with:
+      environment: production
+      tf_workspace: namthuanvn-production
+      domain: namthuan.co
+      api_url: https://namthuan.co/api
+      checkout_ref: refs/tags/${{ github.event.client_payload.tag || inputs.tag }}
+      deploy_script_suffix: ':production'
+      release_tag: ${{ github.event.client_payload.tag || inputs.tag }}
+      deployment_id: ${{ github.event.client_payload.deployment_id }}
+      commit_sha: ${{ github.event.client_payload.sha }}
+      status_context: deploy-production
+      triggered_by: ${{ github.event.client_payload.triggered_by || inputs.triggered_by || github.actor }}
+      run_title: ${{ github.event.client_payload.title }}
+      # release.yml forwards PPAP_CI_REPOS so the gate's full-suite e2e fans out
+      # instead of collapsing onto this repo's 14-shard fallback.
+      fleet: ${{ github.event.client_payload.fleet || inputs.fleet }}
+    secrets:
+      TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+      PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}

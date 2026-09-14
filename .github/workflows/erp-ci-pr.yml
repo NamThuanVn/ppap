@@ -1,0 +1,591 @@
+name: ERP · CI · PR · Lint · Typecheck · Test · E2E
+
+# PR CI entrypoint. Triggered cross-repo by erp-namthuan/.github/workflows/
+# pr-triage-and-ci-dispatch.yml via repository_dispatch[ci]; workflow_dispatch is the
+# manual re-run escape hatch. The actual job graph (biome / typecheck /
+# lint / test / e2e-shards) lives in erp-ci-checks.yml (reusable workflow_call)
+# — this file just wires that graph to the PR-CI trigger surface and pings
+# the Check Run back on completion.
+#
+# Uses a pooled PAT (same pool as deploy/sync, ppap-side copy). It must have
+# Checks:R/W on erp-namthuan so the `report` job can PATCH the Check Run.
+# Note: this collapses the fork-safety boundary that a separate CI_PAT
+# would have provided — see the trade-off note in docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL.
+
+run-name: "${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('ERP · CI · PR #{0} · {1}', github.event.client_payload.pr_number || inputs.pr_number, github.event.client_payload.title || 'manual rerun') || 'ERP · CI · manual · main' }}"
+
+on:
+  repository_dispatch:
+    types: [ci]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number on NamThuanVn/erp-namthuan to (re)run CI for. Leave EMPTY to smoke-test the full CI graph against erp-namthuan main.'
+        required: false
+        type: string
+      e2e_shards:
+        description: 'Override default Playwright shard count for a manual re-run (leave empty to use erp-ci-checks.yml default).'
+        required: false
+        type: number
+      fleet:
+        description: 'Comma-separated owner/repo ppap list to borrow idle e2e capacity from (the erp-namthuan variable PPAP_CI_REPOS). Empty on a manual run ⇒ no fan-out, every shard lands on this repo.'
+        required: false
+        default: ''
+        type: string
+
+permissions: read-all
+
+concurrency:
+  group: ci-${{ github.event.client_payload.pr_number || inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+
+jobs:
+  # Echo the source pull request on erp-namthuan (this run has no PR context of
+  # its own — it's fired cross-repo via repository_dispatch). Prints to the log
+  # and the run's Summary so reviewers can jump straight to the PR being tested.
+  source-pr:
+    name: Source PR
+    runs-on: ubuntu-latest
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Print source PR
+        env:
+          PR: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
+          TITLE: ${{ github.event.client_payload.title }}
+          SHA: ${{ github.event.client_payload.head_sha }}
+          ACTOR: ${{ github.event.client_payload.triggered_by }}
+        run: |
+          URL="https://github.com/${{ env.PRIVATE_REPO }}/pull/${PR}"
+          echo "Source PR: #${PR} — ${TITLE:-<no title>}"
+          echo "  ${URL}"
+          echo "  head_sha: ${SHA:-n/a} · triggered_by: ${ACTOR:-n/a}"
+          {
+            echo "### Source pull request"
+            echo ""
+            echo "- **PR:** [#${PR}](${URL}) — ${TITLE:-_no title_}"
+            echo "- **Head SHA:** \`${SHA:-n/a}\`"
+            echo "- **Triggered by:** ${ACTOR:-n/a}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Re-post the pending CI status so its Details link points at THIS run
+      # instead of the generic /actions list the dispatcher had to use
+      # (repository_dispatch is fire-and-forget — only the run knows its id).
+      - name: Point CI status at this run
+        if: github.event.client_payload.head_sha
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api repos/${{ env.PRIVATE_REPO }}/statuses/"$HEAD_SHA" \
+            -f state=pending \
+            -f context=CI \
+            -f description="Running on ppap" \
+            -f target_url="$RUN_URL"
+          echo "✓ Pending CI status now targets $RUN_URL"
+
+  # Run the 4-job CI graph. erp-ci-checks.yml lives in the same repo and exposes
+  # each job's `result` as a workflow_call output, so the report job below
+  # can build a per-job summary without re-querying the API.
+  #
+  # A PR (repository_dispatch, or workflow_dispatch WITH a number) checks out
+  # refs/pull/<N>/merge — the merge commit GitHub computes between the PR head
+  # and base, mirroring what `pull_request` would test (absent on a merge
+  # conflict → checkout fails → the report surfaces a "resolve conflict" hint).
+  # A manual workflow_dispatch with NO number checks out erp-namthuan `main`
+  # instead, so the full CI graph can be smoke-tested without opening a PR.
+  checks:
+    uses: ./.github/workflows/erp-ci-checks.yml
+    with:
+      checkout_ref: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('refs/pull/{0}/merge', github.event.client_payload.pr_number || inputs.pr_number) || 'main' }}
+      # DESIRED shard count. The effective count is min(this, capacity) —
+      # erp-ci-checks.yml's e2e job borrows idle fleet repos for the surplus,
+      # so this can exceed one org's ~14-shard ceiling. Empty ⇒ erp-ci-checks.yml's
+      # own default.
+      # 48, not 32: fan-out recruits ceil(total/WORKER_SLOTS) hosts, so this is
+      # 6 of the ~15 idle fleet repos and leaves the rest for concurrent PRs.
+      # Measured at 32 (ppap run 33893945508): 32 shards, mean 240s, max 376s,
+      # e2e leg 413s of a 700s run. Going 14 → 32 scaled nearly linearly
+      # (per-shard ~520s → ~240s), so there is headroom left; the floor is each
+      # shard's fixed cost (~30s of install + artifact restore, plus the stack
+      # boot), which is why this stops at 48 rather than 64. Shorter shards also
+      # shrink the slow-shard tail that sets the batch job's 40-minute ceiling.
+      # Revert to 32 here if concurrent PRs start finding the fleet busy.
+      e2e_shards: ${{ fromJSON(inputs.e2e_shards || '48') }}
+      # The fleet this run may borrow e2e capacity from, forwarded by the
+      # private dispatcher (which owns PPAP_CI_REPOS). Absent on a manual
+      # workflow_dispatch → no fan-out, every shard stays here.
+      # A repository_dispatch carries the list; a manual run has to be given it,
+      # otherwise fanout finds no pool, logs "no idle worker" and collapses every
+      # shard onto this one repo (up to COORD_FALLBACK_SLOTS). That made manual
+      # main smoke tests unrepresentative of real PR CI — and unusable for
+      # measuring a shard-count change.
+      fleet: ${{ github.event.client_payload.fleet || inputs.fleet }}
+      pr_number: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
+      head_sha: ${{ github.event.client_payload.head_sha }}
+      # PR CI runs only the changed service's e2e specs (broad/shared change →
+      # full; nothing relevant → skip; see scripts/ci/e2e/plan.sh). A manual main
+      # run has no PR diff to scope against → run the full suite.
+      e2e_changed_only: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && true || false }}
+    secrets:
+      PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+
+  # Posts the final commit-status update on the PR's head SHA, replacing the
+  # `pending` status that pr-triage-and-ci-dispatch.yml created. `if: !cancelled()` so
+  # failures still get a final pingback, but runs cancelled by concurrency
+  # (superseded by a newer push — expected, not an error) stay silent: the
+  # superseding run re-posts a fresh pending status and delivers the real
+  # final state. The shell step itself no-ops if `head_sha` is empty
+  # (manual workflow_dispatch).
+  #
+  # Statuses (not Check Runs) because the Checks API update endpoint
+  # requires a GitHub App installation token; a pooled PAT is a fine-grained
+  # PAT, which the Statuses API accepts with Statuses:R/W.
+  report:
+    name: Report CI
+    needs: [checks]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      # Sparse checkout of scripts/ci only. This job otherwise never touches the
+      # repo — the noise scan reads every log through the API — but the digest
+      # step below runs scripts/ci/failure-digest.mjs, and a script belongs in
+      # scripts/ (CLAUDE.md) rather than inlined here where nothing can test it.
+      # One non-cone path keeps this to a few KB, and no `pnpm install` is needed:
+      # the script imports only node: builtins.
+      #
+      # `continue-on-error`: this job's product is the commit status and the
+      # sticky comment. If the checkout blips the digest degrades to absent and
+      # the report still posts — it must never be why a green PR misses its
+      # auto-merge.
+      - name: Check out the digest script
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.RESOLVED_PAT }}
+          ref: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('refs/pull/{0}/merge', github.event.client_payload.pr_number || inputs.pr_number) || 'main' }}
+          sparse-checkout: scripts/ci
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # The "green is not clean" scan, folded into this job rather than a
+      # separate one in erp-ci-checks.yml. It was its own job only because that is
+      # where the e2e shards used to live; it reads everything through the API
+      # by run id, so it can run anywhere — and its sole consumer is the status
+      # + comment steps right below it. One report job instead of two.
+      #
+      # Reusable-workflow jobs share THIS run, so `github.run_id` covers every
+      # coordinator job; the fanned-out batches live in other repos and come
+      # from the `e2e_runs` output.
+      #
+      # `continue-on-error` + `set +e`: a scan hiccup must never red a run whose
+      # actual checks passed. When it cannot run, `clean` stays empty, which the
+      # steps below treat as "not clean" — so the failure mode is a missed
+      # auto-merge, never a wrongly-permitted one.
+      - name: Scan this run's logs for noise
+        id: noise
+        continue-on-error: true
+        env:
+          # A pooled PAT, not the default token: some shard logs live in other
+          # repos, which GITHUB_TOKEN cannot read. With it the scan silently
+          # returned zero e2e lines — i.e. "clean" — on every fanned-out run.
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          RUN_ID: ${{ github.run_id }}
+          BATCH_RUNS: ${{ needs.checks.outputs.e2e_runs }}
+          # Which categories CI itself calls red. The digest uses this to tell
+          # "this job passed" apart from "this job failed and I could not parse
+          # why" — an unparsed red job must announce itself, not read as silence.
+          R_BIOME: ${{ needs.checks.outputs.biome }}
+          R_TYPE: ${{ needs.checks.outputs.typecheck }}
+          R_LINT: ${{ needs.checks.outputs.lint }}
+          R_TEST: ${{ needs.checks.outputs.test }}
+          R_E2E: ${{ needs.checks.outputs.e2e }}
+        run: |
+          set +e -uo pipefail   # errexit OFF — zero-match greps below exit non-zero by design
+          tmp="$(mktemp -d)"
+          : > "$tmp/e2e.log"; : > "$tmp/biome.log"; : > "$tmp/test.log"
+          : > "$tmp/typecheck.log"; : > "$tmp/eslint.log"
+          : > "$tmp/runs.tsv"
+          printf '%s\t%s\n' "$GITHUB_REPOSITORY" "$RUN_ID" >> "$tmp/runs.tsv"
+          if [ -n "${BATCH_RUNS:-}" ] && [ "$BATCH_RUNS" != "[]" ]; then
+            printf '%s' "$BATCH_RUNS" \
+              | jq -r '.[]? | [.repo, (.run_id|tostring)] | @tsv' 2>/dev/null >> "$tmp/runs.tsv"
+          fi
+          echo "▶ noise: scanning $(wc -l < "$tmp/runs.tsv") run(s)"
+          while IFS="$(printf '\t')" read -r repo run; do
+            [ -n "$repo" ] && [ -n "$run" ] || continue
+            gh api "repos/${repo}/actions/runs/${run}/jobs" --paginate \
+              --jq '.jobs[]? | [(.id|tostring), .name] | @tsv' 2>/dev/null \
+              | while IFS="$(printf '\t')" read -r id name; do
+                  [ -n "$id" ] || continue
+                  # `E2E (shard` and not `E2E`: the plan, build-zone and seed
+                  # jobs share the prefix and carry no test output.
+                  case "$name" in
+                    *"E2E (shard"*)  dest="$tmp/e2e.log" ;;
+                    # BOTH arms, permanently: sync-workflows-to-ppap.yml rsyncs
+                    # file-by-file across the fleet, so there is a window where a
+                    # repo has the new ci-checks and the old ci-pr (or the
+                    # reverse). A single-arm match during that window silently
+                    # reports `biome_warnings: 0, clean: true`.
+                    *"Biome"*|*"Repo gates"*) dest="$tmp/biome.log" ;;
+                    *"Unit tests"*)  dest="$tmp/test.log" ;;
+                    *"Typecheck"*)   dest="$tmp/typecheck.log" ;;
+                    *"ESLint"*)      dest="$tmp/eslint.log" ;;
+                    *)               continue ;;
+                  esac
+                  gh api "repos/${repo}/actions/jobs/${id}/logs" 2>/dev/null \
+                    | sed -E 's/\x1b\[[0-9;]*m//g' >> "$dest"
+                done
+          done < "$tmp/runs.tsv"
+          num() { grep -oiE "$1" "$2" 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}'; }
+          cnt() { grep -acE "$1" "$2" 2>/dev/null | head -1; }
+          flaky=$(num '([0-9]+) flaky' "$tmp/e2e.log"); flaky=${flaky:-0}
+          dup=$(cnt '\[dup-testid\]' "$tmp/e2e.log"); dup=${dup:-0}
+          hyd=$(cnt '\[hydration-error\]' "$tmp/e2e.log"); hyd=${hyd:-0}
+          i18n=$(cnt '\[i18n-missing\]' "$tmp/e2e.log"); i18n=${i18n:-0}
+          font=$(cnt '\[font-preload\]' "$tmp/e2e.log"); font=${font:-0}
+          http404=$(cnt '\[http-404\]' "$tmp/e2e.log"); http404=${http404:-0}
+          biomew=$(num 'Found ([0-9]+) warning' "$tmp/biome.log"); biomew=${biomew:-0}
+          vitest=$(cnt 'stderr \||not wrapped in act' "$tmp/test.log"); vitest=${vitest:-0}
+          total=$(( flaky + dup + hyd + i18n + font + http404 + biomew + vitest ))
+          clean=true; [ "$total" -gt 0 ] && clean=false
+          summary=$(printf 'flaky %s · dup %s · hyd %s · i18n %s · font %s · 404 %s · biome %s · vitest %s' "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest")
+          # The counters above say a run is NOISY. They never say what BROKE —
+          # that used to cost a round trip of per-job log-diving before anything
+          # could be fixed, and with the e2e fail-fast layers removed a red run
+          # now carries the whole failure set, so it is worth reading. Same logs,
+          # already downloaded.
+          RED=''
+          for pair in "e2e:${R_E2E:-}" "test:${R_TEST:-}" "typecheck:${R_TYPE:-}" \
+                      "eslint:${R_LINT:-}" "biome:${R_BIOME:-}"; do
+            [ "${pair#*:}" = success ] || RED="${RED:+$RED,}${pair%%:*}"
+          done
+          DIGEST=''
+          echo '[]' > "$tmp/failures.json"
+          if [ -f scripts/ci/failure-digest.mjs ]; then
+            DIGEST=$(node scripts/ci/failure-digest.mjs --dir "$tmp" --red "$RED" 2>/dev/null) || DIGEST=''
+            node scripts/ci/failure-digest.mjs --dir "$tmp" --red "$RED" --json \
+              > "$tmp/failures.json" 2>/dev/null || echo '[]' > "$tmp/failures.json"
+          else
+            echo "::warning::scripts/ci/failure-digest.mjs not on disk — CI report will carry counters but no failure list"
+          fi
+
+          {
+            echo "clean=$clean"
+            echo "summary=$summary"
+            # Multiline, so the delimiter form. Random-ish delimiter is
+            # unnecessary here: the digest is markdown the script generated and
+            # can never contain this token.
+            echo "digest<<__CI_DIGEST__"
+            printf '%s\n' "$DIGEST"
+            echo "__CI_DIGEST__"
+          } >> "$GITHUB_OUTPUT"
+          mkdir -p ci-noise
+          printf '{"flaky":%s,"dup_testid":%s,"hydration":%s,"i18n_missing":%s,"font_preload":%s,"http_4xx":%s,"biome_warnings":%s,"vitest_stderr":%s,"clean":%s}\n' \
+            "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest" "$clean" > ci-noise/ci-noise-report.json
+          # Attach the grouped failures to the SAME artifact /fix-ci already
+          # downloads, so its fast path gets the list without a second fetch.
+          if jq --slurpfile f "$tmp/failures.json" '. + {failures: ($f[0] // [])}' \
+               ci-noise/ci-noise-report.json > "$tmp/report.json" 2>/dev/null; then
+            mv "$tmp/report.json" ci-noise/ci-noise-report.json
+          fi
+          cat ci-noise/ci-noise-report.json
+          echo "▶ noise: $summary → clean=$clean"
+          echo "▶ digest: $(jq 'length' "$tmp/failures.json" 2>/dev/null || echo '?') root cause(s); red=${RED:-none}"
+          exit 0
+
+      - name: Upload noise report
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-noise-report
+          path: ci-noise/ci-noise-report.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Update CI commit status on erp-namthuan
+        id: status
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          R_BIOME: ${{ needs.checks.outputs.biome }}
+          R_TYPE: ${{ needs.checks.outputs.typecheck }}
+          R_LINT: ${{ needs.checks.outputs.lint }}
+          R_TEST: ${{ needs.checks.outputs.test }}
+          R_E2E: ${{ needs.checks.outputs.e2e }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          tag() {
+            case "$1" in
+              success) echo "✓" ;;
+              *)       echo "✗" ;;
+            esac
+          }
+          # EVERY job in the ci-checks graph must be named in this AND. A job that
+          # runs but is missing from it is a job whose failure the PR reports as
+          # green. Conversely, naming an output that erp-ci-checks.yml does NOT expose
+          # resolves to an empty string and pins STATE to failure forever — so a
+          # gate folded into an existing job (the hook + terraform gates live on
+          # `biome`, with the other repo-wide checks) must NOT get an R_* of its
+          # own; it is covered by its host job's result.
+          if [ "$R_BIOME" = "success" ] && [ "$R_TYPE" = "success" ] && [ "$R_LINT" = "success" ] && [ "$R_TEST" = "success" ] && [ "$R_E2E" = "success" ]; then
+            STATE="success"
+          else
+            STATE="failure"
+          fi
+          # Statuses description max 140 chars. Compact per-job summary fits
+          # easily and gives reviewers an at-a-glance view of which job(s)
+          # broke without clicking through to ppap.
+          DESC=$(printf 'biome %s · typecheck %s · lint %s · vitest %s · e2e %s' \
+            "$(tag "$R_BIOME")" "$(tag "$R_TYPE")" "$(tag "$R_LINT")" "$(tag "$R_TEST")" "$(tag "$R_E2E")")
+          # Exposed for the Telegram notify step below — computed before the
+          # head_sha guard so manual workflow_dispatch re-runs still notify.
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+          echo "desc=$DESC"  >> "$GITHUB_OUTPUT"
+          if [ -z "${HEAD_SHA:-}" ]; then
+            echo "No head_sha in payload (manual workflow_dispatch?) — skipping pingback."
+            exit 0
+          fi
+          gh api repos/${{ env.PRIVATE_REPO }}/statuses/"$HEAD_SHA" \
+            -f state="$STATE" \
+            -f context=CI \
+            -f description="$DESC" \
+            -f target_url="$RUN_URL"
+          echo "✓ Updated CI status on $HEAD_SHA — $STATE ($DESC)"
+
+      # Post/refresh a sticky CI report comment on the source PR; flip ANY draft
+      # ready-for-review once CI is green + noise-clean; and — for PRs labeled
+      # `auto-merge` — squash-merge them on the same green+clean bar. The auto-ready
+      # is unconditional (this is the single owner of draft → ready — the /ship-pr,
+      # /ship-docs, /open-pr commands no longer flip it themselves); the
+      # merge is label-gated. Best-effort: `set +e` + `exit 0` so a comment/ready/merge
+      # hiccup (or a PAT missing contents/PR write) never reds this job after the
+      # status posted. `/clear-todo` adds the `auto-merge` label, so its PRs
+      # merge here on green+clean (which is also why its own classifier-blocked
+      # `gh pr merge` is no longer needed — CI lands the merge).
+      - name: Report to PR + auto-ready + auto-merge when clean
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          STATE: ${{ steps.status.outputs.state }}
+          NOISE_CLEAN: ${{ steps.noise.outputs.clean }}
+          NOISE_SUMMARY: ${{ steps.noise.outputs.summary }}
+          DIGEST: ${{ steps.noise.outputs.digest }}
+          DESC: ${{ steps.status.outputs.desc }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e -o pipefail
+          [ -n "${PR_NUMBER:-}" ] || { echo "No PR number (manual dispatch?) — skipping PR report."; exit 0; }
+          REPO="${{ env.PRIVATE_REPO }}"
+          NOISE_SUMMARY="${NOISE_SUMMARY:-unknown (scan unavailable)}"
+          # PR metadata.
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > /tmp/pr.json 2>/dev/null
+          # Stale-run guard: with CI fanned out across multiple ppap repos, a
+          # superseded run in another org can outlive the cancel sweep (dispatch
+          # → run-creation latency). The commit Status above is sha-scoped and
+          # safe, but everything below — sticky comment, auto-ready, auto-merge
+          # — is PR-scoped, so a stale run must not touch it (a late "✅ green"
+          # comment for an old sha would mislead reviewers). Manual
+          # workflow_dispatch reruns carry no head_sha → guard intentionally
+          # skipped, preserving manual-rerun semantics.
+          CURRENT_HEAD=$(jq -r '.head.sha // ""' /tmp/pr.json 2>/dev/null)
+          if [ -n "${HEAD_SHA:-}" ]; then
+            if [ -z "$CURRENT_HEAD" ]; then
+              # Fail CLOSED on a dispatch run: if the metadata fetch failed we
+              # can't prove this run isn't stale, and a stale "✅ green" comment
+              # is worse than a missing one. (Manual reruns have no HEAD_SHA
+              # and never reach here.)
+              echo "::warning::could not verify PR #$PR_NUMBER head (metadata fetch failed) — skipping PR report/ready/merge."
+              exit 0
+            fi
+            if [ "$CURRENT_HEAD" != "$HEAD_SHA" ]; then
+              echo "Stale run: tested $HEAD_SHA but PR #$PR_NUMBER head is now $CURRENT_HEAD — skipping PR report/ready/merge."
+              exit 0
+            fi
+          fi
+          LABELS=$(jq -r '[.labels[].name] | join(",")' /tmp/pr.json 2>/dev/null)
+          DRAFT=$(jq -r '.draft // false' /tmp/pr.json 2>/dev/null)
+          MERGEABLE=$(jq -r '.mergeable // "null"' /tmp/pr.json 2>/dev/null)
+          MERGED=$(jq -r '.merged // false' /tmp/pr.json 2>/dev/null)
+          HAS_LABEL=false; case ",$LABELS," in *",auto-merge,"*) HAS_LABEL=true ;; esac
+
+          # Auto-ready: flip ANY draft to ready for review once CI is green +
+          # noise-clean — independent of the `auto-merge` label. The draft state
+          # keeps the merge button disabled while CI is still being driven; once the
+          # run is green + noise-clean there is nothing left to drive, so CI hands the
+          # PR to humans by marking it ready. Single run — the PR dispatcher ignores
+          # `ready_for_review`, so no re-dispatch loop. (Merging is separate and still
+          # requires the `auto-merge` label — see the decision tree below.)
+          READY_LINE=""
+          if [ "$MERGED" != "true" ] && [ "$DRAFT" = "true" ] && [ "$STATE" = "success" ] && [ "$NOISE_CLEAN" = "true" ]; then
+            PR_NODE_ID=$(jq -r '.node_id' /tmp/pr.json 2>/dev/null)
+            if [ -n "$PR_NODE_ID" ] && [ "$PR_NODE_ID" != "null" ] \
+               && gh api graphql -f query='mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}' \
+                    -f id="$PR_NODE_ID" >/dev/null 2>&1; then
+              DRAFT=false
+              READY_LINE="✅ **Marked ready for review** — green + noise-clean."
+              echo "✓ marked draft PR #$PR_NUMBER ready for review (green + noise-clean)"
+            else
+              READY_LINE="⚠️ Could not mark ready for review (PAT missing PR write?)."
+              echo "::warning::could not mark PR #$PR_NUMBER ready for review"
+            fi
+          fi
+
+          # Decide the auto-merge action + human-readable reason. Merging requires the
+          # `auto-merge` label (unlike the auto-ready above, which is unconditional).
+          # `/clear-todo` adds the label, so its PRs merge here on green+clean.
+          MERGE_LINE=""
+          if [ "$MERGED" = "true" ]; then
+            MERGE_LINE="✅ Already merged."
+          elif [ "$HAS_LABEL" != "true" ]; then
+            MERGE_LINE="ℹ️ Not auto-merged — add the \`auto-merge\` label to enable."
+          elif [ "$NOISE_CLEAN" != "true" ]; then
+            MERGE_LINE="⏸️ Labeled \`auto-merge\`, but **noise present** ($NOISE_SUMMARY) — not merged. Clear the noise to auto-merge."
+          elif [ "$STATE" != "success" ]; then
+            MERGE_LINE="⏸️ Labeled \`auto-merge\`, but **CI is not green** — not merged."
+          elif [ "$MERGEABLE" = "false" ]; then
+            MERGE_LINE="⚠️ Labeled \`auto-merge\` and green+clean, but **has conflicts** — resolve before it can merge."
+          else
+            # Eligible: green + noise-clean + labeled + mergeable (true/null). The PR
+            # was already flipped ready by the auto-ready block above; squash-merge it.
+            # `sha=` makes the merge atomic: GitHub 409s if the head moved between the
+            # stale-run guard's read and this call, so a raced push can never merge
+            # unvalidated content. (Empty on manual reruns — precondition skipped.)
+            MERGE_ARGS=(-f merge_method=squash)
+            if [ -n "${HEAD_SHA:-}" ]; then MERGE_ARGS+=(-f sha="$HEAD_SHA"); fi
+            if gh api -X PUT "repos/$REPO/pulls/$PR_NUMBER/merge" "${MERGE_ARGS[@]}" >/tmp/merge.json 2>/tmp/merge.err; then
+              MERGE_LINE="✅ **Auto-merged (squash)** — labeled \`auto-merge\`, CI green, noise-clean."
+            else
+              MERGE_LINE="⚠️ Auto-merge attempt failed: $(tr -d '\n' </tmp/merge.err | sed 's/\"//g' | cut -c1-160). PR left green + ready."
+            fi
+          fi
+
+          # Sticky comment (upsert by hidden marker) — one comment per PR, refreshed each run.
+          BODY=$(cat <<EOF
+          <!-- ci-report -->
+          ## CI report — $( [ "$STATE" = "success" ] && echo "✅ green" || echo "❌ failing" )
+
+          $DESC
+
+          **Noise:** $NOISE_SUMMARY → $( [ "$NOISE_CLEAN" = "true" ] && echo "clean ✓" || echo "not clean ✗" )
+
+          $DIGEST
+
+          $READY_LINE
+
+          $MERGE_LINE
+
+          [View CI run]($RUN_URL)
+          EOF
+          )
+          CID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq '[.[] | select(.body|startswith("<!-- ci-report -->"))][0].id' 2>/dev/null)
+          if [ -n "$CID" ] && [ "$CID" != "null" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$CID" -f body="$BODY" >/dev/null 2>&1 \
+              && echo "✓ Updated CI report comment on PR #$PR_NUMBER" \
+              || echo "::warning::could not update CI report comment (PAT missing issues:write?)"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$BODY" >/dev/null 2>&1 \
+              && echo "✓ Posted CI report comment on PR #$PR_NUMBER" \
+              || echo "::warning::could not post CI report comment (PAT missing issues:write?)"
+          fi
+          echo "▶ $MERGE_LINE"
+          exit 0

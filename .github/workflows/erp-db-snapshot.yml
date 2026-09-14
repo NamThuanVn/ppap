@@ -1,0 +1,318 @@
+name: ERP · DB · Publish local D1 snapshot
+
+# Builds the pre-migrated local D1 state from scratch and publishes it as a
+# rolling release asset (tag `db-snapshot`) that every cold-start surface
+# restores instead of replaying all ~350 migrations:
+#
+#   local  `pnpm worktree:init` / `pnpm db:reset`  → scripts/dev/db/reset.sh
+#   PR CI  `e2e-seed` job                          → erp-ci-checks.yml
+#   agent  `/clear-todo` runs                 → erp-agent-clear-todo.yml
+#
+# Triggered by the private repo's release.yml on a PRODUCTION RELEASE (version
+# bump + tag), pinned to the released commit — NOT on every migration merge. So
+# the snapshot always corresponds to a tagged release, and between releases it
+# goes stale by design: restore-then-apply replays whatever migrations landed
+# since, which is correct, just progressively less of a speedup.
+# See docs/engineering/platform/ppap-local-stack.md § DB snapshot.
+#
+# WHY a release asset and not a commit back into erp-namthuan: the state is
+# ~10MB (~3MB gzipped) and migrations are touched ~2.4x/day. Git keeps every
+# blob forever, so committing snapshots would add ~0.5-1GB/yr permanently to a
+# .git that is ~65MB today — paid by every clone and every worktree. A rolling
+# release asset replaces its previous version and costs the repo nothing. It
+# also avoids pushing to main entirely, so there is no [skip ci] marker to get
+# wrong (see docs/engineering/platform/ppap.md § footguns — skip markers leak through squash-merge
+# bodies and silently kill the dispatchers).
+#
+# FILENAME: must NOT start with `ci-`. sync-workflows-to-ppap.yml mirrors
+# `erp-ci-*.yml` to every CI fleet org; this workflow belongs to the deploy repo
+# only, same reason erp-agent-*.yml and erp-local-stack-matrix.yml avoid the prefix.
+
+on:
+  repository_dispatch:
+    types: [db-snapshot]
+  workflow_dispatch:
+    inputs:
+      checkout_ref:
+        description: 'NamThuanVn/erp-namthuan ref to snapshot. Keep `main` — the snapshot must represent merged migrations.'
+        type: string
+        required: false
+        default: main
+
+run-name: >-
+  ERP · DB snapshot ·
+  ${{ github.event.client_payload.tag || github.event.client_payload.sha || inputs.checkout_ref || 'main' }}
+
+permissions:
+  # Nothing is written to ppap any more — the release lives on the private repo
+  # and is reached with a pooled PAT, not with this workflow's own GITHUB_TOKEN.
+  contents: read
+
+# One publish at a time. Latest migration set wins; superseding an in-flight
+# build is correct because the newer main is a superset of the older one.
+concurrency:
+  group: db-snapshot
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+  RELEASE_TAG: db-snapshot
+  # Pre-seed init.defaultBranch so actions/checkout's internal `git init` stops
+  # printing the "hint: git config --global init.defaultBranch" line. Same
+  # cosmetic fix as erp-ci-checks.yml.
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
+jobs:
+  publish:
+    name: Build + publish snapshot
+    runs-on: ubuntu-latest
+    # A cold 13-service migration run is the whole point of this job; 30 leaves
+    # generous headroom over the observed local runtime without letting a hung
+    # wrangler burn an hour.
+    timeout-minutes: 30
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Checkout erp-namthuan
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.RESOLVED_PAT }}
+          # client_payload.sha pins the exact merge commit that carried the new
+          # migrations; workflow_dispatch falls back to main.
+          ref: ${{ github.event.client_payload.sha || inputs.checkout_ref || 'main' }}
+          persist-credentials: false
+
+      # The checkout above is the TARGET REF, and this job runs THAT ref's copy of
+      # the snapshot tooling — not main's. A ref from before the tooling landed
+      # therefore fails in a genuinely dangerous way: `SEEDS=0` is just an unknown
+      # env var to an older scripts/dev/db/reset.sh, so it silently applies the local-seed
+      # files and builds a SEEDED state. Publishing that would be actively harmful,
+      # because local-seed/*.sql are non-idempotent INSERTs — every consumer would
+      # restore the seeded rows and then insert them again.
+      #
+      # Observed on run 30321264026 (checkout_ref=v1.0.10): the build applied
+      # "Procurement demo data" and only escaped publishing because the manifest
+      # script was missing too and crashed the job. Do not rely on that accident —
+      # fail loudly, before the build, with a message that names the fix.
+      - name: Verify this ref supports snapshot builds
+        run: |
+          set -euo pipefail
+          fail=0
+          if [ ! -f scripts/dev/db/snapshot-manifest.mjs ]; then
+            echo "::error::scripts/dev/db/snapshot-manifest.mjs is missing at this ref."
+            fail=1
+          fi
+          # The load-bearing check: without SEEDS support the build silently
+          # produces a seeded snapshot instead of a migrations-only one.
+          if ! grep -q 'SEEDS' scripts/dev/db/reset.sh; then
+            echo "::error::scripts/dev/db/reset.sh at this ref has no SEEDS support, so SEEDS=0 would be ignored and the snapshot would contain non-idempotent local-seed rows."
+            fail=1
+          fi
+          if [ "$fail" != 0 ]; then
+            echo "::error::This ref predates the D1 snapshot tooling. Re-run against 'main' or any tag cut after it landed."
+            exit 1
+          fi
+          echo "✓ ref carries the snapshot tooling"
+
+      - uses: ./.github/actions/install
+
+      # DB_SNAPSHOT=0 is load-bearing: the producer must build from scratch and
+      # never from its own previous output, or any drift would compound forever.
+      # SEEDS=0 stops scripts/dev/db/reset.sh right after the migrations — local-seed/*.sql
+      # are non-idempotent INSERTs and must not be baked into the artifact.
+      - name: Build migrations-only D1 state (cold)
+        run: |
+          set -euo pipefail
+          STATE_DIR=.wrangler/state-snapshot \
+          SEEDS=0 \
+          DB_SNAPSHOT=0 \
+            bash scripts/dev/db/reset.sh
+
+      # The manifest is what makes a restore trustworthy: it records the sha256
+      # of every migration baked into the snapshot, so a consumer can detect a
+      # migration that was renamed/deleted/edited in place on its branch (which
+      # d1_migrations' filename-only tracking would silently skip) and cold-run
+      # instead. Built from the same checkout that just produced the state.
+      - name: Generate manifest
+        run: node scripts/dev/db/snapshot-manifest.mjs > manifest.json
+
+      - name: Package snapshot
+        run: |
+          set -euo pipefail
+          # -C so the tar holds v3/d1/... relative paths, matching the
+          # D1_SUBPATH the restore script extracts. gzip (not zstd) for macOS
+          # BSD tar + Windows Git Bash compatibility.
+          tar -czf d1-snapshot.tar.gz \
+            -C .wrangler/state-snapshot \
+            v3/d1/miniflare-D1DatabaseObject
+          ls -lh d1-snapshot.tar.gz manifest.json
+          node -e 'const m=require("./manifest.json");
+            const n=Object.values(m.services).reduce((a,s)=>a+s.migrations.length,0);
+            console.log(`manifest: ${Object.keys(m.services).length} services, ${n} migrations, sha ${m.sha}`);
+            if (n === 0) { console.error("refusing to publish an empty manifest"); process.exit(1); }'
+
+      # Upload order is the publish COMMIT POINT: tarball first, manifest last.
+      # The restore script fetches the manifest first, so a consumer racing this
+      # publish can never validate a NEW manifest against an OLD tarball.
+      - name: Publish to the rolling db-snapshot release
+        env:
+          # A pooled PAT, not ppap's GITHUB_TOKEN: the release lives on the PRIVATE
+          # repo (Contents R/W is in every pooled PAT's scope) and ppap's own token has no
+          # access there.
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          # --repo stays explicit on EVERY gh release call. The target happens to
+          # match the checkout now, but relying on `gh`'s remote inference is how
+          # this broke before: it silently aimed at whatever the workspace remote
+          # was and 404'd in a way that read like a missing release.
+          TARGET_REPO: ${{ env.PRIVATE_REPO }}
+          # What this snapshot was built from, for the release title. A production
+          # release passes its tag; a manual run only knows the ref it was aimed at.
+          SNAP_TAG: ${{ github.event.client_payload.tag }}
+          SNAP_REF: ${{ inputs.checkout_ref }}
+        run: |
+          set -euo pipefail
+
+          # HEAD of the erp-namthuan checkout in the workspace — the actual content
+          # of this snapshot, and NOT what GitHub shows beside the tag (that is
+          # ppap's own commit, which says nothing about what is inside).
+          SHA="$(git rev-parse HEAD)"
+          SHORT="${SHA:0:7}"
+
+          # The tag is rolling, so the title is the only place the UI can show
+          # provenance. Release builds get their version; manual builds get the ref
+          # plus a short sha, which still distinguishes two runs off the same branch.
+          if [ -n "${SNAP_TAG:-}" ]; then
+            LABEL="$SNAP_TAG"
+          else
+            LABEL="${SNAP_REF:-main}@${SHORT}"
+          fi
+          TITLE="Local D1 snapshot · $LABEL"
+
+          COUNT=$(node -e 'const m=require("./manifest.json");console.log(Object.values(m.services).reduce((a,s)=>a+s.migrations.length,0))')
+          SVCS=$(node -e 'const m=require("./manifest.json");console.log(Object.keys(m.services).length)')
+          BUILT=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          # Notes are written to a FILE and passed with --notes-file, never built
+          # with NOTES=$(cat <<EOF ...). Inside a command substitution bash keeps
+          # tracking quotes while it hunts the closing paren, so one apostrophe in
+          # ordinary prose ("CI's") swallows the rest of the script and it dies with
+          # "unexpected EOF while looking for matching `'`". A plain heredoc to a
+          # file has no such trap and lets the prose read naturally.
+          cat > release-notes.md <<EOF
+          Pre-migrated local D1 state, restored by \`pnpm db:reset\`, \`pnpm worktree:init\`, CI's \`e2e-seed\` job and ppap agent runs so they apply only new migrations instead of replaying every one.
+
+          |  |  |
+          | --- | --- |
+          | Built from | \`erp-namthuan\` **$LABEL** — commit \`$SHA\` |
+          | Contents | $COUNT migrations across $SVCS services |
+          | Built at | $BUILT |
+
+          **Rolling release.** The tag and the asset URLs never change; each rebuild replaces the bytes. Rebuilt automatically on every production release (\`release.yml\`), or on demand:
+
+          \`\`\`
+          gh workflow run erp-db-snapshot.yml -R $TARGET_REPO -f checkout_ref=main
+          \`\`\`
+
+          Do not pin to an asset digest — fetch \`manifest.json\` first; it carries the producing sha and a sha256 per migration, which is what lets a consumer detect a migration edited in place and fall back to a cold run.
+
+          **Contains real seeded company data** — the BA-seeded org lives in the migrations themselves, so this artifact holds ~188 employee records, ~188 accounts and ~2,900 budget rows. It must stay on this private repo; it was briefly published to the public ppap repo and had to be pulled.
+
+          _Marked pre-release so it never takes the "Latest" badge from a real vX.Y.Z release. The two "Source code" assets are attached automatically by GitHub for the \`$RELEASE_TAG\` tag and have nothing to do with the snapshot — ignore them._
+          EOF
+
+          if ! gh release view "$RELEASE_TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            # --target main pins the tag this creates on the private repo to a
+            # sensible commit. --prerelease keeps it OFF the "Latest" badge: this
+            # release now lives beside the real vX.Y.Z releases, and a build
+            # artifact must never displace the newest product release there.
+            gh release create "$RELEASE_TAG" --repo "$TARGET_REPO" \
+              --target main --prerelease \
+              --title "$TITLE" --notes-file release-notes.md
+          fi
+          gh release upload "$RELEASE_TAG" d1-snapshot.tar.gz --clobber --repo "$TARGET_REPO"
+          gh release upload "$RELEASE_TAG" manifest.json      --clobber --repo "$TARGET_REPO"
+
+          # Re-apply title + notes on EVERY run. `gh release create` only fires the
+          # first time, so without this the label freezes at whatever the very first
+          # build happened to be and the UI silently misreports every rebuild after.
+          # --prerelease is re-asserted for the same reason.
+          gh release edit "$RELEASE_TAG" --repo "$TARGET_REPO" --prerelease \
+            --title "$TITLE" --notes-file release-notes.md
+
+          echo "✓ published $RELEASE_TAG to $TARGET_REPO — $TITLE"
+
+      # A dead producer is silent-by-default: consumers just keep cold-running
+      # (correct, only slower), so nothing would ever surface the breakage.
+      # Same failure-only Telegram pattern as the other ppap report jobs.
+      - name: Notify Telegram on failure
+        if: failure() && !cancelled()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured — skipping notify."
+            exit 0
+          fi
+          TEXT=$(printf '🚨 <b>D1 snapshot publish failed</b>\nThe rolling <code>db-snapshot</code> release was NOT updated; worktree:init and CI e2e-seed will keep doing full cold migration runs until this is fixed.\n<a href="%s">View run</a>' "$RUN_URL")
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" \
+            -d parse_mode=HTML \
+            -d disable_web_page_preview=true; then
+            echo "✓ Telegram failure alert sent."
+          else
+            echo "::warning::Telegram notify failed."
+          fi

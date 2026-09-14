@@ -1,0 +1,647 @@
+name: ERP · Agent · loop
+
+# Top-up controller for the self-perpetuating /clear-todo agent loop.
+# Level-triggered: EVERY invocation recomputes K = min(candidates, cap − active)
+# from live API state and fires K repository_dispatch[agent-todo] events at its
+# own repo (erp-agent-clear-todo.yml). It never carries state between invocations,
+# so a lost or coalesced trigger is harmless — the next one recounts.
+#
+# Invoked several ways (all end up here):
+#   · manually — workflow_dispatch on this workflow (gh workflow run
+#     erp-agent-loop.yml -R NamThuanVn/ppap);
+#   · by ba-to-issues.yml in the private repo after a merged BA-docs PR minted
+#     at least one sweepable (`bug`/`task`) issue;
+#   · by each agent run that EXECUTED a solve-verdict (MERGED / PARK / SPLIT /
+#     ABANDONED with green executor steps) — the "Continue loop" step in
+#     erp-agent-clear-todo.yml chains the next lane immediately (lowest latency);
+#   · by the `workflow_run` trigger on ANY agent-clear-todo / rel-plan
+#     completion — success, failure, cancelled, or spot-reclaimed. This is what
+#     catches a run that DIED (the "Continue loop" step never fired) and
+#     re-probes, so a failed lane no longer silently winds the loop down. It is
+#     gated to repository_dispatch-origin completions (see the controller `if:`)
+#     so a one-shot manual run doesn't auto-start the loop. Termination still
+#     holds: when the backlog drains the probe dispatches 0, so no new run is
+#     created → no new completion → nothing re-triggers;
+#   · by erp-agent-rel-plan.yml after a successful planning pass — the
+#     rel-planning gate below defers lane dispatch to that chain whenever any
+#     open BA leaf still lacks the `rel-planned` marker;
+#   · by the `workflow_run` completion of erp-agent-loop-heartbeat.yml (also in the
+#     workflow_run list above) — a rare 15-min backstop for the
+#     controller-self-reclaim gap, kept in its own workflow so it can be toggled
+#     on/off from the Actions UI independently.
+#
+# Cap = repo variable AGENT_MAX_PARALLEL (unset → 6). A dispatch that passes
+# max_parallel is REMEMBERED for 24h (repo variable AGENT_CAP_OVERRIDE, written
+# by Resolve cap with a "<cap>|<expiry>" TTL) so every scheduled tick + chained
+# run in that window reuses the chosen cap, then it auto-reverts to the default.
+# KILL SWITCH:
+#   gh variable set AGENT_MAX_PARALLEL -R NamThuanVn/ppap --body 0
+# → this controller dispatches nothing; in-flight agents finish their current
+# item and their lanes die (top-up yields 0). Keep the cap conservative: agent
+# jobs occupy an org job slot for up to 330 min each, and NamThuanVn shares a
+# 20-concurrent-job cap with the deploy graph (peaks 12–23 jobs) and fallback
+# PR CI (see docs/engineering/platform/ppap-agent-runs.md § Agent runs).
+#
+# Hardening: triggers are repository_dispatch + workflow_dispatch ONLY (ppap
+# public-repo rule). repository_dispatch requires a write-capable token, i.e.
+# pool holders. All dispatches BY this workflow use a pooled PAT too —
+# GITHUB_TOKEN-created events do not trigger workflows (same footgun class as
+# release.yml's `gh release create`).
+
+# No actor in the run-name: most ticks are pure automation (the 15-min schedule
+# heartbeat, or a chained dispatch), and GitHub attributes those to the
+# workflow's last committer — misleading. The native "triggered by <identity>"
+# line already shows the real dispatcher underneath.
+run-name: 'ERP · Agent · loop'
+
+on:
+  # Primary recovery trigger: re-probe after EVERY agent-clear-todo / rel-plan
+  # run completes — success, failure, cancelled, or spot-reclaimed. A productive
+  # run still chains the next lane immediately via the "Continue loop" step
+  # (lower latency than a workflow_run event); this trigger adds the cases that
+  # step can't cover — a FAILED / cancelled / runner-reclaimed run that silently
+  # ends a lane with no re-arm. That is exactly what the old */15 cron existed to
+  # catch, now event-driven instead of polled. Gated in the controller `if:`
+  # below to repository_dispatch-origin completions (loop participants) so a
+  # one-shot manual run (workflow_dispatch, e.g. a human debugging one item)
+  # never auto-starts the autonomous loop.
+  #
+  # This trigger fires on the very failures it recovers from, so on its own it
+  # would re-spin the fleet at run-duration pace — which is exactly what it used
+  # to do, bounded only by a human flipping AGENT_MAX_PARALLEL=0. The bound is
+  # now structural: the "Read loop hold" step runs FIRST and dispatches nothing
+  # while a hold stands. A spent token pool holds until its window reopens; a
+  # harness fault holds until an ambulance repairs it, for at most three
+  # attempts. So a re-trigger on a failure is cheap — the controller looks, sees
+  # the hold, and stops.
+  #
+  # An "ERP · Agent · ambulance" completion is in this list for the same reason a
+  # lane completion is: an ambulance that dies without a verdict must still
+  # re-arm the controller. That cannot loop, because the attempt is charged at
+  # DISPATCH (scripts/agent/board/loop/gate.mjs), not at verdict.
+  # "ERP · Agent · loop heartbeat" is the 15-min BACKSTOP (controller-self-reclaim
+  # gap), kept in its own workflow so it can be enabled/disabled from the Actions
+  # UI without touching this controller. It does nothing but complete on
+  # schedule — this workflow_run entry IS how its tick reaches the loop (no
+  # gh-api/dispatch on that side). Its schedule-origin completion is allowed
+  # through the controller `if:` below (unlike clear-todo/rel-plan, which are
+  # gated to repository_dispatch-origin so a one-shot manual run can't start
+  # the loop).
+  #
+  # ⚠ THESE ARE DISPLAY NAMES, NOT FILENAMES. `workflow_run.workflows` matches
+  # the `name:` at the top of each workflow — it is the ONE place in this tree
+  # where a workflow's human-readable name is load-bearing. A name edited on one
+  # side and not here matches nothing, GitHub raises no error, and the entire
+  # agent loop simply stops chaining: every lane runs once and the controller is
+  # never re-armed. Keep this list in lockstep with the four `name:` lines, and
+  # note they now carry the `ERP · ` prefix that separates this repo's workflows
+  # from website-namthuan's in the shared deploy repo.
+  # Guarded by scripts/gate/ci/workflow-run-names.mjs.
+  workflow_run:
+    workflows:
+      [
+        'ERP · Agent · clear-todo-issue',
+        'ERP · Agent · rel-plan',
+        'ERP · Agent · ambulance',
+        'ERP · Agent · loop heartbeat',
+      ]
+    types: [completed]
+  repository_dispatch:
+    types: [agent-loop]
+  workflow_dispatch:
+    inputs:
+      max_parallel:
+        description: 'Set the AGENT_MAX_PARALLEL cap. A value here is REMEMBERED for 24h — every scheduled tick + chained run reuses it, then it auto-reverts to the repo variable (unset = 6). Empty = keep the current remembered/default cap.'
+        required: false
+        default: ''
+        type: string
+
+permissions: read-all
+
+# Coalescing debounce: at most one running + one queued controller; a third
+# arrival replaces the queued one. Nothing is lost — whichever run executes
+# recounts everything from live state. cancel-in-progress stays false: an
+# in-flight dispatch burst must never be killed halfway.
+concurrency:
+  group: agent-loop
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+  AGENT_WORKFLOW: erp-agent-clear-todo.yml
+
+jobs:
+  controller:
+    name: Top up agent pool
+    # A workflow_run completion continues the loop when EITHER the finished run
+    # is the heartbeat (the intended backstop tick, any origin) OR it was a loop
+    # participant (repository_dispatch-driven clear-todo/rel-plan). A one-shot
+    # manual agent-clear-todo (workflow_dispatch — a human debugging a single
+    # item) must NOT auto-start the loop. Non-workflow_run triggers
+    # (repository_dispatch, workflow_dispatch on THIS workflow) always proceed.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.name == 'Agent · loop heartbeat' ||
+      github.event.workflow_run.event == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    # A hung API call must not wedge the loop's concurrency slot for the
+    # default 360 min — the job is a sparse checkout + the eligibility sweep
+    # (a few dozen API calls on a big backlog) + a 20s settle.
+    timeout-minutes: 10
+    env:
+      # Both repository_dispatch client_payload values and workflow_dispatch
+      # inputs arrive as STRINGS; either side may be absent per trigger.
+      CAP_OVERRIDE: ${{ github.event.client_payload.max_parallel || inputs.max_parallel || '' }}
+      # Sticky override remembered from a prior manual dispatch, "<cap>|<expiry-epoch>".
+      # Resolve cap writes it with a 24h TTL and clears it once expired, so every
+      # scheduled tick + chained run in that window reuses the chosen cap.
+      CAP_STICKY: ${{ vars.AGENT_CAP_OVERRIDE || '' }}
+      CAP_VAR: ${{ vars.AGENT_MAX_PARALLEL || '' }}
+      TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
+    steps:
+      # The board scripts keep their run state here (dead-lanes.json is handed
+      # from the dead-lane sweep to the stranded sweep through it). Set at STEP
+      # level, never in `jobs.<id>.env`: `runner` is not a context there, and
+      # GitHub rejects the whole workflow file rather than evaluating it to empty
+      # — see the same note in erp-agent-clear-todo.yml.
+      - name: Pin the harness state dir
+        run: |
+          set -euo pipefail
+          echo "AGENT_STATE_DIR=${RUNNER_TEMP}/agent-state" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/agent-state"
+
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Resolve cap
+        id: cap
+        env:
+          # Reading/writing the sticky-override repo variable needs a token with
+          # Actions Variables write — a classic pooled PAT (repo scope), not the
+          # read-all GITHUB_TOKEN.
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -euo pipefail
+          NOW=$(date +%s)
+          DEFAULT="${CAP_VAR:-6}"
+          VAR_API="repos/${GITHUB_REPOSITORY}/actions/variables"
+
+          # An explicit dispatch override "sticks" for 24h: remember it as the
+          # repo variable AGENT_CAP_OVERRIDE ("<cap>|<expiry>") so every later
+          # scheduled tick + chained run reuses it, then auto-revert to DEFAULT
+          # once the TTL lapses. Best-effort — a persist failure (missing PAT
+          # scope) just means the override applies to this run only.
+          remember() { # $1 = cap
+            local exp=$(( NOW + 86400 )) val
+            val="$1|$exp"
+            if gh api --method PATCH "$VAR_API/AGENT_CAP_OVERRIDE" -f name=AGENT_CAP_OVERRIDE -f value="$val" >/dev/null 2>&1 \
+               || gh api --method POST "$VAR_API" -f name=AGENT_CAP_OVERRIDE -f value="$val" >/dev/null 2>&1; then
+              echo "::notice::remembered cap=$1 for 24h (expires epoch $exp)"
+            else
+              echo "::warning::could not persist cap override (pooled PAT missing Actions Variables write?) — applies to this run only"
+            fi
+          }
+          forget() { gh api --method DELETE "$VAR_API/AGENT_CAP_OVERRIDE" >/dev/null 2>&1 || true; }
+
+          if [ -n "$CAP_OVERRIDE" ]; then
+            CAP="$CAP_OVERRIDE"
+            remember "$CAP"
+          elif [ -n "$CAP_STICKY" ]; then
+            VAL="${CAP_STICKY%%|*}"; EXP="${CAP_STICKY##*|}"
+            if printf '%s' "$EXP" | grep -qE '^[0-9]+$' && [ "$NOW" -lt "$EXP" ]; then
+              CAP="$VAL"
+              echo "using remembered cap=$CAP (~$(( (EXP - NOW) / 3600 ))h left, then reverts to $DEFAULT)"
+            else
+              echo "::notice::remembered cap expired — reverting to default $DEFAULT"
+              forget
+              CAP="$DEFAULT"
+            fi
+          else
+            CAP="$DEFAULT"
+          fi
+
+          if ! printf '%s' "$CAP" | grep -qE '^[0-9]+$'; then
+            echo "::error::cap '$CAP' is not a non-negative integer (override / sticky / AGENT_MAX_PARALLEL)"
+            exit 1
+          fi
+          if [ "$CAP" -eq 0 ]; then
+            echo "::notice::cap is 0 (kill switch) — dispatching nothing"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "cap=$CAP — proceeding"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "cap=$CAP" >> "$GITHUB_OUTPUT"
+
+      # The claim script's own eligibility sweep runs the probe (COUNT_ONLY):
+      # leaf marker + board Todo + unassigned + no open blockers — the SAME
+      # rules the claim step enforces, so K never over-provisions. The old
+      # label count treated batch mains, parked (Pending) leaves, and blocked
+      # leaves as candidates — observed 6 lanes dispatched for 2 claimable
+      # tasks, 4 dying at the claim step. It also counts genuinely-Todo
+      # `feature` leaves now (a human promoting a feature to Todo makes it
+      # claimable — the old blanket exclusion was an artifact of the dumb
+      # count). Still racy vs in-flight sibling lanes by design: the atomic
+      # claim stays the authority; a raced candidate costs one cheap
+      # backlog-empty run.
+
+      # NOT gated on the cap: the stranded sweep below must tick even while the
+      # kill switch (AGENT_MAX_PARALLEL=0) holds dispatch at zero — otherwise a
+      # switch flip while a lane was mid-item leaves that item assigned + In
+      # Progress with nothing left to release it.
+      - name: Checkout board scripts (sparse)
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 1
+          # The whole `scripts` tree: this job runs scripts/ci/ppap/pat-pool.sh
+          # ("Resolve PAT pool logins") AND scripts/agent/board/*.mjs, and the
+          # board scripts import a sibling lib/api.mjs.
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      # Stranded-claim sweep — release items whose backing run is provably dead
+      # (assigned to us + In Progress/Todo + last claimed > STRANDED_HOURS ago,
+      # which must exceed erp-agent-clear-todo.yml's timeout-minutes). A hosted-
+      # runner reclaim skips the in-job salvage-or-revert (always() does not
+      # survive a runner shutdown), stranding the item; this is the decoupled
+      # backstop. Runs BEFORE the count so a released item is a candidate this
+      # same tick, and BEFORE the cap gate so the kill switch can't suspend
+      # board hygiene. Best-effort, never reds the controller.
+      # Every login in the PAT pool, so the sweep below can see a claim held by
+      # ANY pooled account — not just the one this tick authenticated as. Without
+      # it, a pool silently breaks the sweep: lane A claims as account X, the
+      # controller runs as Y, and X's stranded items are never released.
+      # Best-effort: on failure AGENT_LOGINS stays empty and the sweep falls back
+      # to its own login (single-PAT behaviour).
+      - name: Resolve PAT pool logins
+        id: logins
+        continue-on-error: true
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          L=$(bash scripts/ci/ppap/pat-pool.sh --logins || true)
+          echo "AGENT_LOGINS=$L" >> "$GITHUB_ENV"
+          echo "claim owners: ${L:-<none — sweep uses its own login>}"
+
+      # ── Dead-lane sweep: the EXTERNAL dead-man's switch ───────────────────
+      # A lane the RUNNER killed (OOM 137, SIGTERM 143, lost communication) never
+      # runs its own `always()` steps — not "Capture failure", not "Salvage or
+      # revert", not even "Notify Telegram on failure". So the fleet used to lose
+      # the item AND the alert AND the classification on exactly the failure mode
+      # that was killing most lanes. Classifying from out here is the only place
+      # it can be done, and it must run BEFORE the stranded sweep, which consumes
+      # its dead-lanes.json to release those claims without a grace period.
+      - name: Sweep dead lanes
+        id: dead
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+          DEAD_LANE_LOOKBACK_H: ${{ vars.DEAD_LANE_LOOKBACK_H || '3' }}
+        run: node scripts/agent/board/recover/sweep-dead-lanes.mjs
+
+      # The alert the dead lane could not send for itself. Gated on held_first so
+      # a teardown that kills six lanes at once pages once — the hold coalesces
+      # them by fingerprint, exactly as the in-lane notify does.
+      - name: Notify Telegram on a torn-down lane
+        if: steps.dead.outputs.held_first == 'true'
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          CLASSES: ${{ steps.dead.outputs.classes }}
+          DEAD_RUN_URL: ${{ steps.dead.outputs.run_url }}
+        run: |
+          set -uo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured — skipping notify."
+            exit 0
+          fi
+          TEXT="🤖🚨 <b>Agent lane torn down by the runner</b> — ${CLASSES:-unknown}"
+          TEXT="${TEXT}"$'\n'"The loop is held; an ambulance is being dispatched."
+          TEXT="${TEXT}"$'\n'"<a href=\"${DEAD_RUN_URL}\">View the killed run</a>"
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" \
+            -d parse_mode=HTML \
+            -d disable_web_page_preview=true \
+            && echo "✓ Telegram torn-down alert sent." \
+            || echo "::warning::Telegram notify failed."
+          exit 0
+
+      - name: Reclaim stranded items
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          STRANDED_HOURS: ${{ vars.STRANDED_HOURS || '6' }}
+          AGENT_LOGINS: ${{ env.AGENT_LOGINS }}
+          FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+        run: node scripts/agent/board/claim/reclaim-stranded.mjs
+
+      # A salvage PR is dead the moment its issue closes — the work either
+      # landed through a later claim or was decided against, and the branch is
+      # protecting nothing. Left open they accumulate one per interrupted run
+      # and, because a PR is a board item too, they bury the In-Progress column:
+      # after the 2026-08-28…30 pool-exhaustion burst, 21 of 24 open PRs and 21
+      # of 31 In-Progress cards were superseded salvages. Swept here rather than
+      # from finalize-merged because most items close with no executor at all
+      # (a `Closes #` trailer, a lost verdict, a human).
+      - name: Reap superseded salvage PRs
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+        run: node scripts/agent/board/recover/reap-salvage.mjs
+
+      # ── Loop hold: the FIRST question, before the backlog matters ─────────
+      # A lane that died outside its Claude session left a `harness-broken` hold;
+      # a spent token pool left a timed `pool-exhausted` one. Either way no lane
+      # can make progress, and this workflow's `workflow_run: [completed]`
+      # trigger fires on those very failures — which is how a broken harness used
+      # to re-spin the fleet at bootstrap pace until a human flipped the kill
+      # switch. Now: dispatch nothing, and for a harness fault dispatch ONE
+      # ambulance to reproduce and repair the root cause. Fix the problem before
+      # continuing the loop.
+      #
+      # Placed AFTER the stranded sweep on purpose — board hygiene must keep
+      # running while the loop is held, exactly as it does under the kill switch.
+      # It also publishes how many Claude accounts are usable, which the dispatch
+      # step folds into K.
+      - name: Read loop hold
+        id: hold
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
+        run: node scripts/agent/board/loop/gate.mjs
+
+      - name: Count claimable candidates
+        id: count
+        if: steps.cap.outputs.proceed == 'true' && steps.hold.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          COUNT_ONLY: '1'
+          # In scope even though COUNT_ONLY never touches the fork: every step
+          # that runs a board script passes it, so nothing depends on which code
+          # path happens to avoid it. scripts/gate/ci/agent-board-env.mjs enforces.
+          FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+        run: node scripts/agent/board/claim/todo.mjs
+
+      - name: Probe private-repo backlog (exact eligibility)
+        id: probe
+        if: steps.cap.outputs.proceed == 'true' && steps.hold.outputs.proceed == 'true'
+        env:
+          TOTAL: ${{ steps.count.outputs.eligible || '0' }}
+        run: |
+          set -euo pipefail
+          echo "candidates=$TOTAL" >> "$GITHUB_OUTPUT"
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "::notice::backlog empty (no Todo · unassigned · unblocked leaf) — dispatching nothing"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "✓ $TOTAL claimable candidate(s)"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Rel-planning gate: lanes must not start while ANY open BA leaf lacks
+      # the `rel-planned` marker — the scripted claim respects blockedBy edges
+      # but PLANNING is what sets them (Phase 0-pre's planning half, shared
+      # skill /order-todo-queue). Unplanned leaves → dispatch ONE agent-rel-plan
+      # run INSTEAD of lanes; on success it re-dispatches agent-loop, and this
+      # gate then passes. All three kinds are swept (a bug can be blocked by a
+      # feature) with the SAME leaf-marker query as the planner's sweep and
+      # its coverage recount — the three definitions must stay identical or
+      # the gate and the planner ping-pong. Batch mains are excluded FIRST,
+      # before the leaf test: a batch main can QUOTE a leaf marker in its body
+      # (#2252 pasted the re-mint guard marker into its PR description), and
+      # without that exclusion this gate counts a "leaf" the planner refuses
+      # to plan — dispatch → plan nothing → recount fails, forever. A
+      # SPLIT-decomposed original (`ba-decomposed-into:`) is excluded by the
+      # same clause and for the same reason: it KEEPS its own leaf marker, but
+      # it is a parent — its slices are the plannable work.
+      # Duplicate gate dispatches coalesce
+      # in agent-rel-plan's concurrency group (the extra run no-ops + chains).
+      - name: Rel-planning gate
+        id: relplan
+        if: steps.probe.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
+        run: |
+          set -euo pipefail
+          UNPLANNED=$(for L in bug task slice feature ba-bug ba-task ba-slice ba-change ba-change-package ba-feature; do
+            gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
+              --json number,body,labels --limit 200 \
+              --jq '.[] | select(.body | test("<!--\\s*ba-((bugs|change-packages|features)-batch|decomposed-into):") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
+          done | sort -u | wc -l | tr -d ' ')
+          if [ "$UNPLANNED" -gt 0 ]; then
+            echo "::notice::$UNPLANNED unplanned leaf/leaves — dispatching agent-rel-plan, deferring lane dispatch to its chain"
+            gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
+              -f event_type=agent-rel-plan \
+              -f client_payload[triggered_by]="${TRIGGERED_BY}"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "✓ every open leaf is rel-planned"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Count active runs + dispatch top-up
+        if: steps.relplan.outputs.proceed == 'true'
+        env:
+          # Same-repo Actions reads: GITHUB_TOKEN suffices (read-all).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Dispatch writes MUST use a pooled PAT (GITHUB_TOKEN events don't
+          # trigger workflows).
+          POOL_PAT: ${{ env.RESOLVED_PAT }}
+          CAP: ${{ steps.cap.outputs.cap }}
+          CANDIDATES: ${{ steps.probe.outputs.candidates }}
+          # How many Claude accounts the last pool probe found usable. Empty when
+          # no probe is fresh enough to trust, in which case K is not capped by it.
+          USABLE_ACCOUNTS: ${{ steps.hold.outputs.usable_accounts }}
+          # How many lanes the pool's REMAINING QUOTA can actually fund — the
+          # per-account 5h/7d headroom divided by one lane's assumed cost. Empty
+          # when the probe predates this field (or is stale), in which case K is
+          # not capped by it and the loop behaves exactly as it did before.
+          CAPACITY: ${{ steps.hold.outputs.capacity }}
+        run: |
+          set -euo pipefail
+          # The runs-list `status` param is single-valued → two calls. The list
+          # index is EVENTUALLY CONSISTENT: a just-completed run can stay
+          # listed as in_progress for several seconds after it finished —
+          # observed live (controller 29755617192 counted active=2 with one
+          # real agent → K=0 → a lane died with 4 candidates on the board). So
+          # never trust the list alone: collect the candidate run IDS, then
+          # fresh-verify EACH with a direct GET (strongly consistent) and
+          # count only genuine queued/in_progress survivors. A failed per-id
+          # GET counts as active (conservative — never overshoots the cap;
+          # active runs ≤ cap, so per_page=100 needs no pagination).
+          IDS=$(for S in queued in_progress; do
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${AGENT_WORKFLOW}/runs?status=${S}&per_page=100" \
+              --jq '.workflow_runs[].id'
+          done | sort -u)
+          ACTIVE=0
+          for ID in $IDS; do
+            ST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ID}" --jq '.status' 2>/dev/null || echo "unknown")
+            case "$ST" in
+              queued|in_progress|unknown)
+                ACTIVE=$(( ACTIVE + 1 ))
+                echo "· run $ID: $ST (counted)"
+                ;;
+              *)
+                echo "· run $ID: $ST — stale list entry, not counted"
+                ;;
+            esac
+          done
+          echo "· live agent runs: $ACTIVE"
+          K=$(( CAP - ACTIVE ))
+          [ "$K" -gt "$CANDIDATES" ] && K="$CANDIDATES"
+          # Third term: never send out more lanes than there are Claude accounts
+          # to run them on. A lane whose pool is spent claims an item, discovers
+          # the exhaustion, and hands the item straight back — churn that buys
+          # nothing. Skipped when no fresh probe exists, so an unknown pool
+          # behaves exactly as it did before this term was added.
+          if [ -n "${USABLE_ACCOUNTS:-}" ] && [ "$K" -gt "$USABLE_ACCOUNTS" ]; then
+            echo "· capping K at $USABLE_ACCOUNTS usable Claude account(s) (was $K)"
+            K="$USABLE_ACCOUNTS"
+          fi
+          # Fourth term: never send out more lanes than the pool's remaining
+          # quota can pay for. The account COUNT above is a floor, not a budget —
+          # three accounts at 89% used are three usable accounts and about one
+          # lane's worth of headroom, so the count said 3, the controller
+          # dispatched 3, and all three hit the wall mid-flight. This term reads
+          # the real 5h/7d percentages instead.
+          #
+          # Same null-guard as above, and for the same reason: an empty value
+          # (no fresh probe, or a probe written before the field existed) must
+          # leave K alone. It can only ever make K smaller, never larger, so the
+          # worst case of a wrong estimate is a slower loop — not a dead one.
+          if [ -n "${CAPACITY:-}" ] && [ "$K" -gt "$CAPACITY" ]; then
+            echo "· capping K at $CAPACITY lane(s) of real pool headroom (was $K)"
+            K="$CAPACITY"
+          fi
+          [ "$K" -lt 0 ] && K=0
+          echo "cap=$CAP · active=$ACTIVE · candidates=$CANDIDATES · usable-accounts=${USABLE_ACCOUNTS:-unknown} · capacity=${CAPACITY:-unknown} → dispatching $K run(s)"
+          if [ "$K" -eq 0 ]; then
+            echo "::notice::pool already at capacity (or no headroom) — nothing dispatched"
+            exit 0
+          fi
+          for I in $(seq 1 "$K"); do
+            # -f = string values, ALWAYS ('true' the string). Never switch to
+            # -F: it would send a real JSON boolean and the consumer's
+            # `client_payload.loop == 'true'` gate would silently stop
+            # matching.
+            #
+            # The pooled PAT is shared with every concurrently-running lane
+            # (each resolves its own "best" token the same way, so several can
+            # converge on the same account), and its 5,000/hr core budget can
+            # run out mid-job even though "Resolve PAT from pool" saw headroom
+            # at job start (observed: 5000 remaining, then rate-limited 12s
+            # later — ppap run 34333799888). That is weather, not a defect: no
+            # lane and no ambulance can fix an hourly quota. Failing the whole
+            # job here used to make sweep-dead-lanes.mjs misclassify it as
+            # `harness-broken` and spend a repair-attempt budget on it, so a
+            # rate-limited dispatch stops the loop for THIS tick only — the
+            # next lane completion or the 15-min heartbeat re-probes with
+            # (likely) a fresh "best" token.
+            if ! OUT=$(GH_TOKEN="$POOL_PAT" gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
+              -f event_type=agent-todo \
+              -f client_payload[item]="" \
+              -f client_payload[loop]="true" \
+              -f client_payload[triggered_by]="${TRIGGERED_BY}" 2>&1); then
+              if printf '%s' "$OUT" | grep -qi "API rate limit exceeded"; then
+                echo "::warning::pooled PAT rate-limited after dispatching $((I - 1))/$K — stopping this tick rather than failing the job; the next trigger re-probes"
+                break
+              fi
+              echo "$OUT" >&2
+              exit 1
+            fi
+            echo "✓ dispatched agent run $I/$K"
+            sleep 0.5
+          done
+          # Hold the concurrency slot while the just-created runs become
+          # visible to the Actions API — the NEXT queued controller then
+          # counts them and can't over-provision past the cap.
+          echo "settling 20s for run-creation visibility…"
+          sleep 20
+
+      # The controller's own death used to be the quietest failure in the system:
+      # no lane is dispatched, no hold is written (the hold step may never have
+      # run), and every board and dashboard stays green. The NEXT tick's
+      # control-plane sweep holds the fleet and calls an ambulance for it; this
+      # step is the immediate human-facing half, because "the fleet stopped" is
+      # worth knowing before the next tick.
+      - name: Notify Telegram on controller failure
+        if: failure()
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured — skipping notify."
+            exit 0
+          fi
+          TEXT="🤖🚨 <b>Agent loop CONTROLLER failed</b>"
+          TEXT="${TEXT}"$'\n'"No lanes can be dispatched until this clears."
+          TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" -d parse_mode=HTML \
+            -d disable_web_page_preview=true >/dev/null \
+            && echo "✓ Telegram controller-failure alert sent." \
+            || echo "::warning::Telegram notify failed."
+          exit 0

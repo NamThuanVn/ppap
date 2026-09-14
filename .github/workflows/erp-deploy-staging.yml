@@ -1,0 +1,65 @@
+name: ERP · Deploy · Staging
+
+# Triggered cross-repo from NamThuanVn/erp-namthuan after CI passes on main.
+# `workflow_dispatch` is the manual escape hatch (smoke tests, hand re-runs).
+# All deploy logic lives in deploy.yml (reusable workflow_call); this file is
+# just the trigger + per-env inputs. See docs/engineering/platform/ppap.md for the architecture.
+run-name: "ERP · ${{ github.event.client_payload.title || format('Deploy Staging — triggered by @{0}', inputs.triggered_by || github.actor) }}"
+
+on:
+  repository_dispatch:
+    types: [deploy-staging]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Private-repo ref to deploy (sha or branch). Default: main'
+        required: false
+        default: 'main'
+      triggered_by:
+        description: 'Manual override actor handle (for run-name)'
+        required: false
+        default: ''
+
+permissions: read-all
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/erp-deploy-reusable.yml
+    with:
+      environment: staging
+      tf_workspace: namthuanvn-staging
+      domain: namthuan.org
+      api_url: https://namthuan.org/api
+      checkout_ref: ${{ github.event.client_payload.sha || inputs.ref || 'main' }}
+      # Build & deploy only the workers/zones changed since the previous main
+      # tip (base_sha). A cross-cutting/shared change, a missing base_sha, or a
+      # manual workflow_dispatch falls back to a full deploy — see
+      # scripts/ci/deploy-targets.sh. Production stays full (its
+      # wrapper omits both → the reusable defaults deploy everything).
+      deploy_only_changed: true
+      base_sha: ${{ github.event.client_payload.base_sha }}
+      deploy_script_suffix: ':staging'
+      deployment_id: ${{ github.event.client_payload.deployment_id }}
+      commit_sha: ${{ github.event.client_payload.sha }}
+      status_context: deploy-staging
+      triggered_by: ${{ github.event.client_payload.triggered_by || inputs.triggered_by || github.actor }}
+      run_title: ${{ github.event.client_payload.title }}
+      # Skip the pre-deploy CI gate entirely on staging — the source PR already
+      # ran the full CI (biome/typecheck/lint/vitest + e2e) on refs/pull/N/merge
+      # (= main + PR) before it could merge, so re-checking the same code on the
+      # auto-deploy is redundant; staging goes straight to build/deploy. Production
+      # keeps the gate (defaults true) to re-validate on the release tag.
+      # run_e2e_gate is moot while run_ci_gate=false (the gate doesn't run), but
+      # kept explicit so flipping run_ci_gate back on restores the e2e-skip intent.
+      run_ci_gate: false
+      run_e2e_gate: false
+    secrets:
+      TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+      PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
