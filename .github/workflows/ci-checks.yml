@@ -1,8 +1,8 @@
-name: ERP · CI · Checks · Reusable
+name: CI · Checks · Reusable
 
 # Reusable CI graph: biome / typecheck / lint / test in parallel against an
-# arbitrary erp-namthuan ref. Called by both PR-CI (ppap:erp-ci-pr.yml) and the
-# deploy gate (ppap:erp-deploy-reusable.yml). Outputs each job's `result` so
+# arbitrary erp-namthuan ref. Called by both PR-CI (ppap:ci-pr.yml) and the
+# deploy gate (ppap:deploy-reusable.yml). Outputs each job's `result` so
 # callers can build a per-job summary.
 
 on:
@@ -87,10 +87,10 @@ jobs:
     # every one of them showed up on the PR as "biome is red".
     #
     # The job ID stays `biome:` — it is the workflow_call output key read as
-    # `needs.checks.outputs.biome` in erp-ci-pr.yml (R_BIOME) and in
-    # erp-deploy-reusable.yml's ci-gate. Renaming the ID breaks both.
+    # `needs.checks.outputs.biome` in ci-pr.yml (R_BIOME) and in
+    # deploy-reusable.yml's ci-gate. Renaming the ID breaks both.
     #
-    # erp-ci-pr.yml's `noise` step routes per-job logs by DISPLAY NAME and must be
+    # ci-pr.yml's `noise` step routes per-job logs by DISPLAY NAME and must be
     # changed with this, in the same commit: a rename it does not know about sends
     # this job's log nowhere, and the run reports `biome_warnings: 0, clean: true`
     # on a genuinely warning-laden PR — worse than the bad name ever was.
@@ -329,7 +329,7 @@ jobs:
       # deploy job's `terraform apply`. A bad module reference or undeclared
       # variable therefore surfaced mid-deploy, after CI was green and the release
       # was already rolling — the one thing the ci-gate comment in
-      # erp-deploy-reusable.yml calls out as "before infra touches Cloudflare".
+      # deploy-reusable.yml calls out as "before infra touches Cloudflare".
       # `-backend=false` inside the script keeps it credential-free: no HCP token,
       # no remote state, nothing to leak into a public CI runner.
       #

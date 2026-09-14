@@ -1,6 +1,6 @@
-name: ERP · Deploy · Reusable
+name: Deploy · Reusable
 
-# Reusable workflow shared by erp-deploy-staging.yml and erp-deploy-production.yml.
+# Reusable workflow shared by deploy-staging.yml and deploy-production.yml.
 # Those wrappers handle the trigger surface (event types, concurrency,
 # environment-specific run-name) and pass per-env inputs in here. This file
 # owns the actual deploy graph: read the current Terraform outputs → build
@@ -315,7 +315,7 @@ jobs:
     # Production keeps it true to re-validate on the release tag. When skipped,
     # tf-outputs still proceeds (its `if` treats a skipped gate as pass).
     if: ${{ inputs.run_ci_gate }}
-    uses: ./.github/workflows/erp-ci-checks.yml
+    uses: ./.github/workflows/ci-checks.yml
     with:
       checkout_ref: ${{ inputs.checkout_ref }}
       # Whether this gate runs the full Playwright e2e suite is per-environment

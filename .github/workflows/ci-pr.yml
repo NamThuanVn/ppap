@@ -1,9 +1,9 @@
-name: ERP · CI · PR · Lint · Typecheck · Test · E2E
+name: CI · PR · Lint · Typecheck · Test · E2E
 
 # PR CI entrypoint. Triggered cross-repo by erp-namthuan/.github/workflows/
 # pr-triage-and-ci-dispatch.yml via repository_dispatch[ci]; workflow_dispatch is the
 # manual re-run escape hatch. The actual job graph (biome / typecheck /
-# lint / test / e2e-shards) lives in erp-ci-checks.yml (reusable workflow_call)
+# lint / test / e2e-shards) lives in ci-checks.yml (reusable workflow_call)
 # — this file just wires that graph to the PR-CI trigger surface and pings
 # the Check Run back on completion.
 #
@@ -12,7 +12,7 @@ name: ERP · CI · PR · Lint · Typecheck · Test · E2E
 # Note: this collapses the fork-safety boundary that a separate CI_PAT
 # would have provided — see the trade-off note in docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL.
 
-run-name: "${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('ERP · CI · PR #{0} · {1}', github.event.client_payload.pr_number || inputs.pr_number, github.event.client_payload.title || 'manual rerun') || 'ERP · CI · manual · main' }}"
+run-name: "${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('CI · PR #{0} · {1}', github.event.client_payload.pr_number || inputs.pr_number, github.event.client_payload.title || 'manual rerun') || 'CI · manual · main' }}"
 
 on:
   repository_dispatch:
@@ -24,7 +24,7 @@ on:
         required: false
         type: string
       e2e_shards:
-        description: 'Override default Playwright shard count for a manual re-run (leave empty to use erp-ci-checks.yml default).'
+        description: 'Override default Playwright shard count for a manual re-run (leave empty to use ci-checks.yml default).'
         required: false
         type: number
       fleet:
@@ -132,7 +132,7 @@ jobs:
             -f target_url="$RUN_URL"
           echo "✓ Pending CI status now targets $RUN_URL"
 
-  # Run the 4-job CI graph. erp-ci-checks.yml lives in the same repo and exposes
+  # Run the 4-job CI graph. ci-checks.yml lives in the same repo and exposes
   # each job's `result` as a workflow_call output, so the report job below
   # can build a per-job summary without re-querying the API.
   #
@@ -143,12 +143,12 @@ jobs:
   # A manual workflow_dispatch with NO number checks out erp-namthuan `main`
   # instead, so the full CI graph can be smoke-tested without opening a PR.
   checks:
-    uses: ./.github/workflows/erp-ci-checks.yml
+    uses: ./.github/workflows/ci-checks.yml
     with:
       checkout_ref: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('refs/pull/{0}/merge', github.event.client_payload.pr_number || inputs.pr_number) || 'main' }}
       # DESIRED shard count. The effective count is min(this, capacity) —
-      # erp-ci-checks.yml's e2e job borrows idle fleet repos for the surplus,
-      # so this can exceed one org's ~14-shard ceiling. Empty ⇒ erp-ci-checks.yml's
+      # ci-checks.yml's e2e job borrows idle fleet repos for the surplus,
+      # so this can exceed one org's ~14-shard ceiling. Empty ⇒ ci-checks.yml's
       # own default.
       # 48, not 32: fan-out recruits ceil(total/WORKER_SLOTS) hosts, so this is
       # 6 of the ~15 idle fleet repos and leaves the rest for concurrent PRs.
@@ -263,7 +263,7 @@ jobs:
           persist-credentials: false
 
       # The "green is not clean" scan, folded into this job rather than a
-      # separate one in erp-ci-checks.yml. It was its own job only because that is
+      # separate one in ci-checks.yml. It was its own job only because that is
       # where the e2e shards used to live; it reads everything through the API
       # by run id, so it can run anywhere — and its sole consumer is the status
       # + comment steps right below it. One report job instead of two.
@@ -419,7 +419,7 @@ jobs:
           }
           # EVERY job in the ci-checks graph must be named in this AND. A job that
           # runs but is missing from it is a job whose failure the PR reports as
-          # green. Conversely, naming an output that erp-ci-checks.yml does NOT expose
+          # green. Conversely, naming an output that ci-checks.yml does NOT expose
           # resolves to an empty string and pins STATE to failure forever — so a
           # gate folded into an existing job (the hook + terraform gates live on
           # `biome`, with the other repo-wide checks) must NOT get an R_* of its

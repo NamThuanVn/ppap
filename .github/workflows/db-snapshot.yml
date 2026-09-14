@@ -1,12 +1,12 @@
-name: ERP · DB · Publish local D1 snapshot
+name: DB · Publish local D1 snapshot
 
 # Builds the pre-migrated local D1 state from scratch and publishes it as a
 # rolling release asset (tag `db-snapshot`) that every cold-start surface
 # restores instead of replaying all ~350 migrations:
 #
 #   local  `pnpm worktree:init` / `pnpm db:reset`  → scripts/dev/db/reset.sh
-#   PR CI  `e2e-seed` job                          → erp-ci-checks.yml
-#   agent  `/clear-todo` runs                 → erp-agent-clear-todo.yml
+#   PR CI  `e2e-seed` job                          → ci-checks.yml
+#   agent  `/clear-todo` runs                 → agent-clear-todo.yml
 #
 # Triggered by the private repo's release.yml on a PRODUCTION RELEASE (version
 # bump + tag), pinned to the released commit — NOT on every migration merge. So
@@ -25,8 +25,8 @@ name: ERP · DB · Publish local D1 snapshot
 # bodies and silently kill the dispatchers).
 #
 # FILENAME: must NOT start with `ci-`. sync-workflows-to-ppap.yml mirrors
-# `erp-ci-*.yml` to every CI fleet org; this workflow belongs to the deploy repo
-# only, same reason erp-agent-*.yml and erp-local-stack-matrix.yml avoid the prefix.
+# `ci-*.yml` to every CI fleet org; this workflow belongs to the deploy repo
+# only, same reason agent-*.yml and local-stack-matrix.yml avoid the prefix.
 
 on:
   repository_dispatch:
@@ -40,7 +40,7 @@ on:
         default: main
 
 run-name: >-
-  ERP · DB snapshot ·
+  DB snapshot ·
   ${{ github.event.client_payload.tag || github.event.client_payload.sha || inputs.checkout_ref || 'main' }}
 
 permissions:
@@ -59,7 +59,7 @@ env:
   RELEASE_TAG: db-snapshot
   # Pre-seed init.defaultBranch so actions/checkout's internal `git init` stops
   # printing the "hint: git config --global init.defaultBranch" line. Same
-  # cosmetic fix as erp-ci-checks.yml.
+  # cosmetic fix as ci-checks.yml.
   GIT_CONFIG_COUNT: "1"
   GIT_CONFIG_KEY_0: init.defaultBranch
   GIT_CONFIG_VALUE_0: main
@@ -256,7 +256,7 @@ jobs:
           **Rolling release.** The tag and the asset URLs never change; each rebuild replaces the bytes. Rebuilt automatically on every production release (\`release.yml\`), or on demand:
 
           \`\`\`
-          gh workflow run erp-db-snapshot.yml -R $TARGET_REPO -f checkout_ref=main
+          gh workflow run db-snapshot.yml -R $TARGET_REPO -f checkout_ref=main
           \`\`\`
 
           Do not pin to an asset digest — fetch \`manifest.json\` first; it carries the producing sha and a sha256 per migration, which is what lets a consumer detect a migration edited in place and fall back to a cold run.

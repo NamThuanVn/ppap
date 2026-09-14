@@ -1,9 +1,9 @@
-name: ERP · Fleet · Warm-up scheduler
+name: Fleet · Warm-up scheduler
 
 # ONE hourly run that decides which CI-fleet orgs still need their concurrency
-# ceiling proven, and dispatches erp-ci-warmup.yml to just those.
+# ceiling proven, and dispatches ci-warmup.yml to just those.
 #
-# WHY IT IS CENTRAL. erp-ci-warmup.yml measures an org's real concurrent-job ceiling
+# WHY IT IS CENTRAL. ci-warmup.yml measures an org's real concurrent-job ceiling
 # into that org's own E2E_HOST_CEILING variable, which is what lets
 # scripts/ci/fanout.mjs size the host's e2e batch instead of guessing (see
 # ppap-ci-fleet.md § CI fan-out). It used to carry its OWN hourly cron, so all
@@ -29,7 +29,7 @@ name: ERP · Fleet · Warm-up scheduler
 #     however roomy it really is, and probing is itself the Actions usage that
 #     lifts a young org's ceiling.
 #
-# Filename is deliberately NOT erp-ci-*.yml → the sync mirrors it to
+# Filename is deliberately NOT ci-*.yml → the sync mirrors it to
 # NamThuanVn/ppap only, never to the CI fleet's 20-job budget
 # (docs/engineering/platform/ppap.md § What lives where). That is also what
 # makes it a scheduler rather than a seventeenth copy of the thing it schedules.

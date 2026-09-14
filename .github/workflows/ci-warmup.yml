@@ -1,11 +1,11 @@
-name: ERP · CI · Warm-up (prove this org's concurrency)
+name: CI · Warm-up (prove this org's concurrency)
 
 # Measures how many jobs THIS org can ACTUALLY run at once, and records the
 # answer in its own E2E_HOST_CEILING repo variable so scripts/ci/fanout.mjs can
 # size that host's e2e batch instead of guessing.
 #
 # DISPATCH-ONLY. This workflow has no schedule of its own: one scheduler on the
-# deploy repo — erp-fleet-warmup.yml, hourly — reads every host's ceiling and
+# deploy repo — fleet-warmup.yml, hourly — reads every host's ceiling and
 # dispatches this to the hosts that still need proving. It used to carry its own
 # hourly cron, which meant seventeen copies woke up every hour to each read one
 # variable and each conclude it had nothing to do, and nothing anywhere held the
@@ -36,7 +36,7 @@ name: ERP · CI · Warm-up (prove this org's concurrency)
 # RUNNING IT BY HAND saturates this org for ~3 minutes on purpose, so it is safe
 # but not free: fanout treats a warming host as busy and will not recruit it. The
 # scheduler exists so nobody has to think about that — prefer dispatching
-# erp-fleet-warmup.yml on NamThuanVn/ppap, which only probes hosts that are idle and
+# fleet-warmup.yml on NamThuanVn/ppap, which only probes hosts that are idle and
 # unproven.
 
 on:
@@ -173,7 +173,7 @@ jobs:
           echo "✓ E2E_HOST_CEILING: $CUR → $MAX"
 
           if [ "$MAX" -ge "$TARGET" ]; then
-            echo "🎉 proven at the target — erp-fleet-warmup.yml will stop dispatching to this host."
+            echo "🎉 proven at the target — fleet-warmup.yml will stop dispatching to this host."
           else
             echo "… still below $TARGET; the scheduler queues this host again."
           fi

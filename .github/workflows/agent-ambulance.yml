@@ -1,4 +1,4 @@
-name: ERP · Agent · ambulance
+name: Agent · ambulance
 
 # Repairs the AGENT HARNESS when the loop has held itself.
 #
@@ -15,7 +15,7 @@ name: ERP · Agent · ambulance
 # dispatching lanes, and dispatches ONE of these instead. Fix the problem before
 # continuing the loop.
 #
-# THE PIPELINE (mirrors erp-agent-clear-todo.yml's shape, one layer thinner):
+# THE PIPELINE (mirrors agent-clear-todo.yml's shape, one layer thinner):
 #   1. Materialise the hold  — vars.AGENT_LOOP_HOLD → $AGENT_STATE_DIR/hold.json,
 #      which is what /repair-harness reads. Refuses to run without one.
 #   2. /repair-harness       — reproduce the fault on this runner, fix the root
@@ -46,11 +46,11 @@ name: ERP · Agent · ambulance
 # make the ambulance the new infinite loop. `attempt` in the payload only selects
 # how hard this one tries.
 #
-# Filename is deliberately NOT erp-ci-*.yml → the sync mirrors it to NamThuanVn/ppap
+# Filename is deliberately NOT ci-*.yml → the sync mirrors it to NamThuanVn/ppap
 # only, never to the CI fleet. NOTE the transcript artifact and logs are PUBLIC
 # (accepted trade-off — see docs/engineering/platform/ppap-agent-runs.md).
 
-run-name: 'ERP · Agent · ambulance'
+run-name: 'Agent · ambulance'
 
 on:
   repository_dispatch:

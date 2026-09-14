@@ -1,10 +1,10 @@
-name: ERP · Deploy · Staging
+name: Deploy · Staging
 
 # Triggered cross-repo from NamThuanVn/erp-namthuan after CI passes on main.
 # `workflow_dispatch` is the manual escape hatch (smoke tests, hand re-runs).
 # All deploy logic lives in deploy.yml (reusable workflow_call); this file is
 # just the trigger + per-env inputs. See docs/engineering/platform/ppap.md for the architecture.
-run-name: "ERP · ${{ github.event.client_payload.title || format('Deploy Staging — triggered by @{0}', inputs.triggered_by || github.actor) }}"
+run-name: "${{ github.event.client_payload.title || format('Deploy Staging — triggered by @{0}', inputs.triggered_by || github.actor) }}"
 
 on:
   repository_dispatch:
@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   deploy:
-    uses: ./.github/workflows/erp-deploy-reusable.yml
+    uses: ./.github/workflows/deploy-reusable.yml
     with:
       environment: staging
       tf_workspace: namthuanvn-staging

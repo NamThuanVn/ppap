@@ -1,10 +1,10 @@
-name: ERP · Deploy · Production
+name: Deploy · Production
 
 # Triggered cross-repo from NamThuanVn/erp-namthuan when `release.yml` cuts a
 # new release. `workflow_dispatch` requires typing PRODUCTION into the confirm
 # input as a tripwire against fat-fingered clicks. All deploy logic lives in
 # deploy.yml (reusable workflow_call). See docs/engineering/platform/ppap.md for the architecture.
-run-name: "ERP · ${{ github.event.client_payload.title || format('Deploy Production — triggered by @{0} ({1})', inputs.triggered_by || github.actor, inputs.tag) }}"
+run-name: "${{ github.event.client_payload.title || format('Deploy Production — triggered by @{0} ({1})', inputs.triggered_by || github.actor, inputs.tag) }}"
 
 on:
   repository_dispatch:
@@ -57,7 +57,7 @@ jobs:
     if: |
       always() &&
       (needs.confirm.result == 'success' || needs.confirm.result == 'skipped')
-    uses: ./.github/workflows/erp-deploy-reusable.yml
+    uses: ./.github/workflows/deploy-reusable.yml
     with:
       environment: production
       tf_workspace: namthuanvn-production

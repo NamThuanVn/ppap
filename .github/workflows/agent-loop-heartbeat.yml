@@ -1,6 +1,6 @@
-name: ERP · Agent · loop heartbeat
+name: Agent · loop heartbeat
 
-# Standalone scheduled heartbeat for the agent loop, split OUT of erp-agent-loop.yml
+# Standalone scheduled heartbeat for the agent loop, split OUT of agent-loop.yml
 # so it can be enabled/disabled on its own from the Actions UI (Actions →
 # "Agent · loop heartbeat" → ••• → Disable/Enable workflow) WITHOUT touching the
 # event-driven controller.
