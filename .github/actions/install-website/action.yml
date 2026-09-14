@@ -1,6 +1,24 @@
 name: Install (cached)
 description: Setup pnpm + Node, restore the node_modules cache, install only on cache miss.
 
+# ── Why these action majors, and why they move together ─────────────────────
+# GitHub retired the Node 20 action runtime (2025-09-19). Every run of this repo
+# was raising `Node.js 20 is deprecated. The following actions target Node.js 20
+# but are being forced to run on Node.js 24: actions/checkout@v4,
+# actions/setup-node@v4, pnpm/action-setup@v4`. The warning is about the runtime
+# an ACTION ships with — not about `node-version:` below, which is the Node the
+# BUILD uses and was never implicated. Fixing it is therefore a version bump,
+# not a config change: checkout v7, setup-node v7, cache v6, action-setup v6 are
+# the node24 majors.
+#
+# actions/cache@v5+ additionally requires a runner >= 2.327.1. Every workflow in
+# this repo is `ubuntu-latest` (GitHub-hosted), so that is satisfied by
+# definition; it would need checking before pointing any of them at a
+# self-hosted runner.
+#
+# pnpm/action-setup is in maintenance — its README now points at the successor
+# `pnpm/setup`. v6 is still released against current pnpm (v6.1.0 added pnpm 12
+# support), so this stays until the migration is worth its own change.
 runs:
   using: composite
   steps:
@@ -10,13 +28,13 @@ runs:
     # binary across a 16-repo fleet. `packageManager` (pnpm@11.1.3) already
     # pins the version, and action-setup reads it, so there is exactly one
     # source of truth -- same as the PR gate in .github/workflows/ci.yml.
-    - uses: pnpm/action-setup@v4
+    - uses: pnpm/action-setup@v6
 
     # Must follow action-setup: `cache: pnpm` shells out to pnpm to resolve the
     # store directory.
-    - uses: actions/setup-node@v4
+    - uses: actions/setup-node@v7
       with:
-        node-version: '22'
+        node-version: '24'
         cache: pnpm
       env:
         NODE_OPTIONS: --no-deprecation
@@ -28,7 +46,7 @@ runs:
     # cache whose node_modules predates it.
     - name: Restore node_modules cache
       id: cache
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: node_modules
         key: pnpm-modules-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml') }}

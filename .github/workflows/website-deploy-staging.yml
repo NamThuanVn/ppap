@@ -1,10 +1,10 @@
-name: Deploy · Staging
+name: Website · Deploy · Staging
 
 # Triggered cross-repo from NamThuanVn/website-namthuan on every commit to main.
 # Runs on the SHARED NamThuanVn/ppap.
 # `workflow_dispatch` is the manual escape hatch (smoke tests, hand re-runs).
 # All deploy logic lives in deploy-reusable.yml; this file is just the trigger.
-run-name: "${{ github.event.client_payload.title || format('Deploy Staging — triggered by @{0}', inputs.triggered_by || github.actor) }}"
+run-name: "Website · ${{ github.event.client_payload.title || format('Deploy Staging — triggered by @{0}', inputs.triggered_by || github.actor) }}"
 
 on:
   repository_dispatch:

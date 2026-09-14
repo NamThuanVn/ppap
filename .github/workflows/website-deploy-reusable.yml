@@ -1,4 +1,4 @@
-name: Deploy · Reusable
+name: Website · Deploy · Reusable
 
 # The deploy graph for website-namthuan. Runs on the PUBLIC repo
 # NamThuanVn/ppap -- SHARED with erp-namthuan (free Actions minutes). This repo
@@ -156,7 +156,7 @@ jobs:
           fi
           exit 0
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ env.RESOLVED_PAT }}

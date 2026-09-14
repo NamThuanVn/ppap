@@ -1,10 +1,10 @@
-name: Deploy · Production
+name: Website · Deploy · Production
 
 # Triggered cross-repo from NamThuanVn/website-namthuan when release.yml cuts a
 # new release. Runs on the SHARED NamThuanVn/ppap. `workflow_dispatch` requires typing PRODUCTION into the confirm
 # input as a tripwire against fat-fingered clicks. All deploy logic lives in
 # deploy-reusable.yml; this file is just the trigger.
-run-name: "${{ github.event.client_payload.title || format('Deploy Production {0} — triggered by @{1}', inputs.tag, inputs.triggered_by || github.actor) }}"
+run-name: "Website · ${{ github.event.client_payload.title || format('Deploy Production {0} — triggered by @{1}', inputs.tag, inputs.triggered_by || github.actor) }}"
 
 on:
   repository_dispatch:
