@@ -1,9 +1,9 @@
-name: CI · E2E batch (fan-out worker)
+name: ERP · CI · E2E batch (fan-out worker)
 
 # One BATCH of another repo's Playwright shards.
 #
 # GitHub Free allows ~20 concurrent jobs per org, which caps how wide a single
-# CI run's e2e matrix can go. `ci-checks.yml`'s `e2e-fanout` job splits the
+# CI run's e2e matrix can go. `erp-ci-checks.yml`'s `e2e-fanout` job splits the
 # shard set across idle fleet repos and dispatches a batch to each; this
 # workflow runs one. The dispatching repo remains the COORDINATOR — it owns the
 # checkout ref, the zone builds, the DB seed, the commit Status and every PR
@@ -11,14 +11,14 @@ name: CI · E2E batch (fan-out worker)
 # The coordinator reads that conclusion (scripts/ci/fanout.mjs collect).
 #
 # This file MUST keep its `ci-` prefix: sync-workflows-to-ppap.yml mirrors only
-# `ci-*.yml` to the CI fleet, and a fleet repo without this workflow is skipped
+# `erp-ci-*.yml` to the CI fleet, and a fleet repo without this workflow is skipped
 # by the fan-out's dispatchability guard (so a missed sync degrades to fewer
 # shards, never to a silently untested one).
 #
 # It never posts a status, never touches the PR, and needs no secret beyond the
 # pool every fleet repo already has.
 
-run-name: "E2E · ${{ github.event.client_payload.ctx.pr_number && format('PR #{0}', github.event.client_payload.ctx.pr_number) || 'manual' }} · batch ${{ github.event.client_payload.batch }}/${{ github.event.client_payload.batch_count }} · ${{ github.event.client_payload.correlation }}"
+run-name: "ERP · E2E · ${{ github.event.client_payload.ctx.pr_number && format('PR #{0}', github.event.client_payload.ctx.pr_number) || 'manual' }} · batch ${{ github.event.client_payload.batch }}/${{ github.event.client_payload.batch_count }} · ${{ github.event.client_payload.correlation }}"
 
 on:
   repository_dispatch:
@@ -134,7 +134,7 @@ jobs:
           echo "run=$RUN" >> "$GITHUB_OUTPUT"
           echo "▶ batch shards=$JSON run=$RUN" >&2
 
-  # Identical to ci-checks.yml's `e2e` job, except the build/seed artifacts are
+  # Identical to erp-ci-checks.yml's `e2e` job, except the build/seed artifacts are
   # pulled from the COORDINATOR's run in another repo. Keep the two in step:
   # a change to the boot/run contract in one must land in the other.
   e2e:

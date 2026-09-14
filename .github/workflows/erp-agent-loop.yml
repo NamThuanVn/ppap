@@ -1,19 +1,19 @@
-name: Agent · loop
+name: ERP · Agent · loop
 
 # Top-up controller for the self-perpetuating /clear-todo agent loop.
 # Level-triggered: EVERY invocation recomputes K = min(candidates, cap − active)
 # from live API state and fires K repository_dispatch[agent-todo] events at its
-# own repo (agent-clear-todo.yml). It never carries state between invocations,
+# own repo (erp-agent-clear-todo.yml). It never carries state between invocations,
 # so a lost or coalesced trigger is harmless — the next one recounts.
 #
 # Invoked several ways (all end up here):
 #   · manually — workflow_dispatch on this workflow (gh workflow run
-#     agent-loop.yml -R NamThuanVn/ppap);
+#     erp-agent-loop.yml -R NamThuanVn/ppap);
 #   · by ba-to-issues.yml in the private repo after a merged BA-docs PR minted
 #     at least one sweepable (`bug`/`task`) issue;
 #   · by each agent run that EXECUTED a solve-verdict (MERGED / PARK / SPLIT /
 #     ABANDONED with green executor steps) — the "Continue loop" step in
-#     agent-clear-todo.yml chains the next lane immediately (lowest latency);
+#     erp-agent-clear-todo.yml chains the next lane immediately (lowest latency);
 #   · by the `workflow_run` trigger on ANY agent-clear-todo / rel-plan
 #     completion — success, failure, cancelled, or spot-reclaimed. This is what
 #     catches a run that DIED (the "Continue loop" step never fired) and
@@ -22,10 +22,10 @@ name: Agent · loop
 #     so a one-shot manual run doesn't auto-start the loop. Termination still
 #     holds: when the backlog drains the probe dispatches 0, so no new run is
 #     created → no new completion → nothing re-triggers;
-#   · by agent-rel-plan.yml after a successful planning pass — the
+#   · by erp-agent-rel-plan.yml after a successful planning pass — the
 #     rel-planning gate below defers lane dispatch to that chain whenever any
 #     open BA leaf still lacks the `rel-planned` marker;
-#   · by the `workflow_run` completion of agent-loop-heartbeat.yml (also in the
+#   · by the `workflow_run` completion of erp-agent-loop-heartbeat.yml (also in the
 #     workflow_run list above) — a rare 15-min backstop for the
 #     controller-self-reclaim gap, kept in its own workflow so it can be toggled
 #     on/off from the Actions UI independently.
@@ -52,7 +52,7 @@ name: Agent · loop
 # heartbeat, or a chained dispatch), and GitHub attributes those to the
 # workflow's last committer — misleading. The native "triggered by <identity>"
 # line already shows the real dispatcher underneath.
-run-name: 'Agent · loop'
+run-name: 'ERP · Agent · loop'
 
 on:
   # Primary recovery trigger: re-probe after EVERY agent-clear-todo / rel-plan
@@ -75,11 +75,11 @@ on:
   # attempts. So a re-trigger on a failure is cheap — the controller looks, sees
   # the hold, and stops.
   #
-  # An "Agent · ambulance" completion is in this list for the same reason a lane
-  # completion is: an ambulance that dies without a verdict must still re-arm the
-  # controller. That cannot loop, because the attempt is charged at DISPATCH
-  # (scripts/agent/board/loop/gate.mjs), not at verdict.
-  # "Agent · loop heartbeat" is the 15-min BACKSTOP (controller-self-reclaim
+  # An "ERP · Agent · ambulance" completion is in this list for the same reason a
+  # lane completion is: an ambulance that dies without a verdict must still
+  # re-arm the controller. That cannot loop, because the attempt is charged at
+  # DISPATCH (scripts/agent/board/loop/gate.mjs), not at verdict.
+  # "ERP · Agent · loop heartbeat" is the 15-min BACKSTOP (controller-self-reclaim
   # gap), kept in its own workflow so it can be enabled/disabled from the Actions
   # UI without touching this controller. It does nothing but complete on
   # schedule — this workflow_run entry IS how its tick reaches the loop (no
@@ -87,8 +87,24 @@ on:
   # through the controller `if:` below (unlike clear-todo/rel-plan, which are
   # gated to repository_dispatch-origin so a one-shot manual run can't start
   # the loop).
+  #
+  # ⚠ THESE ARE DISPLAY NAMES, NOT FILENAMES. `workflow_run.workflows` matches
+  # the `name:` at the top of each workflow — it is the ONE place in this tree
+  # where a workflow's human-readable name is load-bearing. A name edited on one
+  # side and not here matches nothing, GitHub raises no error, and the entire
+  # agent loop simply stops chaining: every lane runs once and the controller is
+  # never re-armed. Keep this list in lockstep with the four `name:` lines, and
+  # note they now carry the `ERP · ` prefix that separates this repo's workflows
+  # from website-namthuan's in the shared deploy repo.
+  # Guarded by scripts/gate/ci/workflow-run-names.mjs.
   workflow_run:
-    workflows: ["Agent · clear-todo-issue", "Agent · rel-plan", "Agent · ambulance", "Agent · loop heartbeat"]
+    workflows:
+      [
+        'ERP · Agent · clear-todo-issue',
+        'ERP · Agent · rel-plan',
+        'ERP · Agent · ambulance',
+        'ERP · Agent · loop heartbeat',
+      ]
     types: [completed]
   repository_dispatch:
     types: [agent-loop]
@@ -112,7 +128,7 @@ concurrency:
 
 env:
   PRIVATE_REPO: NamThuanVn/erp-namthuan
-  AGENT_WORKFLOW: agent-clear-todo.yml
+  AGENT_WORKFLOW: erp-agent-clear-todo.yml
 
 jobs:
   controller:
@@ -147,7 +163,7 @@ jobs:
       # from the dead-lane sweep to the stranded sweep through it). Set at STEP
       # level, never in `jobs.<id>.env`: `runner` is not a context there, and
       # GitHub rejects the whole workflow file rather than evaluating it to empty
-      # — see the same note in agent-clear-todo.yml.
+      # — see the same note in erp-agent-clear-todo.yml.
       - name: Pin the harness state dir
         run: |
           set -euo pipefail
@@ -290,7 +306,7 @@ jobs:
 
       # Stranded-claim sweep — release items whose backing run is provably dead
       # (assigned to us + In Progress/Todo + last claimed > STRANDED_HOURS ago,
-      # which must exceed agent-clear-todo.yml's timeout-minutes). A hosted-
+      # which must exceed erp-agent-clear-todo.yml's timeout-minutes). A hosted-
       # runner reclaim skips the in-job salvage-or-revert (always() does not
       # survive a runner shutdown), stranding the item; this is the decoupled
       # backstop. Runs BEFORE the count so a released item is a candidate this

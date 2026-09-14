@@ -1,4 +1,4 @@
-name: Agent · clear-todo-issue
+name: ERP · Agent · clear-todo-issue
 
 # Runs ONE headless agent iteration on ppap's free public-repo runners.
 # ONE run = ONE agent = ONE item. Since the solve-issue split, a loop run is a
@@ -28,7 +28,7 @@ name: Agent · clear-todo-issue
 # LEGACY WRAPPER path instead: no scripted claim; the session runs
 # /clear-todo <item>, which does its own claim + board writes.
 #
-# Parallelism + repetition are owned by agent-loop.yml: loop-spawned runs carry
+# Parallelism + repetition are owned by erp-agent-loop.yml: loop-spawned runs carry
 # client_payload.loop='true', and the final "Continue loop" step chains back to
 # the controller ONLY on an executed verdict (MERGED/PARK/SPLIT/ABANDONED with
 # green executors; MERGED chains even when the run step itself failed — it is
@@ -47,13 +47,13 @@ name: Agent · clear-todo-issue
 # therefore atomic among all CI agents; human sessions on OTHER forks are covered
 # by the open-PR backstop.
 #
-# Dispatched by agent-loop.yml (repository_dispatch[agent-todo]);
+# Dispatched by erp-agent-loop.yml (repository_dispatch[agent-todo]);
 # workflow_dispatch is the manual/smoke-test entry. Filename is deliberately
-# NOT ci-*.yml → the sync mirrors it to NamThuanVn/ppap only, never to the CI
+# NOT erp-ci-*.yml → the sync mirrors it to NamThuanVn/ppap only, never to the CI
 # fleet. NOTE the transcript + session artifacts and logs are PUBLIC (accepted
 # trade-off — see docs/engineering/platform/ppap-agent-runs.md § Agent runs).
 
-run-name: 'Agent · todo'
+run-name: 'ERP · Agent · todo'
 
 on:
   repository_dispatch:
@@ -378,7 +378,7 @@ jobs:
         if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         uses: ./.github/actions/install
 
-      # Same Chromium cache pattern as ci-checks.yml — /verify-in-browser (headless) and
+      # Same Chromium cache pattern as erp-ci-checks.yml — /verify-in-browser (headless) and
       # any e2e the agent runs need it.
       - name: Resolve Playwright version
         id: pw
@@ -745,7 +745,7 @@ jobs:
           exit 0
 
       # Failure-only Telegram to the build topic — same bot/secrets/shape as
-      # deploy-reusable.yml's notify step; non-fatal, skips when unset.
+      # erp-deploy-reusable.yml's notify step; non-fatal, skips when unset.
       #
       # `held_first != 'false'` suppresses the duplicates: a shared harness fault
       # kills every in-flight lane within minutes, and the hold coalesces them by
@@ -826,6 +826,6 @@ jobs:
             -f client_payload[triggered_by]="${TRIGGERED_BY}"; then
             echo "✓ chained agent-loop"
           else
-            echo "::warning::agent-loop chain dispatch failed — this lane ends; restart via 'gh workflow run agent-loop.yml -R NamThuanVn/ppap' or the next BA-docs merge"
+            echo "::warning::agent-loop chain dispatch failed — this lane ends; restart via 'gh workflow run erp-agent-loop.yml -R NamThuanVn/ppap' or the next BA-docs merge"
           fi
           exit 0

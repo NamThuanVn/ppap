@@ -1,4 +1,4 @@
-name: Agent · rel-plan
+name: ERP · Agent · rel-plan
 
 # Relationship-planning run for the agent loop: assesses ordering across all
 # open BA leaves and wires GitHub issue dependencies (blocked-by edges) BEFORE
@@ -7,7 +7,7 @@ name: Agent · rel-plan
 # half, running the shared /order-todo-queue skill headless (LOCAL wrapper ticks
 # invoke the same skill — keep them in lockstep).
 #
-# Dispatched by agent-loop.yml's rel-planning gate whenever any open leaf
+# Dispatched by erp-agent-loop.yml's rel-planning gate whenever any open leaf
 # lacks the `rel-planned` label; the controller defers lane dispatch until the
 # board is fully planned. On success this job ALWAYS re-dispatches agent-loop
 # (even when it found nothing to plan — a gate/plan race must not strand the
@@ -18,18 +18,18 @@ name: Agent · rel-plan
 # Enforcement is deterministic, not transcript-trust: the "Verify plan
 # coverage" step re-runs the SAME unplanned-leaf query after the session and
 # fails the job while any leaf is still unplanned. That query is load-bearing
-# in three places (the gate in agent-loop.yml, the skill's sweep, the recount
+# in three places (the gate in erp-agent-loop.yml, the skill's sweep, the recount
 # here) — change all three together or the loop ping-pongs/stalls.
 #
 # LIGHT bootstrap on purpose: checkout + gh + Claude CLI only. No pnpm
 # install, no Playwright, no codegraph — the planner reads spec files and
 # calls gh; MCP servers are stripped by the wrapper (REL_PLAN=1).
 #
-# Filename is deliberately NOT ci-*.yml → the sync mirrors it to
+# Filename is deliberately NOT erp-ci-*.yml → the sync mirrors it to
 # NamThuanVn/ppap only, never to the CI fleet. Transcript artifact + logs are
 # PUBLIC (accepted trade-off — see docs/engineering/platform/ppap-agent-runs.md § Agent runs).
 
-run-name: 'Agent · rel-plan'
+run-name: 'ERP · Agent · rel-plan'
 
 on:
   repository_dispatch:
@@ -167,7 +167,7 @@ jobs:
           git config user.email "${LOGIN}@users.noreply.github.com"
           echo "✓ workspace on upstream main $(git rev-parse --short HEAD) · acting as @$LOGIN"
 
-      # The SAME query as agent-loop.yml's gate and the recount below: open
+      # The SAME query as erp-agent-loop.yml's gate and the recount below: open
       # leaf (by leaf marker — parents never plan) lacking `rel-planned`.
       # The parent exclusion runs FIRST and is not optional: a batch main can
       # QUOTE a leaf marker in its body (e.g. #2252 pasting the re-mint guard
@@ -292,7 +292,7 @@ jobs:
             -f client_payload[triggered_by]="${TRIGGERED_BY}"; then
             echo "✓ chained agent-loop (board fully rel-planned)"
           else
-            echo "::warning::agent-loop chain dispatch failed — restart via 'gh workflow run agent-loop.yml -R NamThuanVn/ppap' or the next BA-docs merge"
+            echo "::warning::agent-loop chain dispatch failed — restart via 'gh workflow run erp-agent-loop.yml -R NamThuanVn/ppap' or the next BA-docs merge"
           fi
           exit 0
 

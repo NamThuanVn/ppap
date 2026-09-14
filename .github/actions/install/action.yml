@@ -12,7 +12,7 @@ runs:
     # pnpm comes from its own standalone release binary, NOT pnpm/action-setup.
     # The reasoning, the measurements and the platform matrix all live in
     # scripts/ci/pnpm-binary.sh — one copy, shared with release.yml and
-    # local-stack-matrix.yml, and unit-tested at
+    # erp-local-stack-matrix.yml, and unit-tested at
     # scripts/tests/ci/pnpm-binary.test.sh (the platform branches cannot be
     # proven on any single runner).
     - name: Resolve pnpm
@@ -20,7 +20,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # Same guard as ci-checks.yml's e2e dispatch: this action is mirrored to
+        # Same guard as erp-ci-checks.yml's e2e dispatch: this action is mirrored to
         # the ppap repos, but the script comes from the erp-namthuan checkout, so
         # a stale ref would otherwise fail with a bare "No such file".
         if [ ! -f scripts/ci/pnpm-binary.sh ]; then

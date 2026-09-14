@@ -1,4 +1,4 @@
-name: Local Stack · macOS / Linux / Windows
+name: ERP · Local Stack · macOS / Linux / Windows
 
 # Boots the LOCAL-DEV stack exactly the way a developer does on a fresh clone —
 # `pnpm worktree:init`, then `pnpm dev:lite` — on all three platforms, and
@@ -7,7 +7,7 @@ name: Local Stack · macOS / Linux / Windows
 #
 #     "does a fresh checkout come up on this OS?"
 #
-# The other checks already have homes (ci-checks.yml). What they do NOT cover is
+# The other checks already have homes (erp-ci-checks.yml). What they do NOT cover is
 # the local developer path: worktree:init's bootstrap, db:reset across 13 D1s,
 # link-monolith's ~360 per-file symlinks (Windows needs symlink privilege for
 # FILE links — junctions only cover dirs), and the bash-3.2/Git-Bash assumptions
@@ -27,7 +27,7 @@ name: Local Stack · macOS / Linux / Windows
 # minutes on a PRIVATE repo. On a PUBLIC ppap repo every OS is free — the same
 # economics that put the rest of CI here (docs/engineering/platform/ppap.md).
 #
-# WHY NOT NAMED ci-*.yml: sync-workflows-to-ppap.yml mirrors `ci-*.yml` to every
+# WHY NOT NAMED erp-ci-*.yml: sync-workflows-to-ppap.yml mirrors `erp-ci-*.yml` to every
 # repo in PPAP_CI_REPOS. This is not a per-PR gate and must not eat a fleet
 # org's 20-concurrent-job budget, so the non-`ci-` name keeps it in
 # NamThuanVn/ppap only (the full-set target).
@@ -81,7 +81,7 @@ env:
   PRIVATE_REPO: NamThuanVn/erp-namthuan
   # Pre-seed init.defaultBranch so actions/checkout's internal `git init` stops
   # printing the "hint: git config --global init.defaultBranch" line. Same
-  # cosmetic fix as ci-checks.yml.
+  # cosmetic fix as erp-ci-checks.yml.
   GIT_CONFIG_COUNT: "1"
   GIT_CONFIG_KEY_0: init.defaultBranch
   GIT_CONFIG_VALUE_0: main
