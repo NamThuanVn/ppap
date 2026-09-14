@@ -520,6 +520,22 @@ jobs:
 
       - uses: ./.github/actions/install
 
+      # TWO commands, because neither one alone sees the whole repo.
+      #
+      # `lint:js:packages` is `pnpm -r lint:js`, and `pnpm -r` runs a script only
+      # where that script EXISTS — which is `apps/shell` and `apis/*`, nothing
+      # else. It also excludes the workspace root by design. So for as long as
+      # this was the only ESLint job, `packages/*`, `scripts/**`, `monolith/api`
+      # and all ten zone apps were linted by NOTHING. That is not theoretical:
+      # when root ESLint was finally run on a green `main` it reported 575
+      # errors, accumulated invisibly because no gate had ever opened those
+      # files.
+      #
+      # `pnpm lint:js` is the root `eslint .`, whose flat config covers exactly
+      # the packages the per-workspace pass misses (it ignores `apps/shell`,
+      # which has its own config and its own script). Root + packages together
+      # are the whole tree; drop either and a hole reopens silently.
+      - run: pnpm lint:js
       - run: pnpm lint:js:packages
 
   # Vitest, split across parallel legs. `pnpm test:ci` (= `pnpm -r test --
