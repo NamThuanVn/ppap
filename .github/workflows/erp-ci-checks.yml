@@ -538,6 +538,28 @@ jobs:
       - run: pnpm lint:js
       - run: pnpm lint:js:packages
 
+      # ...and a third, because "root + packages are the whole tree" is a CLAIM,
+      # and the two commands above cannot check it. Either pass stays green when
+      # a file stops being linted — an `ignores` entry, a new top-level folder no
+      # config matches, a workspace that drops its `lint:js` script. That is how
+      # the 1,689-file hole opened in the first place: nothing was red, because
+      # nothing was looking.
+      #
+      # `lint-coverage.mjs` enumerates every lintable file in the repo and
+      # asserts each one is claimed by root ESLint or by a workspace pass, so the
+      # claim is mechanical rather than a comment. It also refuses to pass when
+      # its own scan matches nothing, since an empty scan reports zero
+      # uncovered files and reads exactly like success.
+      #
+      # It runs here and not only in `audit.sh` deliberately. `scripts/README.md`
+      # above records what happens otherwise: that gate "ran only in `audit.sh
+      # full/preflight`, i.e. locally", so #3125 landed without it and main went
+      # stale for every agent lane. A gate CI does not run is a gate that stops
+      # existing the moment someone does not run it locally.
+      - name: Every lintable file is covered by a lint pass
+        if: ${{ !cancelled() }}
+        run: node scripts/gate/shape/lint-coverage.mjs
+
   # Vitest, split across parallel legs. `pnpm test:ci` (= `pnpm -r test --
   # --run`) as ONE job was 474s and the second-longest branch in the graph —
   # long enough that it becomes the critical path the moment the e2e matrix is
