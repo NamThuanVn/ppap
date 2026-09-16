@@ -1,18 +1,35 @@
 name: ERP · Local Stack · macOS / Linux / Windows
 
-# Boots the LOCAL-DEV stack exactly the way a developer does on a fresh clone —
-# `pnpm worktree:init`, then `pnpm dev:lite` — on all three platforms, and
-# asserts it actually serves. NOTHING else runs here: no unit tests, no e2e, no
-# lint, no build. The only question this answers is
+# Two questions, one per job, both about ONE OS at a time:
 #
-#     "does a fresh checkout come up on this OS?"
+#   boot   — "does a fresh checkout come up on this OS?"
+#   gates  — "do the per-turn gates a BA hits give the same answer on this OS?"
 #
-# The other checks already have homes (erp-ci-checks.yml). What they do NOT cover is
-# the local developer path: worktree:init's bootstrap, db:reset across 13 D1s,
-# link-monolith's ~360 per-file symlinks (Windows needs symlink privilege for
-# FILE links — junctions only cover dirs), and the bash-3.2/Git-Bash assumptions
-# in scripts/dev/stack/serve-monolith.sh. Those break per-OS, silently, and only a real
-# boot finds it.
+# Everything else still has a home in erp-ci-checks.yml, and none of it runs
+# here: no e2e, no build, no biome, no typecheck, no zone lint.
+#
+# BOOT covers the local developer path erp-ci-checks.yml cannot: worktree:init's
+# bootstrap, db:reset across 13 D1s, link-monolith's ~360 per-file symlinks
+# (Windows needs symlink privilege for FILE links — junctions only cover dirs),
+# and the bash-3.2/Git-Bash assumptions in scripts/dev/stack/serve-monolith.sh.
+# Those break per-OS, silently, and only a real boot finds it.
+#
+# GATES exists because that reasoning was only ever applied to booting. The
+# repo's gates run on ubuntu and nowhere else, so a path-handling assumption in
+# one of them was invisible until it reached a machine — and the people on those
+# machines are the BAs, who work on native Windows + Git Bash while every
+# developer is on macOS or Linux. Five such defects shipped together with the
+# lint work of 2026-09-15 and were found by reading, not by CI:
+# `lint-coverage.mjs` spawned `npx` (an `npx.cmd` that execFileSync refuses) and
+# compared a `/`-suffixed prefix against `\` paths, so it failed on EVERY Windows
+# turn; `scripts-index.mjs --check` was permanently red; `ba/spine.mjs` and
+# `ba/archive.mjs` wrote `](..\..\catalog.md)` into the vault; and two hooks — the
+# guard against editing `main` from a worktree, and the docs-shape reminder —
+# were silently OFF. Four of the five failed in the direction that looks clean.
+#
+# The set below is deliberately SMALL: the gates that compare, key, or emit
+# PATHS, plus the two test suites that cover them. It is not a second CI. Adding
+# a gate here is worth it only when that gate reasons about a path.
 #
 # THE MCP WIRING IS IN SCOPE. `worktree:init`'s last three steps register the
 # Claude Code MCP servers, and scripts/dev/mcp/{sentry,playwright}.sh hard-fail
@@ -452,26 +469,172 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # The gates a BA's machine runs on EVERY turn, on every OS. Cheap: one install
+  # and six commands, no stack, no browser, no database.
+  #
+  # Steps are sequential rather than `if: always()`. On a per-OS diagnostic the
+  # first failure is almost always the whole story — all five defects this job
+  # was added for would have been caught by the first two steps — and a run that
+  # keeps going after a failed install reports six confusing failures instead of
+  # one real one.
+  gates:
+    needs: resolve
+    name: 2 · Gates · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Same reason as boot: "Linux fine, Windows broken" is the whole point.
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.resolve.outputs.os) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Checkout erp-namthuan
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.RESOLVED_PAT }}
+          ref: ${{ inputs.checkout_ref || 'main' }}
+          persist-credentials: false
+
+      # BEFORE the install, because on Windows this writes the gitignored
+      # `.npmrc` carrying `node-linker=hoisted` — which changes where pnpm puts
+      # `node_modules/.bin`, and therefore which layout the gates actually see.
+      # A Windows BA always has it (worktree:init writes it), so a job installing
+      # without it would be testing a tree nobody runs. It warns and never fails,
+      # so it is safe ahead of everything.
+      - name: Match the local Windows environment
+        run: node scripts/dev/git/ensure-local-env.mjs
+
+      # The shared composite here, unlike `boot` below — this job is not testing
+      # the install path, so caching node_modules is pure win. Its cache key is
+      # already `runner.os`-scoped, so the three OSes cannot poison each other.
+      - name: Install
+        uses: ./.github/actions/install
+
+      - name: Print toolchain
+        run: |
+          echo "os     : ${{ matrix.os }} ($(uname -s 2>/dev/null || echo windows))"
+          echo "node   : $(node -v)"
+          echo "pnpm   : $(pnpm -v)"
+          echo "bash   : $BASH_VERSION"
+          echo "linker : $(grep -s node-linker .npmrc || echo '(default — isolated)')"
+
+      # FIRST, because it is the one that blocked every Windows turn: it runs in
+      # audit.sh's `changed` list, so the Stop hook fails with it. It also spawns
+      # a real ESLint, which is where the `npx` → `npx.cmd` trap lived.
+      - name: Every lintable file is covered by a lint pass
+        run: node scripts/gate/shape/lint-coverage.mjs
+
+      - name: scripts/README.md Quick reference is current
+        run: node scripts/gate/shape/scripts-index.mjs --check
+
+      # Named files, not the whole `pnpm test:scripts`, for the same reason as the
+      # bash step below — and it is not hypothetical here either:
+      # `tests/dev/stack/boot-resolve.test.ts` probes a port on ALL interfaces to
+      # prove the dev-stack guard sees a socket bound to `::`, which is precisely
+      # the behaviour that differs between Linux, Windows and WSL. It has nothing
+      # to do with path handling, and a three-OS job has no business going red on
+      # it. (It runs on ubuntu already, in erp-ci-checks.yml's vitest legs.)
+      #
+      # These six are the ones that cover the separator handling: the helper, the
+      # two gates, and the BA link math that writes markdown targets.
+      - name: Path-handling tests (vitest)
+        run: |
+          pnpm --filter @namthuanvn/scripts exec vitest --run \
+            tests/lib/node/paths.test.mjs \
+            tests/gate/shape/lint-coverage.test.mjs \
+            tests/gate/shape/scripts-index.test.mjs \
+            tests/ba/vault.test.mjs \
+            tests/ba/archive.test.mjs \
+            tests/ba/doc-links.test.mjs
+
+      # The two hook suites, NOT `pnpm test:scripts:bash`. The full bash suite is
+      # 57 files, and several need tooling this job has no reason to install —
+      # shellcheck (absent from the windows-latest image), the `claude` CLI,
+      # wrangler, a PAT pool. On a machine without them it reports 101 failures
+      # with the tree completely healthy, which is measured, not assumed: the
+      # clean base and the branch both produce exactly `1177 passed · 101 failed`
+      # across the same 7 files. Wiring that into a three-OS job would make it red
+      # by default, and a job that is always red is a job nobody reads.
+      #
+      # These two need only git and node, and they are the ones that matter here:
+      # both hooks were silently OFF on Windows, and neither failure printed
+      # anything. Adding a third path-handling hook means adding it here too — the
+      # full suite is not doing it for you.
+      - name: Hook suites that reason about paths
+        run: |
+          set -euo pipefail
+          bash scripts/tests/gate/hook/block/out-of-worktree-edit.test.sh
+          bash scripts/tests/gate/hook/remind/docs-shape-context.test.sh
+
+      # The two link gates. They walk the docs tree and rebuild relative links,
+      # which is exactly the operation that emitted `](..\..\catalog.md)` on
+      # Windows — and `--check` is the half a BA runs before pushing.
+      - name: BA vault — links, statuses, stranded items
+        run: pnpm ba:check-links
+
+      - name: Doc links (CLAUDE.md, .claude/, READMEs)
+        run: node scripts/ba/doc-links.mjs
+
   summary:
-    needs: boot
+    needs: [boot, gates]
     if: always()
-    name: 2 · Summary
+    name: 3 · Summary
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
       - name: Report
         env:
-          RESULT: ${{ needs.boot.result }}
+          BOOT: ${{ needs.boot.result }}
+          GATES: ${{ needs.gates.result }}
         run: |
           set -euo pipefail
           {
-            echo "## Local stack boot — \`${{ inputs.checkout_ref || 'main' }}\`"
+            echo "## Local stack — \`${{ inputs.checkout_ref || 'main' }}\`"
             echo ""
-            echo "Per runner: \`pnpm worktree:init\` (install + db:reset + codegraph index"
-            echo "+ all MCP servers registered and asserted) → \`pnpm dev:lite\` → probes of"
-            echo "\`/api/health\` and \`/en/login\`."
+            echo "**boot: $BOOT** — per runner: \`pnpm worktree:init\` (install + db:reset +"
+            echo "codegraph index + all MCP servers registered and asserted) → \`pnpm dev:lite\`"
+            echo "→ probes of \`/api/health\` and \`/en/login\`."
             echo ""
-            echo "Matrix result: **$RESULT** — per-OS detail is in the job list;"
-            echo "boot logs are attached as artifacts."
+            echo "**gates: $GATES** — per runner: the path-handling gates and the two script"
+            echo "test suites a BA's Stop hook runs every turn."
+            echo ""
+            echo "Per-OS detail is in the job list; boot logs are attached as artifacts."
           } >>"$GITHUB_STEP_SUMMARY"
-          [ "$RESULT" = success ] || exit 1
+          # Both must pass. A green boot with red gates is the exact shape this
+          # workflow missed for a year: the stack came up, and every turn on it
+          # was blocked.
+          [ "$BOOT" = success ] && [ "$GATES" = success ]
