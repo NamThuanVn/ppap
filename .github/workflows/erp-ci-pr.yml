@@ -280,10 +280,17 @@ jobs:
         id: noise
         continue-on-error: true
         env:
-          # A pooled PAT, not the default token: some shard logs live in other
-          # repos, which GITHUB_TOKEN cannot read. With it the scan silently
-          # returned zero e2e lines — i.e. "clean" — on every fanned-out run.
+          # TWO tokens, by repo. The e2e batch logs live in OTHER fleet repos,
+          # which only the pooled PAT can read — that is why it is here at all.
+          # But the pooled PAT turned out not to carry Actions:read on the ppap
+          # repos either, so EVERY fetch returned nothing and the scan reported
+          # `clean` on every run (issue #3717). GITHUB_TOKEN always has
+          # actions:read for the repo it is running in, which is where the
+          # biome/test/typecheck/eslint logs are — so use it for this repo and
+          # keep the PAT for the cross-repo batches.
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          POOL_PAT: ${{ env.RESOLVED_PAT }}
+          SELF_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
           BATCH_RUNS: ${{ needs.checks.outputs.e2e_runs }}
           # Which categories CI itself calls red. The digest uses this to tell
@@ -327,10 +334,31 @@ jobs:
                     *"ESLint"*)      dest="$tmp/eslint.log" ;;
                     *)               continue ;;
                   esac
-                  gh api "repos/${repo}/actions/jobs/${id}/logs" 2>/dev/null \
-                    | sed -E 's/\x1b\[[0-9;]*m//g' >> "$dest"
+                  # GITHUB_TOKEN for this repo, pooled PAT for the fanned-out
+                  # batch repos it cannot see. Errors are NO LONGER discarded:
+                  # swallowing them is what turned "I could not read the logs"
+                  # into "there is nothing to see" for every run.
+                  if [ "$repo" = "$GITHUB_REPOSITORY" ]; then tok="$SELF_TOKEN"; else tok="$POOL_PAT"; fi
+                  if ! GH_TOKEN="$tok" gh api "repos/${repo}/actions/jobs/${id}/logs" 2>"$tmp/fetch.err" \
+                       | sed -E 's/\x1b\[[0-9;]*m//g' >> "$dest"; then
+                    echo "::warning::could not read logs for job ${id} (${name}) in ${repo}: $(head -c 200 "$tmp/fetch.err")"
+                    echo "$repo/$id" >> "$tmp/fetch-failures"
+                  fi
                 done
           done < "$tmp/runs.tsv"
+          # Bytes actually read. Zero across every log means the scan did not
+          # run — which is NOT the same as a clean run, and must never be
+          # reported as one.
+          bytes=0
+          for f in e2e biome test typecheck eslint; do
+            bytes=$(( bytes + $(wc -c < "$tmp/$f.log") ))
+          done
+          scan_ok=true
+          if [ "$bytes" -eq 0 ]; then
+            scan_ok=false
+            echo "::warning::noise scan read 0 bytes of job logs — reporting the scan as UNAVAILABLE, not clean (see issue #3717)"
+          fi
+          echo "▶ noise: read ${bytes} byte(s) of job logs; scan_ok=${scan_ok}"
           # Counters, digest, status line and comment body all come from ONE
           # tested script now (scripts/ci/report.mjs). What stays here is the
           # part only a workflow can do: downloading the logs above, and posting
@@ -340,7 +368,9 @@ jobs:
           # merge. See docs/engineering/platform/ppap.md § To CI validation.
           JOBS="gates=${R_BIOME:-},typecheck=${R_TYPE:-},lint=${R_LINT:-},vitest=${R_TEST:-},e2e=${R_E2E:-}"
           out="$tmp/report"
-          if ! node scripts/ci/report.mjs --dir "$tmp" --jobs "$JOBS" \
+          SCAN_FLAG=""
+          [ "$scan_ok" = true ] || SCAN_FLAG="--scan-unavailable"
+          if ! node scripts/ci/report.mjs --dir "$tmp" --jobs "$JOBS" $SCAN_FLAG \
                  --run-url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
                  --out-dir "$out"; then
             echo "::error::scripts/ci/report.mjs failed — the PR would otherwise get a green-looking empty report"
@@ -351,6 +381,7 @@ jobs:
           {
             echo "clean=$clean"
             echo "summary=$summary"
+            echo "scan_ok=$scan_ok"
             echo "state=$(cat "$out/state.txt")"
             echo "status=$(cat "$out/status.txt")"
             echo "logdir=$tmp"
@@ -448,6 +479,7 @@ jobs:
           NOISE_SUMMARY: ${{ steps.noise.outputs.summary }}
           DESC: ${{ steps.status.outputs.desc }}
           LOGDIR: ${{ steps.noise.outputs.logdir }}
+          NOISE_SCAN_OK: ${{ steps.noise.outputs.scan_ok }}
           R_BIOME: ${{ needs.checks.outputs.biome }}
           R_TYPE: ${{ needs.checks.outputs.typecheck }}
           R_LINT: ${{ needs.checks.outputs.lint }}
@@ -546,7 +578,9 @@ jobs:
           # produced the status, now that the ready/merge outcome is known; the
           # marker it emits is what keeps this an edit rather than a new comment
           # every run.
-          BODY=$(node scripts/ci/report.mjs --dir "$LOGDIR" \
+          SCAN_FLAG=""
+          [ "${NOISE_SCAN_OK:-true}" = true ] || SCAN_FLAG="--scan-unavailable"
+          BODY=$(node scripts/ci/report.mjs --dir "$LOGDIR" $SCAN_FLAG \
             --jobs "gates=${R_BIOME:-},typecheck=${R_TYPE:-},lint=${R_LINT:-},vitest=${R_TEST:-},e2e=${R_E2E:-}" \
             --run-url "$RUN_URL" --ready-line "$READY_LINE" --merge-line "$MERGE_LINE" \
             --out-dir "$LOGDIR/report2" --print)
