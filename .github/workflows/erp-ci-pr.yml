@@ -282,12 +282,13 @@ jobs:
         env:
           # TWO tokens, by repo. The e2e batch logs live in OTHER fleet repos,
           # which only the pooled PAT can read — that is why it is here at all.
-          # But the pooled PAT turned out not to carry Actions:read on the ppap
-          # repos either, so EVERY fetch returned nothing and the scan reported
-          # `clean` on every run (issue #3717). GITHUB_TOKEN always has
-          # actions:read for the repo it is running in, which is where the
-          # biome/test/typecheck/eslint logs are — so use it for this repo and
-          # keep the PAT for the cross-repo batches.
+          # GITHUB_TOKEN is used for this repo's own jobs, where it always has
+          # actions:read.
+          #
+          # NOTE: permissions were NOT what broke the scan in #3717 — that was
+          # `gh` refusing to print a response containing ANSI escapes (see the
+          # --allow-escape-sequences note below). The split is kept because it is
+          # the right scoping, not because it was the fix.
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           POOL_PAT: ${{ env.RESOLVED_PAT }}
           SELF_TOKEN: ${{ github.token }}
@@ -339,7 +340,16 @@ jobs:
                   # swallowing them is what turned "I could not read the logs"
                   # into "there is nothing to see" for every run.
                   if [ "$repo" = "$GITHUB_REPOSITORY" ]; then tok="$SELF_TOKEN"; else tok="$POOL_PAT"; fi
-                  if ! GH_TOKEN="$tok" gh api "repos/${repo}/actions/jobs/${id}/logs" 2>"$tmp/fetch.err" \
+                  # `--allow-escape-sequences` is REQUIRED, not optional: a job
+                  # log is full of ANSI colour, and newer `gh` refuses to print a
+                  # response containing escapes without it — erroring out with
+                  # "the response contains terminal escape sequences". With the
+                  # old `2>/dev/null` that error was invisible, so every fetch
+                  # produced an empty file and the scan called every run clean
+                  # (#3717). The `sed` below still strips the escapes; this flag
+                  # only lets them out of `gh` so there is something to strip.
+                  if ! GH_TOKEN="$tok" gh api --allow-escape-sequences \
+                       "repos/${repo}/actions/jobs/${id}/logs" 2>"$tmp/fetch.err" \
                        | sed -E 's/\x1b\[[0-9;]*m//g' >> "$dest"; then
                     echo "::warning::could not read logs for job ${id} (${name}) in ${repo}: $(head -c 200 "$tmp/fetch.err")"
                     echo "$repo/$id" >> "$tmp/fetch-failures"
