@@ -33,7 +33,7 @@ on:
         type: boolean
         default: true
       e2e_changed_only:
-        description: 'Scope e2e to the changed service''s specs (broad/shared change → full suite, nothing relevant → skip). PR CI passes true; the production deploy gate leaves the default false → full suite. See scripts/ci/e2e/plan.sh.'
+        description: 'Scope e2e to the changed service''s specs (broad/shared change → full suite, nothing relevant → skip). NOBODY passes true any more: PR CI stopped scoping in #3722 because a PR could be green while the suite was red, and the deploy gate always ran full. Kept because the scoping logic below is still the right tool if a caller ever needs it. See scripts/ci/e2e/plan.sh.'
         type: boolean
         default: false
     outputs:

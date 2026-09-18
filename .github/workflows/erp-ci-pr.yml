@@ -171,10 +171,26 @@ jobs:
       fleet: ${{ github.event.client_payload.fleet || inputs.fleet }}
       pr_number: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
       head_sha: ${{ github.event.client_payload.head_sha }}
-      # PR CI runs only the changed service's e2e specs (broad/shared change →
-      # full; nothing relevant → skip; see scripts/ci/e2e/plan.sh). A manual main
-      # run has no PR diff to scope against → run the full suite.
-      e2e_changed_only: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && true || false }}
+      # EVERY PR runs the FULL e2e suite, and it blocks the merge (issue #3722).
+      #
+      # It used to scope to the changed service's specs, which is why a PR could
+      # be green while the suite was red: a change under `scripts/` selected ~0
+      # specs, so nothing outside the touched area was ever exercised before
+      # merge. The gap was invisible for as long as the noise scan was broken
+      # (#3717) and only surfaced when the failure digest became readable.
+      #
+      # Cost is deliberately not the deciding factor: this runs on the ppap
+      # fleet's free public-repo minutes, so the trade is wall-clock for a
+      # guarantee that nothing merges past a broken spec.
+      #
+      # KNOWN AND ACCEPTED: the suite is flaky today — 6 green / 2 red measured
+      # across 8 full runs against `main`, with ~11 specs failing intermittently
+      # and the membership changing run to run. Until that rate comes down, this
+      # gate WILL red a PR for reasons unrelated to it. The mitigation is to fix
+      # the flake spec-by-spec (see #3722 for the measured profile and the
+      # "assert the precondition" pattern that fixed the first one), NOT to
+      # re-narrow the scope — re-narrowing restores the exact hole this closes.
+      e2e_changed_only: false
     secrets:
       PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
 
