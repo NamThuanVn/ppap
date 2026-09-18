@@ -331,61 +331,40 @@ jobs:
                     | sed -E 's/\x1b\[[0-9;]*m//g' >> "$dest"
                 done
           done < "$tmp/runs.tsv"
-          num() { grep -oiE "$1" "$2" 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}'; }
-          cnt() { grep -acE "$1" "$2" 2>/dev/null | head -1; }
-          flaky=$(num '([0-9]+) flaky' "$tmp/e2e.log"); flaky=${flaky:-0}
-          dup=$(cnt '\[dup-testid\]' "$tmp/e2e.log"); dup=${dup:-0}
-          hyd=$(cnt '\[hydration-error\]' "$tmp/e2e.log"); hyd=${hyd:-0}
-          i18n=$(cnt '\[i18n-missing\]' "$tmp/e2e.log"); i18n=${i18n:-0}
-          font=$(cnt '\[font-preload\]' "$tmp/e2e.log"); font=${font:-0}
-          http404=$(cnt '\[http-404\]' "$tmp/e2e.log"); http404=${http404:-0}
-          biomew=$(num 'Found ([0-9]+) warning' "$tmp/biome.log"); biomew=${biomew:-0}
-          vitest=$(cnt 'stderr \||not wrapped in act' "$tmp/test.log"); vitest=${vitest:-0}
-          total=$(( flaky + dup + hyd + i18n + font + http404 + biomew + vitest ))
-          clean=true; [ "$total" -gt 0 ] && clean=false
-          summary=$(printf 'flaky %s · dup %s · hyd %s · i18n %s · font %s · 404 %s · biome %s · vitest %s' "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest")
-          # The counters above say a run is NOISY. They never say what BROKE —
-          # that used to cost a round trip of per-job log-diving before anything
-          # could be fixed, and with the e2e fail-fast layers removed a red run
-          # now carries the whole failure set, so it is worth reading. Same logs,
-          # already downloaded.
-          RED=''
-          for pair in "e2e:${R_E2E:-}" "test:${R_TEST:-}" "typecheck:${R_TYPE:-}" \
-                      "eslint:${R_LINT:-}" "biome:${R_BIOME:-}"; do
-            [ "${pair#*:}" = success ] || RED="${RED:+$RED,}${pair%%:*}"
-          done
-          DIGEST=''
-          echo '[]' > "$tmp/failures.json"
-          if [ -f scripts/ci/failure-digest.mjs ]; then
-            DIGEST=$(node scripts/ci/failure-digest.mjs --dir "$tmp" --red "$RED" 2>/dev/null) || DIGEST=''
-            node scripts/ci/failure-digest.mjs --dir "$tmp" --red "$RED" --json \
-              > "$tmp/failures.json" 2>/dev/null || echo '[]' > "$tmp/failures.json"
-          else
-            echo "::warning::scripts/ci/failure-digest.mjs not on disk — CI report will carry counters but no failure list"
+          # Counters, digest, status line and comment body all come from ONE
+          # tested script now (scripts/ci/report.mjs). What stays here is the
+          # part only a workflow can do: downloading the logs above, and posting
+          # the result below. The composition used to be ~55 lines of grep/awk
+          # here plus ~90 in the two steps after it — untestable, and only
+          # fixable by a merge to main because this tree syncs to the fleet on
+          # merge. See docs/engineering/platform/ppap.md § To CI validation.
+          JOBS="gates=${R_BIOME:-},typecheck=${R_TYPE:-},lint=${R_LINT:-},vitest=${R_TEST:-},e2e=${R_E2E:-}"
+          out="$tmp/report"
+          if ! node scripts/ci/report.mjs --dir "$tmp" --jobs "$JOBS" \
+                 --run-url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
+                 --out-dir "$out"; then
+            echo "::error::scripts/ci/report.mjs failed — the PR would otherwise get a green-looking empty report"
+            exit 1
           fi
-
+          clean=$(jq -r '.clean' "$out/report.json")
+          summary=$(node -e 'const r=require(process.argv[1]);console.log(["flaky","dup_testid","hydration","i18n_missing","font_preload","http_4xx","biome_warnings","vitest_stderr"].map(k=>k+" "+r[k]).join(" · "))' "$out/report.json")
           {
             echo "clean=$clean"
             echo "summary=$summary"
-            # Multiline, so the delimiter form. Random-ish delimiter is
-            # unnecessary here: the digest is markdown the script generated and
-            # can never contain this token.
-            echo "digest<<__CI_DIGEST__"
-            printf '%s\n' "$DIGEST"
-            echo "__CI_DIGEST__"
+            echo "state=$(cat "$out/state.txt")"
+            echo "status=$(cat "$out/status.txt")"
+            echo "logdir=$tmp"
+            # Multiline, so the delimiter form. The body is markdown this script
+            # generated and can never contain the token.
+            echo "comment<<__CI_COMMENT__"
+            cat "$out/comment.md"
+            echo ""
+            echo "__CI_COMMENT__"
           } >> "$GITHUB_OUTPUT"
           mkdir -p ci-noise
-          printf '{"flaky":%s,"dup_testid":%s,"hydration":%s,"i18n_missing":%s,"font_preload":%s,"http_4xx":%s,"biome_warnings":%s,"vitest_stderr":%s,"clean":%s}\n' \
-            "$flaky" "$dup" "$hyd" "$i18n" "$font" "$http404" "$biomew" "$vitest" "$clean" > ci-noise/ci-noise-report.json
-          # Attach the grouped failures to the SAME artifact /fix-ci already
-          # downloads, so its fast path gets the list without a second fetch.
-          if jq --slurpfile f "$tmp/failures.json" '. + {failures: ($f[0] // [])}' \
-               ci-noise/ci-noise-report.json > "$tmp/report.json" 2>/dev/null; then
-            mv "$tmp/report.json" ci-noise/ci-noise-report.json
-          fi
+          cp "$out/report.json" ci-noise/ci-noise-report.json
           cat ci-noise/ci-noise-report.json
           echo "▶ noise: $summary → clean=$clean"
-          echo "▶ digest: $(jq 'length' "$tmp/failures.json" 2>/dev/null || echo '?') root cause(s); red=${RED:-none}"
           exit 0
 
       - name: Upload noise report
@@ -408,32 +387,31 @@ jobs:
           R_LINT: ${{ needs.checks.outputs.lint }}
           R_TEST: ${{ needs.checks.outputs.test }}
           R_E2E: ${{ needs.checks.outputs.e2e }}
+          REPORT_STATE: ${{ steps.noise.outputs.state }}
+          REPORT_STATUS: ${{ steps.noise.outputs.status }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          tag() {
-            case "$1" in
-              success) echo "✓" ;;
-              *)       echo "✗" ;;
-            esac
-          }
-          # EVERY job in the ci-checks graph must be named in this AND. A job that
-          # runs but is missing from it is a job whose failure the PR reports as
-          # green. Conversely, naming an output that erp-ci-checks.yml does NOT expose
-          # resolves to an empty string and pins STATE to failure forever — so a
-          # gate folded into an existing job (the hook + terraform gates live on
-          # `biome`, with the other repo-wide checks) must NOT get an R_* of its
-          # own; it is covered by its host job's result.
-          if [ "$R_BIOME" = "success" ] && [ "$R_TYPE" = "success" ] && [ "$R_LINT" = "success" ] && [ "$R_TEST" = "success" ] && [ "$R_E2E" = "success" ]; then
-            STATE="success"
-          else
-            STATE="failure"
+          # STATE and DESC are computed by scripts/ci/report.mjs (isGreen /
+          # statusLine) and read back here. The rule they enforce is unchanged and
+          # still load-bearing: EVERY job in the ci-checks graph must be in the
+          # AND, because a job that runs but is missing from it is a job whose
+          # failure the PR reports as green — and a job result that is absent
+          # counts as failure, never as success. That is now covered by a test per
+          # job plus the missing-key case, instead of a conjunction nobody could
+          # exercise.
+          #
+          # The other half of the rule still stands and cannot be tested away:
+          # naming an output erp-ci-checks.yml does NOT expose resolves to an empty
+          # string and pins STATE to failure forever, so a gate folded into an
+          # existing job must NOT get an R_* of its own. It is covered by its host
+          # job's result, and named individually in the report's Repo-gates list.
+          STATE="${REPORT_STATE:-failure}"
+          DESC="${REPORT_STATUS:-}"
+          if [ -z "$DESC" ]; then
+            echo "::error::report.mjs produced no status line — refusing to post an empty CI status"
+            exit 1
           fi
-          # Statuses description max 140 chars. Compact per-job summary fits
-          # easily and gives reviewers an at-a-glance view of which job(s)
-          # broke without clicking through to ppap.
-          DESC=$(printf 'biome %s · typecheck %s · lint %s · vitest %s · e2e %s' \
-            "$(tag "$R_BIOME")" "$(tag "$R_TYPE")" "$(tag "$R_LINT")" "$(tag "$R_TEST")" "$(tag "$R_E2E")")
           # Exposed for the Telegram notify step below — computed before the
           # head_sha guard so manual workflow_dispatch re-runs still notify.
           echo "state=$STATE" >> "$GITHUB_OUTPUT"
@@ -468,8 +446,13 @@ jobs:
           STATE: ${{ steps.status.outputs.state }}
           NOISE_CLEAN: ${{ steps.noise.outputs.clean }}
           NOISE_SUMMARY: ${{ steps.noise.outputs.summary }}
-          DIGEST: ${{ steps.noise.outputs.digest }}
           DESC: ${{ steps.status.outputs.desc }}
+          LOGDIR: ${{ steps.noise.outputs.logdir }}
+          R_BIOME: ${{ needs.checks.outputs.biome }}
+          R_TYPE: ${{ needs.checks.outputs.typecheck }}
+          R_LINT: ${{ needs.checks.outputs.lint }}
+          R_TEST: ${{ needs.checks.outputs.test }}
+          R_E2E: ${{ needs.checks.outputs.e2e }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set +e -o pipefail
@@ -558,24 +541,24 @@ jobs:
             fi
           fi
 
-          # Sticky comment (upsert by hidden marker) — one comment per PR, refreshed each run.
-          BODY=$(cat <<EOF
-          <!-- ci-report -->
+          # Sticky comment (upsert by the hidden marker) — one comment per PR,
+          # refreshed each run. The body is rebuilt by the same tested script that
+          # produced the status, now that the ready/merge outcome is known; the
+          # marker it emits is what keeps this an edit rather than a new comment
+          # every run.
+          BODY=$(node scripts/ci/report.mjs --dir "$LOGDIR" \
+            --jobs "gates=${R_BIOME:-},typecheck=${R_TYPE:-},lint=${R_LINT:-},vitest=${R_TEST:-},e2e=${R_E2E:-}" \
+            --run-url "$RUN_URL" --ready-line "$READY_LINE" --merge-line "$MERGE_LINE" \
+            --out-dir "$LOGDIR/report2" --print)
+          if [ -z "$BODY" ]; then
+            echo "::warning::report.mjs produced no comment body — falling back to the status line"
+            BODY="<!-- ci-report -->
           ## CI report — $( [ "$STATE" = "success" ] && echo "✅ green" || echo "❌ failing" )
 
           $DESC
 
-          **Noise:** $NOISE_SUMMARY → $( [ "$NOISE_CLEAN" = "true" ] && echo "clean ✓" || echo "not clean ✗" )
-
-          $DIGEST
-
-          $READY_LINE
-
-          $MERGE_LINE
-
-          [View CI run]($RUN_URL)
-          EOF
-          )
+          [View CI run]($RUN_URL)"
+          fi
           CID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
             --jq '[.[] | select(.body|startswith("<!-- ci-report -->"))][0].id' 2>/dev/null)
           if [ -n "$CID" ] && [ "$CID" != "null" ]; then

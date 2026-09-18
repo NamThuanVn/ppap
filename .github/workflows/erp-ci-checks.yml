@@ -345,6 +345,82 @@ jobs:
         if: ${{ !cancelled() }}
         run: bash scripts/gate/ci/terraform.sh
 
+      # ── Gates that ran in `audit.sh` and NOWHERE in CI until #3709 ──────────
+      #
+      # Each was local-only: enforced on every agent turn, invisible to a PR, and
+      # gone the moment someone did not run it locally. That is precisely how
+      # #3125 landed (see the scripts-index note above), and it had already
+      # happened a second time with root ESLint — 575 errors piled up unseen.
+      # All seven are green and cost ~10s together, measured, against a ~20-minute
+      # round trip to discover afterwards that main went stale.
+
+      # Every executable lives in scripts/, in the folder matching its concern,
+      # inside the closed folder set, with a mirrored test under scripts/tests/.
+      # CLAUDE.md calls this rule load-bearing and names this gate as what
+      # enforces it. Nothing else does: a script dropped into .claude/ or
+      # .github/ would merge and become the precedent for the next one.
+      - name: Repo layout (scripts/ folder set, lib boundary, mirrored tests)
+        if: ${{ !cancelled() }}
+        run: bash scripts/gate/shape/layout.sh
+
+      # A BA archive sweep, or a regenerated hub / folder-index block, must never
+      # ride along in a branch. The block is one row per item in a file every item
+      # shares, so two lanes inserting rows conflict INSIDE it. PR #2773 was
+      # docs-only across 67 files and its single such conflict left GitHub unable
+      # to build refs/pull/2773/merge — every job died at checkout with exit 128.
+      # `main` regenerates these blocks after the merge; a branch never should.
+      - name: No BA archive sweep or regenerated block in a branch
+        if: ${{ !cancelled() }}
+        run: bash scripts/gate/data/ba-item-scope.sh
+
+      # Every workspace (apis/*, apps/*, packages/*, monolith/*) ships a
+      # README.md — .claude/rules.md § Documentation.
+      - name: Every workspace has a README
+        if: ${{ !cancelled() }}
+        run: bash scripts/gate/shape/readmes.sh
+
+      # shellcheck over scripts/** — ~80 files of bash that gate every turn,
+      # choose which e2e specs CI runs, and reset databases. The class of bug it
+      # catches is the class that hurts here: an unquoted expansion that
+      # word-splits a path, an unchecked `cd` that leaves the rest of the script
+      # running in the wrong directory, an `rm -rf "$a/$b"` that becomes `rm -rf /`
+      # when a variable is empty.
+      - name: Shell scripts pass shellcheck
+        if: ${{ !cancelled() }}
+        run: bash scripts/gate/shape/shell.sh
+
+      # A workflow can be flawless YAML and still be rejected wholesale by
+      # GitHub — `runner` used in a job-level `env:` took out two agent workflows
+      # for two hours in 0s-failing sync pushes, while the controller kept
+      # reporting success. This tree is the source of truth that auto-syncs to the
+      # satellite ppap repos on merge, so a broken workflow here cannot be fixed
+      # by the PR that broke it.
+      - name: Workflows are valid, not merely parseable
+        if: ${{ !cancelled() }}
+        run: bash scripts/gate/ci/workflows.sh
+
+      # Dead code — unused files, exports and dependencies. Needs the whole module
+      # graph, which is why it is never change-scoped in the per-turn hook.
+      - name: Dead code (knip)
+        if: ${{ !cancelled() }}
+        run: pnpm dead-code
+
+      # Copy-paste detection. Duplication is never introduced-and-must-block
+      # within a single turn, so it stays out of the per-turn hook — but a PR is
+      # exactly where it should be visible.
+      - name: Duplicate code (jscpd)
+        if: ${{ !cancelled() }}
+        run: pnpm duplicates
+
+      # ...and the gate that keeps the two lists in step. `audit.sh` owns the gate
+      # list; this workflow re-enumerates it BY HAND. Nothing compared them, which
+      # is how the seven above drifted out of CI unnoticed. This fails when a gate
+      # in audit.sh has neither a step here nor a documented exception — so the
+      # eighth cannot go missing the same way.
+      - name: Every audit.sh gate also runs in CI
+        if: ${{ !cancelled() }}
+        run: node scripts/gate/ci/audit-parity.mjs
+
   # Typecheck, split across parallel legs — same reasoning as the Vitest matrix
   # above (389s as one job, and the dominant cost on any PR whose e2e is
   # skipped).
