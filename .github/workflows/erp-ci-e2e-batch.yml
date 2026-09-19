@@ -334,9 +334,18 @@ jobs:
           }
           attempt() {
             bash scripts/ci/e2e/ci-boot.sh || return 70
+            # `line,json`, and ON THE COMMAND LINE rather than in
+            # packages/e2e-kit/src/config.ts: `--reporter` OVERRIDES the config's
+            # value outright, so a reporter added there would be silently
+            # discarded here and `results.json` would never exist — the whole
+            # rich-payload path would degrade to log-scraping with no error to
+            # notice. It also belongs here on the merits: only CI consumes the
+            # json report, and a local run should not litter the tree with one.
+            # `line` stays first so the job log reads exactly as it did.
             # shellcheck disable=SC2086  # E2E_TARGETS is an intentional path list
             PLAYWRIGHT_BASE_URL="http://localhost:$(cat .wrangler/e2e-port)" \
-              pnpm exec playwright test --reporter=line --shard="$SHARD/$TOTAL" $E2E_TARGETS
+            PLAYWRIGHT_JSON_OUTPUT_NAME=test-results/results.json \
+              pnpm exec playwright test --reporter=line,json --shard="$SHARD/$TOTAL" $E2E_TARGETS
           }
           rc=0
           attempt || rc=$?
@@ -388,6 +397,37 @@ jobs:
           else
             echo "present=false" >>"$GITHUB_OUTPUT"
           fi
+
+      # The SAME failures, in a form the agent driving the PR can act on
+      # directly. The artifact below is for a human opening the run; this is for
+      # the report job, which folds it into the PR comment so that a failure can
+      # be diagnosed WITHOUT downloading any artifact at all.
+      #
+      # It has to happen here, on the shard, because this is the only place the
+      # two inputs exist together: Playwright's json report (per-attempt status,
+      # so a flake is distinguishable from a break) and the `error-context.md`
+      # page snapshot it points at. Both are local files that never reach the
+      # job log.
+      #
+      # Tiny (a few KB), and `|| true` throughout: a shard that cannot summarise
+      # itself still reports its real verdict through the job conclusion.
+      - name: Summarise failures for the PR comment
+        if: ${{ failure() || steps.pw_artifacts.outputs.present == 'true' }}
+        continue-on-error: true
+        run: |
+          node scripts/ci/payload.mjs \
+            --results test-results/results.json \
+            --out "ci-sites-${{ matrix.shard }}.json" || true
+          [ -f "ci-sites-${{ matrix.shard }}.json" ] || echo '[]' > "ci-sites-${{ matrix.shard }}.json"
+
+      - name: Upload failure summary
+        if: ${{ failure() || steps.pw_artifacts.outputs.present == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-sites-${{ matrix.shard }}
+          path: ci-sites-${{ matrix.shard }}.json
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Upload Playwright report
         if: ${{ failure() || steps.pw_artifacts.outputs.present == 'true' }}

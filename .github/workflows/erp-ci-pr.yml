@@ -194,6 +194,94 @@ jobs:
     secrets:
       PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
 
+  # Publishes each check job's failures to the PR AS THAT JOB FINISHES, instead
+  # of making the agent driving the PR wait for `report` below.
+  #
+  # `report` needs: [checks], so it cannot exist until every job has finished.
+  # Measured on a real ~10.5-minute run: typecheck was final 7m51s before the
+  # report comment appeared, vitest/gates/lint 5m40s before. All of that was
+  # dead time for whoever was driving the PR — and the agent fleet spends it on
+  # every attempt of every item.
+  #
+  # Deliberately a WATCHER with no `needs:`, rather than a publish step inside
+  # each job. A per-job step would have to capture that job's own stdout
+  # (`cmd | tee log`), and Actions' default shell is `bash -e {0}` with pipefail
+  # OFF — so every such call site that forgot `set -o pipefail` would silently
+  # turn a failing job green. A hole in the gate is a far worse outcome than a
+  # slow round trip, so nothing about the existing jobs is touched: this reads
+  # their logs through the same API the report job already uses.
+  #
+  # Never gates anything. It has no dependants, always exits 0, and its comments
+  # are deleted by `report`. If it dies, CI behaves exactly as it did before.
+  progress:
+    name: Publish CI progress
+    if: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && !cancelled() }}
+    runs-on: ubuntu-latest
+    # Comfortably past the e2e leg's own ceiling, so the watcher is still alive
+    # to report the last job; it exits on its own once every watched job is done.
+    timeout-minutes: 45
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Checkout ppap (for scripts/ci)
+        uses: actions/checkout@v5
+
+      - name: Check out erp-namthuan scripts
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('refs/pull/{0}/merge', github.event.client_payload.pr_number || inputs.pr_number) || 'main' }}
+          token: ${{ env.RESOLVED_PAT }}
+          path: erp
+          sparse-checkout: |
+            scripts/ci
+          sparse-checkout-cone-mode: false
+
+      - name: Watch jobs and publish parts
+        continue-on-error: true
+        env:
+          # Two tokens by role, same split the report job uses: the run's own
+          # token reads this repo's job logs, the pooled PAT writes the comment
+          # on the private repo.
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          SELF_TOKEN: ${{ github.token }}
+          PRIVATE_REPO: ${{ env.PRIVATE_REPO }}
+        run: |
+          node erp/scripts/ci/progress.mjs \
+            --pr "${{ github.event.client_payload.pr_number || inputs.pr_number }}" \
+            --sha "${{ github.event.client_payload.head_sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --repo "${{ github.repository }}" \
+            --private-repo "${{ env.PRIVATE_REPO }}"
+
   # Posts the final commit-status update on the PR's head SHA, replacing the
   # `pending` status that pr-triage-and-ci-dispatch.yml created. `if: !cancelled()` so
   # failures still get a final pingback, but runs cancelled by concurrency
@@ -392,16 +480,37 @@ jobs:
           # here plus ~90 in the two steps after it — untestable, and only
           # fixable by a merge to main because this tree syncs to the fleet on
           # merge. See docs/engineering/platform/ppap.md § To CI validation.
+          # The RICH e2e payload. Each batch shard wrote a `ci-sites` artifact
+          # from Playwright's json report — per-attempt status (so a flake is
+          # distinguishable from a break) and the `error-context.md` page
+          # snapshot, neither of which survives into the text log. Pulling them
+          # here is what lets the PR comment replace an artifact download.
+          # Entirely best-effort: no sites simply means a leaner comment.
+          sitesdir="$tmp/sites"; mkdir -p "$sitesdir"
+          SITES_FLAG=""
+          if [ -n "${BATCH_RUNS:-}" ] && [ "$BATCH_RUNS" != "[]" ]; then
+            while IFS=$'\t' read -r brepo brun; do
+              [ -n "$brepo" ] && [ -n "$brun" ] || continue
+              GH_TOKEN="$POOL_PAT" gh run download "$brun" -R "$brepo" -p 'ci-sites-*' \
+                -D "$sitesdir/$brun" >/dev/null 2>&1 || true
+            done < <(printf '%s' "$BATCH_RUNS" | jq -r '.[]? | [.repo, (.run_id|tostring)] | @tsv' 2>/dev/null)
+            if node scripts/ci/payload.mjs --merge "$sitesdir" --out "$tmp/sites.json" 2>/dev/null; then
+              [ -s "$tmp/sites.json" ] && SITES_FLAG="--sites $tmp/sites.json"
+            fi
+          fi
+          echo "▶ rich e2e sites: ${SITES_FLAG:-none collected}"
+
           JOBS="gates=${R_BIOME:-},typecheck=${R_TYPE:-},lint=${R_LINT:-},vitest=${R_TEST:-},e2e=${R_E2E:-}"
           out="$tmp/report"
           SCAN_FLAG=""
           [ "$scan_ok" = true ] || SCAN_FLAG="--scan-unavailable"
-          if ! node scripts/ci/report.mjs --dir "$tmp" --jobs "$JOBS" $SCAN_FLAG \
+          if ! node scripts/ci/report.mjs --dir "$tmp" --jobs "$JOBS" $SCAN_FLAG $SITES_FLAG \
                  --run-url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
                  --out-dir "$out"; then
             echo "::error::scripts/ci/report.mjs failed — the PR would otherwise get a green-looking empty report"
             exit 1
           fi
+          [ -s "$tmp/sites.json" ] && cp "$tmp/sites.json" "$RUNNER_TEMP/ci-sites.json" || true
           clean=$(jq -r '.clean' "$out/report.json")
           summary=$(node -e 'const r=require(process.argv[1]);console.log(["flaky","dup_testid","hydration","i18n_missing","font_preload","http_4xx","biome_warnings","vitest_stderr"].map(k=>k+" "+r[k]).join(" · "))' "$out/report.json")
           {
@@ -606,7 +715,9 @@ jobs:
           # every run.
           SCAN_FLAG=""
           [ "${NOISE_SCAN_OK:-true}" = true ] || SCAN_FLAG="--scan-unavailable"
-          BODY=$(node scripts/ci/report.mjs --dir "$LOGDIR" $SCAN_FLAG \
+          SITES_FLAG=""
+          [ -s "$RUNNER_TEMP/ci-sites.json" ] && SITES_FLAG="--sites $RUNNER_TEMP/ci-sites.json"
+          BODY=$(node scripts/ci/report.mjs --dir "$LOGDIR" $SCAN_FLAG $SITES_FLAG \
             --jobs "gates=${R_BIOME:-},typecheck=${R_TYPE:-},lint=${R_LINT:-},vitest=${R_TEST:-},e2e=${R_E2E:-}" \
             --run-url "$RUN_URL" --ready-line "$READY_LINE" --merge-line "$MERGE_LINE" \
             --out-dir "$LOGDIR/report2" --print)
@@ -630,5 +741,10 @@ jobs:
               && echo "✓ Posted CI report comment on PR #$PR_NUMBER" \
               || echo "::warning::could not post CI report comment (PAT missing issues:write?)"
           fi
+          # The consolidated comment is up, so the per-job progress comments have
+          # served their purpose — remove them and leave the PR with exactly one
+          # CI comment, as it looked before progressive reporting existed.
+          # Best-effort by construction: a part we cannot delete is cosmetic.
+          node scripts/ci/parts.mjs clear --pr "$PR_NUMBER" --repo "$REPO" 2>/dev/null || true
           echo "▶ $MERGE_LINE"
           exit 0
