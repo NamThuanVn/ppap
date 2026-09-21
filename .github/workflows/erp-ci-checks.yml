@@ -13,7 +13,7 @@ on:
         type: string
         required: true
       e2e_shards:
-        description: 'DESIRED number of parallel Playwright shards. The effective count is min(this, available capacity) — see the e2e job. 48 = 6 workers x 8 shards at the default WORKER_SLOTS. Both PR CI and the deploy gate inherit it.'
+        description: 'DESIRED number of parallel Playwright shards. The effective count is min(this, available capacity) — see the e2e job. 48 = 4 workers x 12 shards at the default WORKER_SLOTS on an idle fleet, more workers with smaller batches on a busy one. Both PR CI and the deploy gate inherit it.'
         type: number
         default: 48
       fleet:
@@ -1322,12 +1322,18 @@ jobs:
           # With no recruitable worker the coordinator dispatches to its OWN
           # repo rather than running inline, so there is never a local matrix.
           COORD_FALLBACK_SLOTS: '14'
-          # 8 per worker: a worker also runs its own `plan` job, so this sits at
-          # 9 of the org's 20 concurrent jobs — loose enough to leave room for a
-          # second PR's batch. Paired with the 48-shard default it fans out over
-          # exactly six workers — for PR CI and the production deploy gate alike,
-          # which scripts/gate/ci/e2e-shards.mjs holds in step.
-          WORKER_SLOTS: '8'
+          # The per-host CAP, applied on top of what the host actually has free
+          # (fanout counts in-flight JOBS now, so a host running someone else's
+          # batch lends its remainder rather than being skipped). 12 shards plus
+          # the worker's own `plan` job sits at 13 of the org's 20, so one PR
+          # still cannot monopolise a host. Paired with the 48-shard default it
+          # fans out over four workers — for PR CI and the production deploy
+          # gate alike, which scripts/gate/ci/e2e-shards.mjs holds in step.
+          #
+          # It was 8 while the probe was a binary busy check: every host was
+          # either idle or skipped, so 8 was the whole reservation policy. With
+          # real occupancy measured, that reservation is automatic.
+          WORKER_SLOTS: '12'
         run: |
           set -euo pipefail
           if [ ! -f scripts/ci/fanout.mjs ]; then

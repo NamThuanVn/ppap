@@ -164,7 +164,7 @@ jobs:
       # private dispatcher (which owns PPAP_CI_REPOS). Absent on a manual
       # workflow_dispatch → no fan-out, every shard stays here.
       # A repository_dispatch carries the list; a manual run has to be given it,
-      # otherwise fanout finds no pool, logs "no idle worker" and collapses every
+      # otherwise fanout finds no pool, logs "no worker with room" and collapses every
       # shard onto this one repo (up to COORD_FALLBACK_SLOTS). That made manual
       # main smoke tests unrepresentative of real PR CI — and unusable for
       # measuring a shard-count change.
