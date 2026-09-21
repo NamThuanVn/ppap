@@ -190,9 +190,8 @@ jobs:
         run: terraform init
 
       # apply BEFORE wrangler deploy, always. The worker's Terraform-managed
-      # secrets (CONTACT_WEBHOOK_URL, CONTACT_TELEGRAM_BOT_TOKEN,
-      # ERP_CLIENT_SECRET) must exist on the account before the script that
-      # reads them is uploaded.
+      # secrets (CONTACT_WEBHOOK_URL, ERP_CLIENT_SECRET) must exist on the
+      # account before the script that reads them is uploaded.
       - name: Terraform Apply
         working-directory: terraform
         run: terraform apply -auto-approve -no-color
@@ -217,13 +216,6 @@ jobs:
           # missing output yields "" rather than the string "null".
           STORE_ID="$(jq -r '.secrets_store_id.value // empty' /tmp/tf-outputs.json)"
           SECRET_NAME="$(jq -r '.contact_webhook_secret_name.value // empty' /tmp/tf-outputs.json)"
-          # Telegram is the decided delivery target (#7). The bot TOKEN is a
-          # Secrets Store secret; the chat and thread ids are plain worker vars
-          # (identifiers, not credentials), so they are not masked. All three
-          # empty is valid — the route degrades to the webhook, then to logging.
-          TG_SECRET_NAME="$(jq -r '.telegram_secret_name.value // empty' /tmp/tf-outputs.json)"
-          TG_CHAT_ID="$(jq -r '.telegram_chat_id.value // empty' /tmp/tf-outputs.json)"
-          TG_THREAD_ID="$(jq -r '.telegram_thread_id.value // empty' /tmp/tf-outputs.json)"
           # ERP intake (system of record for enquiries + CV applications). The
           # client SECRET is a Secrets Store secret and never leaves the store;
           # the gateway URL and client id are identifiers, so not masked. All
@@ -254,9 +246,6 @@ jobs:
             echo "SITE_HOSTNAME=$HOST"
             echo "SECRETS_STORE_ID=$STORE_ID"
             echo "CONTACT_WEBHOOK_SECRET_NAME=$SECRET_NAME"
-            echo "CONTACT_TELEGRAM_SECRET_NAME=$TG_SECRET_NAME"
-            echo "CONTACT_TELEGRAM_CHAT_ID=$TG_CHAT_ID"
-            echo "CONTACT_TELEGRAM_THREAD_ID=$TG_THREAD_ID"
             echo "ERP_SECRET_NAME=$ERP_SECRET_NAME"
             echo "ERP_GATEWAY_URL=$ERP_GATEWAY_URL"
             echo "ERP_CLIENT_ID=$ERP_CLIENT_ID"
@@ -267,9 +256,6 @@ jobs:
           # a success state. (Email/Resend is not Terraform-managed yet, so it is
           # not visible here.)
           ANY=""
-          if [ -n "$TG_SECRET_NAME" ] && [ -n "$TG_CHAT_ID" ]; then
-            echo "enquiries → Telegram chat $TG_CHAT_ID${TG_THREAD_ID:+ thread $TG_THREAD_ID}"; ANY=1
-          fi
           if [ -n "$SECRET_NAME" ]; then
             echo "enquiries → CONTACT_WEBHOOK_URL (bound from the Secrets Store)"; ANY=1
           fi
@@ -277,7 +263,7 @@ jobs:
             echo "enquiries + CVs → ERP at $ERP_GATEWAY_URL (client $ERP_CLIENT_ID)"; ANY=1
           fi
           if [ -z "$ANY" ]; then
-            echo "::warning::no enquiry delivery target configured for this environment — POST /api/contact will LOG and return delivered:false while still showing the visitor success. Set telegram_bot_token + telegram_chat_id, erp_gateway_url + erp_client_id + erp_client_secret, or contact_webhook_url on the ${TF_WORKSPACE} workspace."
+            echo "::warning::no enquiry delivery target configured for this environment — POST /api/contact will LOG and return delivered:false while still showing the visitor success. Set erp_gateway_url + erp_client_id + erp_client_secret, or contact_webhook_url, on the ${TF_WORKSPACE} workspace."
           fi
           echo "host=$HOST" >> "$GITHUB_OUTPUT"
           echo "deploying to $HOST"
