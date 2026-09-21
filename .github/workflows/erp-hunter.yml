@@ -427,6 +427,103 @@ jobs:
 
           Biome's own fixer produced every edit here, so the diff is as safe as running \`pnpm biome check --write\` locally. The remaining categories (flaky, dup-testid, hydration, i18n, font, 404, vitest stderr) are judgement calls and are tracked in the sticky [\`ci-noise\`](https://github.com/NamThuanVn/erp-namthuan/issues?q=is%3Aissue+is%3Aopen+label%3Aci-noise) issue instead."
 
+      # ── Hunt, then KILL ──────────────────────────────────────────────
+      # The sweep found the ambient flakes and ranked them. Until now that is
+      # where it stopped: one sticky issue, owned by nobody, and only biome
+      # warnings ever actually fixed. Every other finding waited for a human to
+      # read the inventory and volunteer, which measurably did not happen —
+      # sites sat there for weeks while each new PR met them in turn.
+      #
+      # The hunt still does not FIX a flake, and must not: which of two
+      # responsive branches owns a testid, whether a wait is racing a cache
+      # hit, is a judgement call, and a codemod guessing would land
+      # unreviewable diffs across 400 specs. But this repo already runs a fleet
+      # that takes a Todo item and drives it to a merged fix end to end
+      # (/clear-todo → /solve-issue). The missing link was never the fixing; it
+      # was that nothing turned a finding into a claimable item. This is that
+      # link.
+      #
+      # scripts/ci/noise-work.mjs DECIDES (ambient-only, capped, idempotent,
+      # self-closing — see its header); this step only does the I/O, exactly
+      # the same split as the sticky issue above.
+      - name: File the ambient flakes as claimable work
+        if: ${{ always() && steps.scan.conclusion == 'success' && !inputs.dry_run }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DAYS: ${{ inputs.days || '7' }}
+        run: |
+          set -uo pipefail
+          REPO=NamThuanVn/erp-namthuan
+          # org board "ERP Namthuan" → github.com/orgs/NamThuanVn/projects/1.
+          # Same ids scripts/ba/intake/create-issues.mjs uses; Status=Todo is
+          # what the agent fleet's claim sweep keys on.
+          PROJECT_ID=PVT_kwDOEFPEIM4BYI8w
+          STATUS_FIELD_ID=PVTSSF_lADOEFPEIM4BYI8wzhTQ1-Q
+          TODO_OPTION_ID=f75ad846
+
+          # The label is how tomorrow's sweep finds its own issues again, so it
+          # has to exist before the first one is filed.
+          gh label create ci-flake --repo "$REPO" --color B60205 \
+            --description "Ambient CI flake, filed by the daily fleet sweep" >/dev/null 2>&1 || true
+
+          gh issue list --repo "$REPO" --label ci-flake --state open --limit 100 \
+            --json number,title,body > open.json 2>/dev/null || echo '[]' > open.json
+
+          PLAN=$(node scripts/ci/noise-work.mjs plan \
+                   --report noise/ci-noise-fleet.json --open open.json \
+                   --run-url "$RUN_URL" --days "$DAYS") || PLAN=''
+          if [ -z "$PLAN" ]; then
+            echo "::warning::noise-work planner failed — filing nothing this sweep"
+            exit 0
+          fi
+
+          # Close first: an item whose site has stopped appearing is DONE, and
+          # saying so before opening new ones keeps the board honest even if
+          # the opens below hit a rate limit.
+          printf '%s' "$PLAN" | jq -r '.close[]' | while read -r N; do
+            [ -n "$N" ] || continue
+            jq -n --arg b "✅ The fleet sweep no longer sees this site — closing. It reopens automatically if it comes back. ([sweep]($RUN_URL))" \
+              '{body: $b}' | gh api -X POST "repos/$REPO/issues/$N/comments" --input - >/dev/null 2>&1 || true
+            jq -n '{state: "closed", state_reason: "completed"}' \
+              | gh api -X PATCH "repos/$REPO/issues/$N" --input - >/dev/null 2>&1 \
+              && echo "killed: closed #$N"
+          done
+
+          COUNT=$(printf '%s' "$PLAN" | jq '.file | length')
+          HELD=$(printf '%s' "$PLAN" | jq -r '.held | join(", ")')
+          [ -n "$HELD" ] && echo "::notice::holding until tomorrow (per-sweep cap): $HELD"
+
+          for i in $(seq 0 $((COUNT - 1))); do
+            TITLE=$(printf '%s' "$PLAN" | jq -r ".file[$i].title")
+            printf '%s' "$PLAN" | jq -r ".file[$i].body" > body.md
+            NODE=$(jq -n --arg t "$TITLE" --rawfile b body.md \
+                     '{title: $t, body: $b, labels: ["ci-flake", "bug", "scope:infra"]}' \
+                     | gh api -X POST "repos/$REPO/issues" --input - --jq '.node_id' 2>/dev/null) || NODE=''
+            if [ -z "$NODE" ]; then
+              echo "::warning::could not file $TITLE"
+              continue
+            fi
+            echo "hunting: filed $TITLE"
+            # Onto the board at Todo, which is what makes it claimable by the
+            # fleet rather than another line nobody owns. Best-effort: a board
+            # write failing must not undo the issue we just filed.
+            ITEM=$(gh api graphql \
+                     -f 'query=mutation($p:ID!,$c:ID!){addProjectV2ItemById(input:{projectId:$p,contentId:$c}){item{id}}}' \
+                     -f "p=$PROJECT_ID" -f "c=$NODE" \
+                     --jq '.data.addProjectV2ItemById.item.id' 2>/dev/null) || ITEM=''
+            if [ -n "$ITEM" ]; then
+              gh api graphql \
+                -f 'query=mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$o}}){projectV2Item{id}}}' \
+                -f "p=$PROJECT_ID" -f "i=$ITEM" -f "f=$STATUS_FIELD_ID" -f "o=$TODO_OPTION_ID" \
+                >/dev/null 2>&1 && echo "  → Project #1 (Todo) — the fleet can claim it"
+            else
+              echo "::warning::filed $TITLE but could not add it to Project #1 (pooled PAT missing org Projects R/W?)"
+            fi
+          done
+          exit 0
+
       # The sticky inventory. ONE issue, refreshed in place — a new issue per day
       # would bury the trend under 30 duplicates, and the trend (which spec, how
       # many distinct runs) is the entire product. Closed automatically the day

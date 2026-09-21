@@ -117,20 +117,27 @@ jobs:
       # Re-post the pending CI status so its Details link points at THIS run
       # instead of the generic /actions list the dispatcher had to use
       # (repository_dispatch is fire-and-forget — only the run knows its id).
+      # `status_context` lets ONE pull request carry SEVERAL independent CI
+      # runs. A commit status is keyed by its context, so N runs all posting
+      # `CI` overwrite each other and the PR shows one ambiguous check for N
+      # runs — which is exactly what a 5-way verification fan-out looked like
+      # before this. A dispatcher that sends no context keeps plain `CI`, so
+      # every ordinary PR is untouched.
       - name: Point CI status at this run
         if: github.event.client_payload.head_sha
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          STATUS_CONTEXT: ${{ github.event.client_payload.status_context || 'CI' }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           gh api repos/${{ env.PRIVATE_REPO }}/statuses/"$HEAD_SHA" \
             -f state=pending \
-            -f context=CI \
+            -f context="$STATUS_CONTEXT" \
             -f description="Running on ppap" \
             -f target_url="$RUN_URL"
-          echo "✓ Pending CI status now targets $RUN_URL"
+          echo "✓ Pending $STATUS_CONTEXT status now targets $RUN_URL"
 
   # Run the 4-job CI graph. erp-ci-checks.yml lives in the same repo and exposes
   # each job's `result` as a workflow_call output, so the report job below
@@ -548,6 +555,9 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          # Must match the context the pending status used, or the run leaves a
+          # pending check behind forever and posts its verdict under a second one.
+          STATUS_CONTEXT: ${{ github.event.client_payload.status_context || 'CI' }}
           R_BIOME: ${{ needs.checks.outputs.biome }}
           R_TYPE: ${{ needs.checks.outputs.typecheck }}
           R_LINT: ${{ needs.checks.outputs.lint }}
@@ -588,10 +598,10 @@ jobs:
           fi
           gh api repos/${{ env.PRIVATE_REPO }}/statuses/"$HEAD_SHA" \
             -f state="$STATE" \
-            -f context=CI \
+            -f context="${STATUS_CONTEXT:-CI}" \
             -f description="$DESC" \
             -f target_url="$RUN_URL"
-          echo "✓ Updated CI status on $HEAD_SHA — $STATE ($DESC)"
+          echo "✓ Updated ${STATUS_CONTEXT:-CI} status on $HEAD_SHA — $STATE ($DESC)"
 
       # Post/refresh a sticky CI report comment on the source PR; flip ANY draft
       # ready-for-review once CI is green + noise-clean; and — for PRs labeled
