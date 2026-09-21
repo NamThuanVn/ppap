@@ -39,13 +39,12 @@ name: ERP · Fleet · Warm-up scheduler
 # ceiling for it.
 
 on:
-  schedule:
-    # Hourly, on the half hour to stay clear of the :00 cron stampede — the same
-    # slot the per-host crons used to occupy, now for one run instead of
-    # seventeen. EXPECT IT LATE: Actions queues a schedule and commonly starts it
-    # minutes after its cron time. Nothing here is time-critical; an hour that
-    # slips just probes an hour later.
-    - cron: '30 * * * *'
+  # No `schedule:`. The hourly clock moved OUT of GitHub — it delayed the
+  # schedule EVENT at its own scheduler and dropped ticks it could not place.
+  # erp-heartbeat.yml now dispatches this workflow when its last run is over an
+  # hour old, driven by a Cloudflare cron on the ERP's service-utilities worker.
+  # See erp-heartbeat.yml's header, and `/settings/cron` in the ERP for the
+  # on/off switch.
   workflow_dispatch:
     inputs:
       target:

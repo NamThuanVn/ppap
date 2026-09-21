@@ -25,7 +25,7 @@ name: ERP · Agent · loop
 #   · by erp-agent-rel-plan.yml after a successful planning pass — the
 #     rel-planning gate below defers lane dispatch to that chain whenever any
 #     open BA leaf still lacks the `rel-planned` marker;
-#   · by the `workflow_run` completion of erp-agent-loop-heartbeat.yml (also in the
+#   · by the `workflow_run` completion of erp-heartbeat.yml (also in the
 #     workflow_run list above) — a rare 15-min backstop for the
 #     controller-self-reclaim gap, kept in its own workflow so it can be toggled
 #     on/off from the Actions UI independently.
@@ -79,14 +79,14 @@ on:
   # lane completion is: an ambulance that dies without a verdict must still
   # re-arm the controller. That cannot loop, because the attempt is charged at
   # DISPATCH (scripts/agent/board/loop/gate.mjs), not at verdict.
-  # "ERP · Agent · loop heartbeat" is the 15-min BACKSTOP (controller-self-reclaim
-  # gap), kept in its own workflow so it can be enabled/disabled from the Actions
-  # UI without touching this controller. It does nothing but complete on
-  # schedule — this workflow_run entry IS how its tick reaches the loop (no
-  # gh-api/dispatch on that side). Its schedule-origin completion is allowed
-  # through the controller `if:` below (unlike clear-todo/rel-plan, which are
-  # gated to repository_dispatch-origin so a one-shot manual run can't start
-  # the loop).
+  # "ERP · Heartbeat" is the 15-min tick, now driven by the ERP's own Cloudflare
+  # cron rather than a GitHub `schedule:` block (GitHub delayed and dropped those
+  # — see that file's header). It fans out to the due scheduled workflows and
+  # then completes; this workflow_run entry IS how its tick reaches the loop (no
+  # gh-api/dispatch on that side). Its workflow_dispatch-origin completion is
+  # allowed through the controller `if:` below by NAME (unlike clear-todo/
+  # rel-plan, which are gated to repository_dispatch-origin so a one-shot manual
+  # run can't start the loop).
   #
   # ⚠ THESE ARE DISPLAY NAMES, NOT FILENAMES. `workflow_run.workflows` matches
   # the `name:` at the top of each workflow — it is the ONE place in this tree
@@ -103,7 +103,7 @@ on:
         'ERP · Agent · clear-todo-issue',
         'ERP · Agent · rel-plan',
         'ERP · Agent · ambulance',
-        'ERP · Agent · loop heartbeat',
+        'ERP · Heartbeat',
       ]
     types: [completed]
   repository_dispatch:
@@ -141,7 +141,7 @@ jobs:
     # (repository_dispatch, workflow_dispatch on THIS workflow) always proceed.
     if: >-
       github.event_name != 'workflow_run' ||
-      github.event.workflow_run.name == 'Agent · loop heartbeat' ||
+      github.event.workflow_run.name == 'ERP · Heartbeat' ||
       github.event.workflow_run.event == 'repository_dispatch'
     runs-on: ubuntu-latest
     # A hung API call must not wedge the loop's concurrency slot for the

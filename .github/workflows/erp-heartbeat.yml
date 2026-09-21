@@ -1,0 +1,172 @@
+name: ERP · Heartbeat
+
+# The fleet's tick. Triggered by the ERP, not by GitHub.
+#
+# WHY THE SCHEDULE LEFT GITHUB. This workflow used to carry `schedule: */15 * * * *`
+# and it did not work. Observed ticks: 00:32, 20:59, 15:19, 07:26, 01:15 — gaps of
+# HOURS against a 15-minute cron. GitHub delays the `schedule` EVENT at its own
+# scheduler, upstream of runner assignment, and drops a tick it cannot place.
+# Moving to the self-hosted `panda` pool did not fix it and could not: `runs-on`
+# only chooses where a job runs once the event has already fired. The previous
+# version of this file said so itself — "if ticks are still missed, the fix is an
+# external trigger, not another runner". This is that external trigger.
+#
+# The clock is now a Cloudflare cron trigger on the ERP's `service-utilities`
+# worker (`apis/utilities/wrangler.jsonc`), which POSTs `workflow_dispatch` here
+# every 15 minutes using a PAT. To turn it on or off, or to see whether it is
+# actually ticking, use `/settings/cron` in the ERP — NOT the Actions UI.
+#
+# WHAT IT DOES. Two things, in this order:
+#
+#   1. Fans out to the scheduled workflows that are due. Both used to carry their
+#      own `schedule:` blocks and lost them for the same reason this one did.
+#      Due-ness is decided by asking GitHub when each last ran, not by wall-clock
+#      arithmetic on this run's start time — a tick that arrives late must not
+#      skip a day, and a re-run must not double-fire.
+#   2. Completes. That completion IS the agent-loop signal: erp-agent-loop.yml
+#      lists this workflow in its `workflow_run` trigger, so no dispatch call is
+#      needed for the loop itself.
+#
+# RUNS ON A HOSTED RUNNER, deliberately. The old file ran on self-hosted `panda`
+# to dodge the dropped-tick problem, and justified that on a PUBLIC repo by
+# having "no checkout, no secrets and `permissions: {}`". Step 1 needs a PAT, so
+# that justification is gone — and the capacity argument is gone too, because the
+# ERP now owns the clock. Back to `ubuntu-latest`.
+
+on:
+  # No `schedule:` — that is the entire point of this file. The ERP's Cloudflare
+  # cron is the only scheduled trigger; `workflow_dispatch` is what it calls, and
+  # what a human uses to force a tick by hand.
+  workflow_dispatch: {}
+
+permissions: read-all
+
+# NEVER cancel a tick in flight. The old file used `cancel-in-progress: true`,
+# which was free when this workflow did nothing but `echo` — the SIGNAL was the
+# completion, and a cancelled run still fires `workflow_run`. It is NOT free now:
+# a superseded tick can be killed between deciding that the hunter is due and
+# dispatching it, silently dropping that day's run.
+concurrency:
+  group: erp-heartbeat
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    name: Fan out to due workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Same inlined PAT pool as every other ppap workflow. scripts/ci/ppap/pat-pool.sh
+      # is the canonical copy — scripts/gate/ci/pat-pool-drift.mjs fails the build
+      # if these diverge.
+      #
+      # Needs Actions WRITE, not just read: the dispatches below are POSTs.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      # Fan out to the workflows whose `schedule:` blocks this file replaced.
+      #
+      # Due-ness is read from GitHub's own run history — "when did this workflow
+      # last start?" — rather than computed from this run's clock. Two reasons:
+      # a tick that arrives late still fires a job that was due (wall-clock
+      # window matching would skip it until tomorrow), and a hand-run tick right
+      # after a scheduled one does not double-fire.
+      #
+      # A failed dispatch does NOT fail the job. This run's COMPLETION is what
+      # re-arms the agent loop, so exiting non-zero here would take the loop down
+      # over an unrelated workflow — the opposite of what a heartbeat is for. A
+      # failure is a ::warning:: and the next tick retries in 15 minutes.
+      - name: Dispatch due workflows
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+
+          # <workflow file>:<minimum minutes between runs>:<extra gh flags>
+          #   erp-fleet-warmup.yml — was `30 * * * *` (hourly)
+          #   erp-hunter.yml       — was `0 19 * * *` (daily 19:00 UTC = 02:00 ICT)
+          #
+          # The interval is a FLOOR, not a slot: at a 15-minute tick the hourly
+          # job lands within 15 min of the hour and the daily one within 15 min
+          # of a day. Neither was ever minute-accurate on GitHub's scheduler
+          # either — both files documented expecting to start late — so this
+          # loses nothing that was real.
+          #
+          # WHY erp-hunter.yml NEEDS `dry_run=false` SPELLED OUT. Under a
+          # `schedule` trigger `inputs.dry_run` is NULL, which is falsy, so the
+          # daily run took the `--apply` branch (erp-hunter.yml says exactly this
+          # at its `Hunt` step). Under `workflow_dispatch` GitHub substitutes the
+          # input's DECLARED DEFAULT instead — and that default is `true`.
+          # Dispatching it bare would therefore turn the hunter into a permanent
+          # no-op: green every day, scanning, reporting, never opening a PR.
+          # Passing the value explicitly is what keeps the behaviour it had on a
+          # schedule. Any future workflow added here needs the same check.
+          DUE_SPEC='erp-fleet-warmup.yml:60:
+          erp-hunter.yml:1440:-f dry_run=false'
+
+          NOW=$(date -u +%s)
+
+          while IFS=: read -r WF MIN_GAP EXTRA; do
+            WF=$(printf '%s' "$WF" | tr -d '[:blank:]')
+            MIN_GAP=$(printf '%s' "$MIN_GAP" | tr -d '[:blank:]')
+            # EXTRA keeps its spaces — it is a flag list, not a single token.
+            EXTRA=$(printf '%s' "${EXTRA:-}" | sed 's/^[[:blank:]]*//; s/[[:blank:]]*$//')
+            [ -n "$WF" ] || continue
+
+            # Most recent run of any status. `created_at` (not `updated_at`):
+            # we care when it STARTED, so a long run cannot look overdue.
+            LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WF}/runs?per_page=1" \
+                     --jq '.workflow_runs[0].created_at // empty' 2>/dev/null) || LAST=''
+
+            if [ -z "$LAST" ]; then
+              echo "$WF — no run history, dispatching"
+            else
+              LAST_EPOCH=$(date -u -d "$LAST" +%s 2>/dev/null || echo 0)
+              AGE_MIN=$(( (NOW - LAST_EPOCH) / 60 ))
+              if [ "$AGE_MIN" -lt "$MIN_GAP" ]; then
+                echo "$WF — last run ${AGE_MIN}m ago (< ${MIN_GAP}m), not due"
+                continue
+              fi
+              echo "$WF — last run ${AGE_MIN}m ago (>= ${MIN_GAP}m), dispatching"
+            fi
+
+            # shellcheck disable=SC2086 — EXTRA is a flag LIST and must word-split.
+            if gh workflow run "$WF" --ref main $EXTRA; then
+              echo "  ✓ dispatched $WF"
+            else
+              echo "::warning::failed to dispatch $WF — the next tick retries in 15 minutes"
+            fi
+          done <<< "$DUE_SPEC"
+
+      # The agent loop's actual signal. erp-agent-loop.yml triggers on this
+      # workflow's `workflow_run: [completed]`, so reaching this step at all is
+      # what re-arms the controller — there is no dispatch call on this side.
+      - name: Tick
+        run: echo "✓ heartbeat tick — agent-loop re-probes on this run's workflow_run completion"

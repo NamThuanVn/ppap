@@ -50,21 +50,22 @@ name: ERP · Hunter · Timeouts + CI noise
 # (docs/engineering/platform/ppap.md § To which workflows ppap runs).
 
 on:
-  schedule:
-    # 02:00 Vietnam time (ICT) daily = 19:00 UTC. Actions cron is UTC-only, and
-    # ICT is UTC+7 with NO daylight saving, so this one offset holds all year —
-    # no seasonal drift to re-check.
-    #
-    # EXPECT IT LATE. Actions does not honour a schedule to the minute; a
-    # scheduled run is queued and commonly starts minutes to tens of minutes
-    # after its cron time, more so on a busy hour. A run appearing at 02:25 ICT
-    # is the platform behaving normally, not a broken schedule — don't "fix" the
-    # cron over it. The corollary is that shifting this by a few minutes to
-    # dodge another job's minute buys nothing: with that much jitter, the actual
-    # start minute is not the cron's to decide. The time here says WHEN WE WANT
-    # IT, and the middle of the Vietnam night is the point — the fleet is idle,
-    # so a ~1.5k-call REST sweep competes with nobody's PR CI.
-    - cron: '0 19 * * *'
+  # No `schedule:`. The daily clock moved OUT of GitHub — it delayed the schedule
+  # EVENT at its own scheduler and dropped ticks it could not place.
+  # erp-heartbeat.yml now dispatches this workflow when its last run is over a
+  # day old, driven by a Cloudflare cron on the ERP's service-utilities worker.
+  #
+  # The intent is unchanged: run in the middle of the Vietnam night, when the
+  # fleet is idle and a ~1.5k-call REST sweep competes with nobody's PR CI. The
+  # heartbeat preserves that by only dispatching once the previous run is 24h
+  # old, so the daily slot drifts by at most one 15-minute tick from wherever it
+  # last landed.
+  #
+  # NOTE FOR ANYONE EDITING `dry_run` BELOW: under `schedule` its value was NULL
+  # (falsy → `--apply`). Under `workflow_dispatch` GitHub substitutes the
+  # DECLARED DEFAULT, which is `true`. erp-heartbeat.yml therefore passes
+  # `-f dry_run=false` explicitly; changing the default here without changing
+  # that would silently turn the daily hunt into a no-op.
   workflow_dispatch:
     inputs:
       dry_run:
