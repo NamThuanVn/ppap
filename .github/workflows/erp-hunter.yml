@@ -80,6 +80,10 @@ on:
         description: 'Noise hunt: how many days of fleet CI logs to pool'
         type: string
         default: '7'
+      fresh_hunt:
+        description: 'When the pooled window has nothing to kill, sample main to make fresh evidence. The re-entry pass sets this false so a hunt can never chain into another.'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -253,6 +257,15 @@ jobs:
   hunt-noise:
     name: Hunt CI noise
     runs-on: ubuntu-latest
+    outputs:
+      # What the `kill` job below acts on, and what `hunt-fresh` acts on when
+      # both are empty. Kept as job outputs rather than an artifact because
+      # they gate a job's `if:`, which is evaluated before any step runs.
+      sites: ${{ steps.batch.outputs.count }}
+      keys: ${{ steps.batch.outputs.keys }}
+      fixable: ${{ steps.scan.outputs.fixable_files }}
+      summary: ${{ steps.scan.outputs.summary }}
+      pr_open: ${{ steps.guard.outputs.open }}
     # ~1.5k REST calls for a 7-day window over the 16-repo fleet (two run
     # listings per repo, one job listing per run, one log download per
     # test-bearing job), six in flight at a time. Measured serially at ~35
@@ -341,6 +354,44 @@ jobs:
             --json noise/ci-noise-fleet.json \
             --markdown noise/ci-noise-fleet.md
 
+      # Which sites this run will actually try to fix. Pure decision, taken
+      # here rather than in the kill job so it can gate that job's `if:` —
+      # a job whose steps all skip still costs a runner and shows up green,
+      # which is exactly how a hunt that did nothing looked like a hunt that
+      # worked.
+      #
+      # scripts/ci/noise-fix.mjs DECIDES (ambient-only, capped, worst first —
+      # see its header); this step only reads the answer out.
+      - name: Pick the fix batch
+        id: batch
+        if: ${{ steps.scan.conclusion == 'success' }}
+        env:
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DAYS: ${{ inputs.days || '7' }}
+        run: |
+          set -uo pipefail
+          BATCH=$(node scripts/ci/noise-fix.mjs plan \
+                    --report noise/ci-noise-fleet.json \
+                    --brief noise/fix-brief.md \
+                    --run-url "$RUN_URL" --days "$DAYS") || BATCH=''
+          if [ -z "$BATCH" ]; then
+            # NOT zero. A planner that crashed has not told us the window is
+            # clean, and reporting zero here would send hunt-fresh off to
+            # sample main on the strength of a failure.
+            echo "::warning::noise-fix planner failed — this sweep kills nothing"
+            echo "count=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          COUNT=$(printf '%s' "$BATCH" | jq '.count')
+          KEYS=$(printf '%s' "$BATCH" | jq -r '.keys | join(", ")')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "keys=$KEYS" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::notice::nothing ambient to kill in this window"
+          else
+            echo "::notice::killing $COUNT site(s): $KEYS"
+          fi
+
       - name: Upload the fleet noise report
         if: ${{ always() }}
         continue-on-error: true
@@ -351,12 +402,14 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
-      # Never stack two batches, same rule as hunt-timeouts: the PR's own CI is
-      # the only evidence the batch was safe, so opening tomorrow's before
-      # today's has landed makes a red run unattributable.
-      - name: Skip the fix PR while one is still open
-        id: fix_guard
-        if: steps.scan.outputs.fixable_files != ''
+      # Never stack two batches, same rule as hunt-timeouts: the PR's own
+      # five-run fan-out is the only evidence the batch was safe, so opening
+      # tomorrow's before today's has landed makes a red run unattributable —
+      # and the second PR would be cut from a main that still carries the
+      # first one's flake, so its fan-out would fail on work already done.
+      - name: Hold the kill while a hunter PR is still open
+        id: guard
+        if: ${{ always() }}
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
@@ -365,163 +418,11 @@ jobs:
                    --json number,headRefName \
                    --jq '[.[] | select(.headRefName | startswith("chore/ci-noise"))] | length' 2>/dev/null || echo 0)
           if [ "${OPEN:-0}" -gt 0 ]; then
-            echo "::notice::a noise-hunter PR is still open — skipping today's fix batch"
-            echo 'skip=true' >> "$GITHUB_OUTPUT"
+            echo "::notice::a noise-hunter PR is still open — holding today's kill until it lands"
+            echo 'open=true' >> "$GITHUB_OUTPUT"
           else
-            echo 'skip=false' >> "$GITHUB_OUTPUT"
+            echo 'open=false' >> "$GITHUB_OUTPUT"
           fi
-
-      - uses: ./.github/actions/install
-        if: steps.scan.outputs.fixable_files != '' && steps.fix_guard.outputs.skip == 'false'
-
-      # Biome IS the codemod — the hunter never reimplements a fixer, exactly as
-      # hunt-timeouts borrows strip-timeouts.mjs from the gate. Scoped to the
-      # files the scan named rather than the whole tree, so the diff is
-      # attributable to the finding.
-      - name: Fix the biome warnings the sweep named
-        id: fix
-        if: steps.scan.outputs.fixable_files != '' && steps.fix_guard.outputs.skip == 'false'
-        env:
-          FIXABLE: ${{ steps.scan.outputs.fixable_files }}
-        run: |
-          set -uo pipefail
-          # shellcheck disable=SC2086  # FIXABLE is an intentional space-separated path list
-          pnpm exec biome check --write $FIXABLE || true
-          if git diff --quiet; then
-            echo "::notice::biome had nothing left to rewrite in the named files (already fixed on main)"
-            echo 'changed=false' >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "files=$(git diff --name-only | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Open the fix PR
-        if: steps.fix.outputs.changed == 'true' && !inputs.dry_run
-        env:
-          GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          FILES: ${{ steps.fix.outputs.files }}
-          SUMMARY: ${{ steps.scan.outputs.summary }}
-        run: |
-          set -euo pipefail
-          BRANCH="chore/ci-noise-$(date -u +%Y%m%d)"
-          git config user.name  'noise-hunter'
-          git config user.email 'noreply@github.com'
-          git checkout -b "$BRANCH"
-          git add -A
-          git commit -F - <<EOF
-          chore(ci): clear the biome warnings the fleet noise sweep found ($FILES file(s))
-
-          \`biome check --write\` over exactly the files the sweep named. Biome's own
-          fixer did the edit; the hunter only chose the inputs.
-
-          Fleet window: $SUMMARY.
-          Generated by .github/ppap/workflows/erp-hunter.yml (hunt-noise).
-          EOF
-          git push "https://x-access-token:${RESOLVED_PAT}@github.com/NamThuanVn/erp-namthuan.git" "$BRANCH"
-          gh pr create --repo NamThuanVn/erp-namthuan \
-            --base main --head "$BRANCH" \
-            --title "chore(ci): clear the biome warnings the fleet noise sweep found ($FILES file(s))" \
-            --body "Automated batch from the CI noise hunter — \`biome check --write\` over exactly the files the fleet sweep named, nothing else.
-
-          Fleet window: \`$SUMMARY\`. Full inventory in this run's \`ci-noise-fleet\` artifact.
-
-          Biome's own fixer produced every edit here, so the diff is as safe as running \`pnpm biome check --write\` locally. The remaining categories (flaky, dup-testid, hydration, i18n, font, 404, vitest stderr) are judgement calls and are tracked in the sticky [\`ci-noise\`](https://github.com/NamThuanVn/erp-namthuan/issues?q=is%3Aissue+is%3Aopen+label%3Aci-noise) issue instead."
-
-      # ── Hunt, then KILL ──────────────────────────────────────────────
-      # The sweep found the ambient flakes and ranked them. Until now that is
-      # where it stopped: one sticky issue, owned by nobody, and only biome
-      # warnings ever actually fixed. Every other finding waited for a human to
-      # read the inventory and volunteer, which measurably did not happen —
-      # sites sat there for weeks while each new PR met them in turn.
-      #
-      # The hunt still does not FIX a flake, and must not: which of two
-      # responsive branches owns a testid, whether a wait is racing a cache
-      # hit, is a judgement call, and a codemod guessing would land
-      # unreviewable diffs across 400 specs. But this repo already runs a fleet
-      # that takes a Todo item and drives it to a merged fix end to end
-      # (/clear-todo → /solve-issue). The missing link was never the fixing; it
-      # was that nothing turned a finding into a claimable item. This is that
-      # link.
-      #
-      # scripts/ci/noise-work.mjs DECIDES (ambient-only, capped, idempotent,
-      # self-closing — see its header); this step only does the I/O, exactly
-      # the same split as the sticky issue above.
-      - name: File the ambient flakes as claimable work
-        if: ${{ always() && steps.scan.conclusion == 'success' && !inputs.dry_run }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          DAYS: ${{ inputs.days || '7' }}
-        run: |
-          set -uo pipefail
-          REPO=NamThuanVn/erp-namthuan
-          # org board "ERP Namthuan" → github.com/orgs/NamThuanVn/projects/1.
-          # Same ids scripts/ba/intake/create-issues.mjs uses; Status=Todo is
-          # what the agent fleet's claim sweep keys on.
-          PROJECT_ID=PVT_kwDOEFPEIM4BYI8w
-          STATUS_FIELD_ID=PVTSSF_lADOEFPEIM4BYI8wzhTQ1-Q
-          TODO_OPTION_ID=f75ad846
-
-          # The label is how tomorrow's sweep finds its own issues again, so it
-          # has to exist before the first one is filed.
-          gh label create ci-flake --repo "$REPO" --color B60205 \
-            --description "Ambient CI flake, filed by the daily fleet sweep" >/dev/null 2>&1 || true
-
-          gh issue list --repo "$REPO" --label ci-flake --state open --limit 100 \
-            --json number,title,body > open.json 2>/dev/null || echo '[]' > open.json
-
-          PLAN=$(node scripts/ci/noise-work.mjs plan \
-                   --report noise/ci-noise-fleet.json --open open.json \
-                   --run-url "$RUN_URL" --days "$DAYS") || PLAN=''
-          if [ -z "$PLAN" ]; then
-            echo "::warning::noise-work planner failed — filing nothing this sweep"
-            exit 0
-          fi
-
-          # Close first: an item whose site has stopped appearing is DONE, and
-          # saying so before opening new ones keeps the board honest even if
-          # the opens below hit a rate limit.
-          printf '%s' "$PLAN" | jq -r '.close[]' | while read -r N; do
-            [ -n "$N" ] || continue
-            jq -n --arg b "✅ The fleet sweep no longer sees this site — closing. It reopens automatically if it comes back. ([sweep]($RUN_URL))" \
-              '{body: $b}' | gh api -X POST "repos/$REPO/issues/$N/comments" --input - >/dev/null 2>&1 || true
-            jq -n '{state: "closed", state_reason: "completed"}' \
-              | gh api -X PATCH "repos/$REPO/issues/$N" --input - >/dev/null 2>&1 \
-              && echo "killed: closed #$N"
-          done
-
-          COUNT=$(printf '%s' "$PLAN" | jq '.file | length')
-          HELD=$(printf '%s' "$PLAN" | jq -r '.held | join(", ")')
-          [ -n "$HELD" ] && echo "::notice::holding until tomorrow (per-sweep cap): $HELD"
-
-          for i in $(seq 0 $((COUNT - 1))); do
-            TITLE=$(printf '%s' "$PLAN" | jq -r ".file[$i].title")
-            printf '%s' "$PLAN" | jq -r ".file[$i].body" > body.md
-            NODE=$(jq -n --arg t "$TITLE" --rawfile b body.md \
-                     '{title: $t, body: $b, labels: ["ci-flake", "bug", "scope:infra"]}' \
-                     | gh api -X POST "repos/$REPO/issues" --input - --jq '.node_id' 2>/dev/null) || NODE=''
-            if [ -z "$NODE" ]; then
-              echo "::warning::could not file $TITLE"
-              continue
-            fi
-            echo "hunting: filed $TITLE"
-            # Onto the board at Todo, which is what makes it claimable by the
-            # fleet rather than another line nobody owns. Best-effort: a board
-            # write failing must not undo the issue we just filed.
-            ITEM=$(gh api graphql \
-                     -f 'query=mutation($p:ID!,$c:ID!){addProjectV2ItemById(input:{projectId:$p,contentId:$c}){item{id}}}' \
-                     -f "p=$PROJECT_ID" -f "c=$NODE" \
-                     --jq '.data.addProjectV2ItemById.item.id' 2>/dev/null) || ITEM=''
-            if [ -n "$ITEM" ]; then
-              gh api graphql \
-                -f 'query=mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$o}}){projectV2Item{id}}}' \
-                -f "p=$PROJECT_ID" -f "i=$ITEM" -f "f=$STATUS_FIELD_ID" -f "o=$TODO_OPTION_ID" \
-                >/dev/null 2>&1 && echo "  → Project #1 (Todo) — the fleet can claim it"
-            else
-              echo "::warning::filed $TITLE but could not add it to Project #1 (pooled PAT missing org Projects R/W?)"
-            fi
-          done
           exit 0
 
       # The sticky inventory. ONE issue, refreshed in place — a new issue per day
@@ -587,5 +488,415 @@ jobs:
                     '{title: "CI noise inventory — fleet log sweep", body: $b, labels: ["ci-noise", "chore", "scope:infra"]}' \
                     | gh api -X POST "repos/$REPO/issues" --input - --jq '.number')
             echo "filed #$NUM — $SUMMARY"
+          fi
+          exit 0
+
+  # ── THE KILL ──────────────────────────────────────────────────────────────
+  #
+  # Everything in hunt-noise HUNTS: it pools the fleet's logs, ranks what it
+  # finds, and picks the sites worth fixing. For its first weeks that is where
+  # the hunter stopped — a nightly report, one sticky issue, and only biome
+  # warnings ever actually repaired, because `biome check --write` was the one
+  # provable mechanical fix. Every other finding waited for a human to read the
+  # inventory and volunteer, which measurably did not happen: sites sat there
+  # for weeks while each new PR met them in turn. Filing an issue per site was
+  # tried next and was no better — it moves the waiting rather than ending it,
+  # and it buries a board humans also use.
+  #
+  # So this job fixes them. One branch carrying both halves of the repair —
+  # biome's own mechanical rewrite, and a headless Claude session for the
+  # flakes, which are judgement calls no codemod can make — then ONE pull
+  # request, proved by five parallel fleet CI runs before anything merges.
+  #
+  # WHY FIVE, AND WHY AT ONCE. One green run proves almost nothing about a
+  # flake: a site that fails one run in thirty is green on almost every run,
+  # which is how it survived long enough to be found by a pooled sweep in the
+  # first place. Five runs in five different ppap repos hold five separate
+  # `ci-<pr>` concurrency groups, so none of them cancels another — which is
+  # why this is a fan-out and not five sequential re-runs of an hour.
+  #
+  # WHAT IT WILL NOT DO. It never merges on its own authority: clearing the bar
+  # adds the `auto-merge` label, and the repo's existing machinery lands the PR
+  # once its own required checks are green. A fan-out that comes back dirty
+  # leaves the PR open with the evidence on it, and tomorrow's sweep holds
+  # (see `Hold the kill…` above) until a human has looked.
+  kill:
+    name: Kill the noise
+    needs: hunt-noise
+    # Three conditions, and the middle one is the one that is easy to get
+    # wrong: `sites` is the string `unknown` when the planner crashed, which
+    # is neither a count nor zero and must not be read as "go".
+    if: >-
+      ${{ !inputs.dry_run
+          && needs.hunt-noise.outputs.pr_open == 'false'
+          && ((needs.hunt-noise.outputs.sites != '0'
+               && needs.hunt-noise.outputs.sites != 'unknown'
+               && needs.hunt-noise.outputs.sites != '')
+              || needs.hunt-noise.outputs.fixable != '') }}
+    runs-on: ubuntu-latest
+    # A fixer session plus five watched CI runs. The session is bounded by the
+    # harness's own budgets; the fan-out is ~20 min for the slowest run. Five
+    # hours is the same order as an agent lane (330 min) and well inside the
+    # six-hour job ceiling.
+    timeout-minutes: 300
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Checkout upstream main
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The sweep's own output, not a second scan. Re-deriving it here would
+      # cost another ~1.5k REST calls and — worse — could disagree with the
+      # batch the gate above was evaluated on, so the job would fix a
+      # different set of sites than the one it was started for.
+      - name: Take the sweep's report and fix brief
+        uses: actions/download-artifact@v7
+        with:
+          name: ci-noise-fleet
+          path: noise/
+
+      - name: Branch
+        run: |
+          set -euo pipefail
+          BRANCH="chore/ci-noise-$(date -u +%Y%m%d-%H%M)"
+          git config user.name  'noise-hunter'
+          git config user.email 'noreply@github.com'
+          git checkout -b "$BRANCH"
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+      - uses: ./.github/actions/install
+
+      # Biome IS the codemod — the hunter never reimplements a fixer, exactly
+      # as hunt-timeouts borrows strip-timeouts.mjs from the gate. Scoped to
+      # the files the scan named rather than the whole tree, so every hunk is
+      # attributable to a finding.
+      - name: Fix the biome warnings the sweep named
+        id: biome
+        if: ${{ needs.hunt-noise.outputs.fixable != '' }}
+        env:
+          FIXABLE: ${{ needs.hunt-noise.outputs.fixable }}
+        run: |
+          set -uo pipefail
+          # shellcheck disable=SC2086  # FIXABLE is an intentional space-separated path list
+          pnpm exec biome check --write $FIXABLE || true
+          if git diff --quiet; then
+            echo "::notice::biome had nothing left to rewrite in the named files (already fixed on main, or the warning only exists on a branch)"
+          else
+            echo "biome rewrote $(git diff --name-only | wc -l | tr -d ' ') file(s)"
+          fi
+          exit 0
+
+      - name: Install Claude Code CLI
+        if: ${{ needs.hunt-noise.outputs.sites != '0' }}
+        env:
+          CLAUDE_VERSION: '2.1.267'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version
+
+      # The flakes themselves. A codemod cannot do this — which of two
+      # responsive branches owns a testid, whether a wait is racing a cache
+      # hit, is a judgement call, and a guess would land unreviewable diffs
+      # across 400 specs. So it is a real headless session, on the same
+      # token-pool wrapper the agent fleet uses (scripts/agent/run/claude.sh,
+      # HUNT mode): account ranking by remaining quota, mid-run failover,
+      # transient-5xx retries and a full transcript, none of which is worth a
+      # second implementation here.
+      #
+      # It edits the tree and stops — the brief says so explicitly, and the
+      # steps below own the branch, the commit and the PR. `continue-on-error`
+      # because a session that dies halfway may still have left good edits in
+      # the tree, and biome's rewrite is certainly still there; the `git diff`
+      # below is what decides whether there is anything to ship.
+      - name: Fix the flaky sites
+        id: fixer
+        if: ${{ needs.hunt-noise.outputs.sites != '0' }}
+        continue-on-error: true
+        env:
+          CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          HUNT_BRIEF: noise/fix-brief.md
+          AGENT_STATE_DIR: ${{ runner.temp }}
+        run: bash scripts/agent/run/claude.sh
+
+      - name: Upload the fixer session
+        if: ${{ always() && needs.hunt-noise.outputs.sites != '0' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: hunter-fixer-session
+          path: ${{ runner.temp }}/agent-*.json*
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # No diff is a legitimate outcome, not a failure: the session may have
+      # read the evidence and concluded honestly that none of the sites is
+      # fixable from what the logs show. Ending green here — rather than
+      # opening an empty PR or failing the job — is what keeps that an
+      # available answer instead of one the harness punishes.
+      - name: Commit and push what the tree now holds
+        id: push
+        env:
+          KEYS: ${{ needs.hunt-noise.outputs.keys }}
+          SUMMARY: ${{ needs.hunt-noise.outputs.summary }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          git add -A
+          # Name anything NEW the session left behind. A flake fix is almost
+          # always an edit to a file that already exists, so an added file is
+          # either a genuine new helper or scratch the session forgot — and
+          # the PR's own hygiene gate will red on the second kind rather than
+          # letting it into a squash-merged main forever. Saying so here is
+          # what makes that red attributable instead of mysterious.
+          ADDED=$(git diff --cached --name-only --diff-filter=A)
+          [ -n "$ADDED" ] && echo "::notice::new file(s) in this batch: $(echo "$ADDED" | tr '\n' ' ')"
+          if git diff --cached --quiet; then
+            echo "::notice::nothing to ship — neither biome nor the fixer changed a file"
+            echo 'pushed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -q -F - <<EOF
+          fix(ci): kill the ambient noise the fleet sweep found
+
+          Sites: ${KEYS:-none}
+          Fleet window: ${SUMMARY}
+          Swept by ${RUN_URL}
+
+          Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+          EOF
+          git push "https://x-access-token:${RESOLVED_PAT}@github.com/NamThuanVn/erp-namthuan.git" "$BRANCH"
+          echo 'pushed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Open the PR
+        id: pr
+        if: ${{ steps.push.outputs.pushed == 'true' }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          KEYS: ${{ needs.hunt-noise.outputs.keys }}
+          SUMMARY: ${{ needs.hunt-noise.outputs.summary }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'Automated kill from the CI noise hunter.\n\n'
+            printf 'The nightly sweep pools CI logs across every ppap repo, so it sees what no\n'
+            printf 'single PR can: a spec that fails one run in thirty is green on almost every\n'
+            printf 'PR and unmistakable once forty runs are pooled. Every site below is AMBIENT —\n'
+            printf 'it failed on `main` itself, or on more than one unrelated branch — so there\n'
+            printf 'is a real defect behind it rather than one branch being at fault.\n\n'
+            printf '**Sites:** %s\n\n' "${KEYS:-none — biome warnings only}"
+            printf '**Fleet window:** `%s`\n\n' "$SUMMARY"
+            printf 'Sweep: %s\n\n' "$RUN_URL"
+            printf -- '---\n\n'
+            printf 'This PR does NOT merge on one green run. The hunter dispatches **five CI runs\n'
+            printf 'at once** across five idle ppap repos and adds `auto-merge` only if all five\n'
+            printf 'come back with zero failing sites — one green run proves almost nothing about\n'
+            printf 'a flake. Each run reports as its own `CI verify n/5` check below.\n'
+          } > "$RUNNER_TEMP/pr-body.md"
+          URL=$(gh pr create --repo NamThuanVn/erp-namthuan \
+                  --base main --head "$BRANCH" \
+                  --title "fix(ci): kill the ambient noise the fleet sweep found" \
+                  --body-file "$RUNNER_TEMP/pr-body.md")
+          NUM="${URL##*/}"
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+          echo "::notice::opened $URL"
+
+      # The bar. Five runs at once, and every one of them must come back with
+      # zero failing SITES — not merely `conclusion: success`, and not the
+      # report's own `clean` field, which is computed after the blast radius
+      # defers what the PR could not have caused. That is the right question
+      # for an ordinary merge and the wrong one here: a deferred site still
+      # ran and still flaked, and this PR exists precisely to stop it doing so.
+      - name: Prove it with five fleet runs
+        id: prove
+        if: ${{ steps.pr.outputs.number != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node scripts/ci/prove-clean.mjs --pr "${{ steps.pr.outputs.number }}" --need 5 --go
+
+      - name: Merge on five clean, or leave it open with the reason
+        if: ${{ always() && steps.pr.outputs.number != '' }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PR: ${{ steps.pr.outputs.number }}
+          PROVED: ${{ steps.prove.outcome }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ "$PROVED" = "success" ]; then
+            # `auto-merge` rather than `gh pr merge`: the label is the repo's
+            # own lever (ppap CI marks the PR ready and squash-merges it once
+            # its required checks are green), so the kill lands through the
+            # same path every other PR does instead of around it.
+            gh pr edit "$PR" --repo NamThuanVn/erp-namthuan --add-label auto-merge \
+              && echo "::notice::five clean fan-out runs — labelled auto-merge, PR #$PR lands on green"
+            jq -n --arg b "✅ **Five for five.** The fleet fan-out came back with zero failing sites across all five runs, which is the bar this PR was opened against. Labelled \`auto-merge\`; it lands as soon as its own required checks are green. ([fan-out]($RUN_URL))" \
+              '{body: $b}' | gh api -X POST "repos/NamThuanVn/erp-namthuan/issues/$PR/comments" --input - >/dev/null 2>&1 || true
+            exit 0
+          fi
+          echo "::warning::the fan-out did not come back five-for-five — PR #$PR stays open and unlabelled"
+          jq -n --arg b "⚠️ **The fan-out did not clear the bar.** This PR is NOT being merged. Either a site in the batch is still flaking, or the fix moved the failure somewhere else — the per-run verdicts and the sites each run saw are in the [fan-out log]($RUN_URL), and each run also reported as its own \`CI verify n/5\` check.
+
+          Tomorrow's sweep will hold rather than open a second batch on top of this one, so this PR wants a human before the hunter runs again." \
+            '{body: $b}' | gh api -X POST "repos/NamThuanVn/erp-namthuan/issues/$PR/comments" --input - >/dev/null 2>&1 || true
+          exit 0
+
+  # ── HUNT WHEN THE WINDOW IS QUIET ────────────────────────────────────────
+  #
+  # A pooled window with nothing to kill is not the same as a healthy suite.
+  # It usually means the fleet was IDLE — a weekend, a holiday, a day nobody
+  # opened a PR — so there were no runs to pool and therefore no evidence. The
+  # sweep then reports "clean", files nothing, and the flakes that are still
+  # there wait to be discovered by whoever opens the next PR. That is the
+  # failure this job exists for: on a quiet day, go and MAKE evidence.
+  #
+  # It samples `main` itself, five runs at once, through the same fan-out that
+  # proves a PR (scripts/ci/prove-clean.mjs --main). Sampling the trunk rather
+  # than a branch is what makes the result immediately actionable: a site that
+  # fails on main has no branch to blame, so noise-fix takes it into the batch
+  # on ONE sighting instead of waiting for a second distinct PR
+  # (scripts/ci/noise-fix.mjs § isAmbient). Five at once rather than five in
+  # a row because a concurrency group is scoped to one repository, so five
+  # runs in five ppap repos do not cancel each other — an hour of wall-clock
+  # collapses to one run's worth.
+  #
+  # It does NOT file anything itself. It re-enters the hunter with `days=1`,
+  # and that second pass pools the runs it just created along with the last
+  # day's real traffic, then files and dispatches through exactly the one code
+  # path above. A second copy of the filing logic here is how the two would
+  # drift, and the drift would show up as the hunt cheerfully finding nothing.
+  #
+  # TERMINATION, because this is a workflow that re-triggers itself: the
+  # re-entry passes `fresh_hunt=false`, and this job's `if:` requires it true.
+  # One extra pass, never two, whatever the second pass finds.
+  hunt-fresh:
+    name: Hunt fresh noise on main
+    needs: hunt-noise
+    # The gate is "the sweep found nothing to kill": no ambient site and no
+    # biome warning. `''` (the step never ran) and `unknown` (the planner
+    # crashed) both fall through and sample nothing — an absent answer is not
+    # a clean one, and sampling the trunk on the strength of a crash would
+    # spend five CI runs to learn what we already failed to read.
+    if: >-
+      ${{ needs.hunt-noise.outputs.sites == '0'
+          && needs.hunt-noise.outputs.fixable == ''
+          && inputs.fresh_hunt && !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    # Five CI runs dispatched at once and watched to completion: ~20 minutes
+    # for the slowest, plus the poll interval and artifact reads. Double that
+    # and stop — a fan-out still unfinished after an hour has lost a run, and
+    # the next nightly sweep pools whatever did finish anyway.
+    timeout-minutes: 60
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Checkout upstream main
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Capacity-gated inside the script: it borrows only repos with nothing
+      # in flight, and only floor(idle / 5) of them, because one CI run
+      # occupies roughly five repos (its coordinator plus the e2e workers it
+      # recruits). On a busy fleet it starts fewer than five, or none, and
+      # says so. That gate is not a nicety — an earlier version counted
+      # coordinator slots only, started five runs on a sixteen-repo fleet that
+      # needs twenty-five, and two died with 403s polling a batch repo a
+      # sibling had taken. The fan-out manufactured the noise it was measuring.
+      - name: Sample main for fresh evidence
+        id: sample
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node scripts/ci/prove-clean.mjs --main --need 5 --go
+
+      # Back through the front door. `days=1` keeps the second sweep cheap and
+      # untruncated: the 7-day window routinely offers more logs than
+      # --max-logs will read, and a truncated window under-counts ambience
+      # specifically — a site needs a second sighting to qualify, and
+      # truncation drops exactly those. The runs we just made are minutes old,
+      # so one day is all this pass needs.
+      - name: Re-enter the hunter over the evidence it just made
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          if gh workflow run erp-hunter.yml -R "${GITHUB_REPOSITORY}" \
+               -f dry_run=false -f days=1 -f fresh_hunt=false; then
+            echo "✓ re-entered the hunter over a 1-day window (fresh_hunt=false — this cannot chain again)"
+          else
+            echo "::warning::could not re-enter the hunter — the sampling runs are in the fleet's logs and tonight's sweep will pool them anyway, a day later than intended"
           fi
           exit 0
