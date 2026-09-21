@@ -583,11 +583,22 @@ jobs:
           # existing job must NOT get an R_* of its own. It is covered by its host
           # job's result, and named individually in the report's Repo-gates list.
           STATE="${REPORT_STATE:-failure}"
-          DESC="${REPORT_STATUS:-}"
-          if [ -z "$DESC" ]; then
-            echo "::error::report.mjs produced no status line — refusing to post an empty CI status"
-            exit 1
-          fi
+          # A missing REPORT_STATUS means report.mjs never ran at all — e.g. the
+          # `refs/pull/N/merge` checkout above 404s whenever the PR is unmergeable
+          # against main, which takes the "Check out the digest script" step's
+          # `continue-on-error` past the soft "digest absent" case it was written
+          # for and into a total checkout failure, so `scripts/ci/report.mjs`
+          # itself is gone (MODULE_NOT_FOUND). Refusing to post here used to leave
+          # the commit's `pending` status — set when CI was first dispatched —
+          # standing forever, because nothing ever replaces it. Every agent
+          # lane's CI-wait then polls that stuck `pending` for its FULL budget
+          # before giving up, which coalesces into the fleet-wide
+          # `terminal-state-unmet` hold (2026-09-21, fingerprint e239a6eaff6c,
+          # #3806/PR #3830 among others). Post a generic failure description
+          # instead — it still matches STATE's existing "absent means failure"
+          # rule two lines up, and a described failure is what actually lets the
+          # waiting agent (or a human) act on it.
+          DESC="${REPORT_STATUS:-CI reporting failed before it could summarize the run (see the run log) — treating as failure}"
           # Exposed for the Telegram notify step below — computed before the
           # head_sha guard so manual workflow_dispatch re-runs still notify.
           echo "state=$STATE" >> "$GITHUB_OUTPUT"
