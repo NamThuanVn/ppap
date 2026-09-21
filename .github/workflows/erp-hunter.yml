@@ -508,12 +508,21 @@ jobs:
   # flakes, which are judgement calls no codemod can make — then ONE pull
   # request, proved by five parallel fleet CI runs before anything merges.
   #
-  # WHY FIVE, AND WHY AT ONCE. One green run proves almost nothing about a
+  # WHY FIVE, AND WHY IN PARALLEL. One green run proves almost nothing about a
   # flake: a site that fails one run in thirty is green on almost every run,
   # which is how it survived long enough to be found by a pooled sweep in the
-  # first place. Five runs in five different ppap repos hold five separate
-  # `ci-<pr>` concurrency groups, so none of them cancels another — which is
-  # why this is a fan-out and not five sequential re-runs of an hour.
+  # first place. Runs in different ppap repos hold separate `ci-<pr>`
+  # concurrency groups, so none of them cancels another — which is why this is
+  # a fan-out and not five sequential re-runs of an hour.
+  #
+  # Five runs, NOT five at once. A run occupies ~5 repos (its coordinator plus
+  # the e2e workers it recruits), so a 16-repo fleet carries three at a time.
+  # prove-clean therefore goes in WAVES: it takes what the fleet can carry,
+  # waits for those repos to come back, and takes the rest. Asking for five in
+  # one capacity-capped wave returns three, compares `3 >= 5`, and fails on
+  # every fleet this size — which is exactly what shipped in #3834 and was
+  # fixed in #3838 before the first real run. A bar nobody can clear stops the
+  # thing it was meant to gate.
   #
   # WHAT IT WILL NOT DO. It never merges on its own authority: clearing the bar
   # adds the `auto-merge` label, and the repo's existing machinery lands the PR
@@ -583,11 +592,17 @@ jobs:
       # cost another ~1.5k REST calls and — worse — could disagree with the
       # batch the gate above was evaluated on, so the job would fix a
       # different set of sites than the one it was started for.
+      # Into RUNNER_TEMP, NOT the checkout. These are the sweep's own outputs —
+      # a JSON report, a markdown table and a generated brief — and dropping
+      # them in the worktree puts them inside `git add -A`'s reach. Measured:
+      # run 35602930767 staged all three, and lefthook's pre-commit biome gate
+      # then rejected `ci-noise-fleet.json` for formatting, so the kill job
+      # died on the formatting of a file it never meant to commit.
       - name: Take the sweep's report and fix brief
         uses: actions/download-artifact@v7
         with:
           name: ci-noise-fleet
-          path: noise/
+          path: ${{ runner.temp }}/noise/
 
       - name: Branch
         run: |
@@ -651,9 +666,19 @@ jobs:
         env:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          HUNT_BRIEF: noise/fix-brief.md
+          HUNT_BRIEF: ${{ runner.temp }}/noise/fix-brief.md
           AGENT_STATE_DIR: ${{ runner.temp }}
         run: bash scripts/agent/run/claude.sh
+
+      # `continue-on-error` above keeps a half-finished session's edits, which
+      # is right — but it also reports a session that never started as a green
+      # step. Run 35602930767 read `Fix the flaky sites: success` while the
+      # session had died on its first line. Say so instead.
+      - name: Say plainly whether the fixer survived
+        if: ${{ always() && steps.fixer.outcome == 'failure' }}
+        run: |
+          echo "::warning::the fixer session exited non-zero — shipping only whatever it left in the tree, which may be nothing. Its transcript is in the hunter-fixer-session artifact."
+          exit 0
 
       - name: Upload the fixer session
         if: ${{ always() && needs.hunt-noise.outputs.sites != '0' }}
@@ -692,7 +717,16 @@ jobs:
             echo 'pushed=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git commit -q -F - <<EOF
+          # NOT `set -e`, because the `[ -n "$ADDED" ] && echo` above is a
+          # legitimate false. So the commit's status is checked by hand — and
+          # it has to be: `pnpm install` put lefthook's hooks in this
+          # checkout, so `git commit` runs the full pre-commit audit over the
+          # fixer's work. That gate is worth having (a bad fix should not
+          # reach a PR), but without this check a rejected commit fell
+          # straight through to the push, which then asked an unattended
+          # runner for `Username for 'https://github.com':` and buried the
+          # real reason under an auth error. Measured: run 35602930767.
+          if ! git commit -q -F - <<EOF
           fix(ci): kill the ambient noise the fleet sweep found
 
           Sites: ${KEYS:-none}
@@ -701,6 +735,11 @@ jobs:
 
           Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
           EOF
+          then
+            echo "::error::the commit was rejected — the pre-commit audit above says why. The fixer's work is NOT being pushed; read the gate output rather than re-running."
+            echo 'pushed=false' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
           git push "https://x-access-token:${RESOLVED_PAT}@github.com/NamThuanVn/erp-namthuan.git" "$BRANCH"
           echo 'pushed=true' >> "$GITHUB_OUTPUT"
 
@@ -725,10 +764,12 @@ jobs:
             printf '**Fleet window:** `%s`\n\n' "$SUMMARY"
             printf 'Sweep: %s\n\n' "$RUN_URL"
             printf -- '---\n\n'
-            printf 'This PR does NOT merge on one green run. The hunter dispatches **five CI runs\n'
-            printf 'at once** across five idle ppap repos and adds `auto-merge` only if all five\n'
-            printf 'come back with zero failing sites — one green run proves almost nothing about\n'
-            printf 'a flake. Each run reports as its own `CI verify n/5` check below.\n'
+            printf 'This PR does NOT merge on one green run. The hunter takes **five CI runs\n'
+            printf 'across the fleet** — as many at a time as it can carry, in waves — and adds\n'
+            printf '`auto-merge` only if all five come back with zero failing sites. One green run\n'
+            printf 'proves almost nothing about a flake. Each run reports as its own\n'
+            printf '`CI verify w<wave>.<n>` check below, and the first dirty one ends the fan-out:\n'
+            printf 'the answer is already known.\n'
           } > "$RUNNER_TEMP/pr-body.md"
           URL=$(gh pr create --repo NamThuanVn/erp-namthuan \
                   --base main --head "$BRANCH" \
