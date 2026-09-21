@@ -103,6 +103,26 @@ jobs:
       # re-arms the agent loop, so exiting non-zero here would take the loop down
       # over an unrelated workflow — the opposite of what a heartbeat is for. A
       # failure is a ::warning:: and the next tick retries in 15 minutes.
+      # Sparse checkout of `scripts/ci` only — the due decider lives there
+      # (CLAUDE.md: every executable is in scripts/), and this job otherwise
+      # touches no repo at all. A few KB, non-cone, and no `pnpm install`: the
+      # script imports only node builtins. Same pattern as erp-ci-pr.yml's
+      # digest checkout.
+      #
+      # `continue-on-error`: if it blips, the dispatch step below falls back to
+      # the age-only rule rather than losing the tick.
+      - name: Check out the due decider
+        id: decider
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          sparse-checkout: scripts/ci
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Dispatch due workflows
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
@@ -131,8 +151,6 @@ jobs:
           DUE_SPEC='erp-fleet-warmup.yml:60:
           erp-hunter.yml:1440:-f dry_run=false'
 
-          NOW=$(date -u +%s)
-
           while IFS=: read -r WF MIN_GAP EXTRA; do
             WF=$(printf '%s' "$WF" | tr -d '[:blank:]')
             MIN_GAP=$(printf '%s' "$MIN_GAP" | tr -d '[:blank:]')
@@ -140,21 +158,46 @@ jobs:
             EXTRA=$(printf '%s' "${EXTRA:-}" | sed 's/^[[:blank:]]*//; s/[[:blank:]]*$//')
             [ -n "$WF" ] || continue
 
-            # Most recent run of any status. `created_at` (not `updated_at`):
-            # we care when it STARTED, so a long run cannot look overdue.
-            LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WF}/runs?per_page=1" \
-                     --jq '.workflow_runs[0].created_at // empty' 2>/dev/null) || LAST=''
-
-            if [ -z "$LAST" ]; then
-              echo "$WF — no run history, dispatching"
+            # Due-ness reads the run's CONCLUSION, not just its age — see
+            # scripts/ci/heartbeat-due.mjs. An age-only rule counted a run that
+            # DIED as a run that happened: the hunter is capped at 45 minutes
+            # and can be cancelled or killed by a GitHub limit, and its
+            # `created_at` is then minutes old, so the next tick said "not due"
+            # and the fleet lost a whole day's sweep without a word. A dead run
+            # is retried on a short floor instead, bounded so something broken
+            # at its first step cannot be re-run around the clock.
+            #
+            # Several runs, not one: the retry budget is the count of
+            # CONSECUTIVE dead runs at the head of the history, which means the
+            # history is the state and nothing has to be stored.
+            RUNS_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WF}/runs?per_page=10" \
+                          --jq '.workflow_runs' 2>/dev/null) || RUNS_JSON='[]'
+            VERDICT=$(printf '%s' "$RUNS_JSON" \
+                        | node scripts/ci/heartbeat-due.mjs --min-gap "$MIN_GAP" 2>/dev/null) || VERDICT=''
+            if [ -z "$VERDICT" ]; then
+              # The decider could not run (checkout blipped, node missing).
+              # Fall back to the OLD age-only rule rather than dispatching
+              # blind: "always dispatch" would fire the 45-minute hunter sweep
+              # on every 15-minute tick, which is far worse than the missed
+              # retry this change exists to fix.
+              echo "::warning::$WF — due check unavailable, falling back to the age-only rule"
+              LAST=$(printf '%s' "$RUNS_JSON" | jq -r '.[0].created_at // empty' 2>/dev/null || true)
+              if [ -n "$LAST" ]; then
+                LAST_EPOCH=$(date -u -d "$LAST" +%s 2>/dev/null || echo 0)
+                AGE_MIN=$(( ($(date -u +%s) - LAST_EPOCH) / 60 ))
+                if [ "$AGE_MIN" -lt "$MIN_GAP" ]; then
+                  echo "$WF — last run ${AGE_MIN}m ago (< ${MIN_GAP}m), not due"
+                  continue
+                fi
+              fi
             else
-              LAST_EPOCH=$(date -u -d "$LAST" +%s 2>/dev/null || echo 0)
-              AGE_MIN=$(( (NOW - LAST_EPOCH) / 60 ))
-              if [ "$AGE_MIN" -lt "$MIN_GAP" ]; then
-                echo "$WF — last run ${AGE_MIN}m ago (< ${MIN_GAP}m), not due"
+              DUE=${VERDICT%%	*}
+              WHY=${VERDICT#*	}
+              if [ "$DUE" != due ]; then
+                echo "$WF — $WHY, not due"
                 continue
               fi
-              echo "$WF — last run ${AGE_MIN}m ago (>= ${MIN_GAP}m), dispatching"
+              echo "$WF — $WHY, dispatching"
             fi
 
             # shellcheck disable=SC2086 — EXTRA is a flag LIST and must word-split.
