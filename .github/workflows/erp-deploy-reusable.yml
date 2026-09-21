@@ -229,7 +229,14 @@ jobs:
       # (staging) runs; production is full-deploy and ignores base_sha.
       - name: Resolve baseline = last successful deploy
         id: baseline
-        if: inputs.deploy_only_changed == 'true'
+        # `inputs.deploy_only_changed` is declared `type: boolean`, so it arrives
+        # as a BOOLEAN. Comparing it to the string 'true' silently never matched:
+        # GitHub casts mismatched operands to numbers, and `true` → 1 while
+        # 'true' → NaN, so the condition was false on every run since this step
+        # was added. The step below it reads the same input correctly by
+        # interpolating it into an env string, which is why the two disagreed
+        # without anyone noticing — and why staging kept drifting from main.
+        if: inputs.deploy_only_changed
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           PRIVATE_REPO: ${{ env.PRIVATE_REPO }}
@@ -897,10 +904,40 @@ jobs:
           echo "::add-mask::$ACC"
           echo "::add-mask::$TOKEN"
           printf 'export default { fetch() { return new Response("bootstrapping", { status: 503 }); } };\n' > /tmp/placeholder.mjs
+          # Probe each worker with retries, and NEVER let the probe itself fail the
+          # deploy. This loop killed a whole staging deploy once (2026-09-21): one
+          # `curl` hit a TLS error (exit 35) mid-list, `set -e` aborted the step,
+          # and the deploy died having shipped nothing — which then let the NEXT
+          # deploy's change-scoped diff skip the dropped commit's workers entirely.
+          #
+          # The asymmetry below is deliberate. An indeterminate probe is treated as
+          # "exists" (skip the placeholder), because the two wrong guesses are not
+          # equally bad: guessing "missing" for a LIVE worker would overwrite it
+          # with a 503 placeholder, while guessing "exists" for a genuinely new one
+          # only reproduces the loud, recoverable Cloudflare 10007 this bootstrap
+          # exists to avoid. So a network blip degrades to the old behaviour, never
+          # to an outage.
+          probe_worker() {
+            local name="$1" attempt code
+            for attempt in 1 2 3 4; do
+              code="$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer $TOKEN" \
+                "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/services/$name" || true)"
+              # A real HTTP status ends the retry loop; curl failing outright
+              # leaves `code` empty or 000, which is what we retry on.
+              case "$code" in
+                ''|000) sleep $((attempt * 3)) ;;
+                *) printf '%s' "$code"; return 0 ;;
+              esac
+            done
+            printf '%s' "unknown"
+          }
           for name in $(grep -rho 'script_name *= *"[^"]*"' apis/ | sed 's/.*"\(.*\)"/\1/' | sort -u); do
-            code="$(curl -s -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer $TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/services/$name")"
+            code="$(probe_worker "$name")"
+            if [[ "$code" == "unknown" ]]; then
+              echo "::warning::could not determine whether worker '$name' exists (4 probes failed) — assuming it does and skipping its placeholder"
+              continue
+            fi
             if [[ "$code" == "404" ]]; then
               echo "worker '$name' missing — uploading placeholder so its secret can attach"
               curl -sf -X PUT \
