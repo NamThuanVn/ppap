@@ -387,11 +387,29 @@ jobs:
       # match on any file that is not the bookkeeping one — which stays correct
       # whether or not a caller passes `--output` (shard.sh does, this job does
       # not, and both nest .last-run.json inside whatever dir they chose).
+      #
+      # `results.json` is excluded for the SAME reason and was the miss that kept
+      # this detector firing after the .last-run.json fix: the `attempt()` above
+      # runs Playwright with `PLAYWRIGHT_JSON_OUTPUT_NAME=test-results/results.json`,
+      # so the json reporter drops its report into the very directory this scans,
+      # on every run, green or not. Measured on PR #3877's run (35688244114): the
+      # notice fired on 48 of 48 shards while 47 of them passed 64/64 first try,
+      # and because the two steps below are gated on `present == 'true'`, every
+      # shard also ran payload.mjs and uploaded a summary artifact holding
+      # nothing. A detector that fires always says exactly as much as one that
+      # never fires — and this one is what /fix-ci and the noise hunter read to
+      # decide whether a green run was actually clean.
+      #
+      # Both exclusions are BY NAME, so they hold wherever the reporter is
+      # pointed (shard.sh nests it under test-results/shard-N/). A genuine
+      # retained attempt is a screenshot, trace or video, never either of these.
+      # scripts/tests/ci/payload.test.ts pins the pair together, so a third file
+      # written into this directory cannot quietly re-break it.
       - name: Detect retained failure artifacts (covers flaky-passed-on-retry)
         id: pw_artifacts
         if: always()
         run: |
-          if [ -n "$(find test-results -mindepth 1 -type f ! -name '.last-run.json' -print -quit 2>/dev/null)" ]; then
+          if [ -n "$(find test-results -mindepth 1 -type f ! -name '.last-run.json' ! -name 'results.json' -print -quit 2>/dev/null)" ]; then
             echo "present=true" >>"$GITHUB_OUTPUT"
             echo "::notice::shard ${{ matrix.shard }} retained failure artifacts (flaky first attempt) — uploading"
           else
