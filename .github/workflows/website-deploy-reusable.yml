@@ -229,6 +229,13 @@ jobs:
           ERP_SECRET_NAME="$(jq -r '.erp_secret_name.value // empty' /tmp/tf-outputs.json)"
           ERP_GATEWAY_URL="$(jq -r '.erp_gateway_url.value // empty' /tmp/tf-outputs.json)"
           ERP_CLIENT_ID="$(jq -r '.erp_client_id.value // empty' /tmp/tf-outputs.json)"
+          # Bot protection. The SECRET is a Secrets Store secret and never leaves
+          # the store; the SITE key is public (it ships to the browser inside the
+          # widget) so it is a plain var and is not masked. Terraform emits both
+          # only when the pair is configured, so empty means "no Turnstile here"
+          # and the forms stay open rather than refusing every submission.
+          TURNSTILE_SECRET_NAME="$(jq -r '.turnstile_secret_name.value // empty' /tmp/tf-outputs.json)"
+          TURNSTILE_SITE_KEY="$(jq -r '.turnstile_site_key.value // empty' /tmp/tf-outputs.json)"
           rm -f /tmp/tf-outputs.json
           echo "::add-mask::$ACC"
           echo "::add-mask::$TOKEN"
@@ -262,6 +269,8 @@ jobs:
             echo "ERP_SECRET_NAME=$ERP_SECRET_NAME"
             echo "ERP_GATEWAY_URL=$ERP_GATEWAY_URL"
             echo "ERP_CLIENT_ID=$ERP_CLIENT_ID"
+            echo "TURNSTILE_SECRET_NAME=$TURNSTILE_SECRET_NAME"
+            echo "TURNSTILE_SITE_KEY=$TURNSTILE_SITE_KEY"
           } >> "$GITHUB_ENV"
           # Every configured target runs in parallel (src/lib/delivery.ts);
           # list them. None at all gets a warning rather than a notice because it
@@ -274,6 +283,11 @@ jobs:
           fi
           if [ -n "$ERP_SECRET_NAME" ]; then
             echo "enquiries + CVs → ERP at $ERP_GATEWAY_URL (client $ERP_CLIENT_ID)"; ANY=1
+          fi
+          if [ -n "$TURNSTILE_SECRET_NAME" ]; then
+            echo "forms protected by Turnstile (site key $TURNSTILE_SITE_KEY)"
+          else
+            echo "::notice::Turnstile not configured for this environment — the forms accept submissions without a bot check. Set turnstile_site_key + turnstile_secret_key on the ${TF_WORKSPACE} workspace."
           fi
           if [ -z "$ANY" ]; then
             echo "::warning::no enquiry delivery target configured for this environment — POST /api/contact will LOG and return delivered:false while still showing the visitor success. Set erp_gateway_url + erp_client_id + erp_client_secret, or contact_webhook_url, on the ${TF_WORKSPACE} workspace."
