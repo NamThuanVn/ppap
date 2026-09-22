@@ -88,6 +88,14 @@ on:
 permissions:
   contents: read
 
+env:
+  # The shared agent fork the kill job's session pushes through — the same
+  # repo variable every agent lane reads, and shared on purpose so a hunter
+  # branch cannot collide with a lane's. Unset means the session has nowhere
+  # to push, which the kill job refuses loudly rather than discovering at
+  # `git push` time.
+  FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+
 concurrency:
   group: hunter
   cancel-in-progress: false
@@ -604,14 +612,37 @@ jobs:
           name: ci-noise-fleet
           path: ${{ runner.temp }}/noise/
 
-      - name: Branch
+      # The SAME layout every agent lane uses, and for the same reason: the
+      # session ships with /ship-pr, which pushes to `origin` and opens the PR
+      # against `upstream`. Give it anything else and /ship-pr — a command
+      # written for that layout and exercised by every lane — would have to
+      # learn a second one.
+      #
+      # `gh auth setup-git` is what makes the push work at all: the checkout
+      # above is `persist-credentials: false`, so without it the push has no
+      # credential and asks an unattended runner for a username (measured, run
+      # 35602930767).
+      - name: Branch + fork layout + identity
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -euo pipefail
+          [ -n "${FORK_REPO:-}" ] || {
+            echo "::error::AGENT_FORK_REPO is unset on this repo — the session has nowhere to push. Set it to the shared agent fork (docs/engineering/platform/ppap-agent-runs.md § Agent runs)."
+            exit 1
+          }
           BRANCH="chore/ci-noise-$(date -u +%Y%m%d-%H%M)"
-          git config user.name  'noise-hunter'
-          git config user.email 'noreply@github.com'
+          git remote rename origin upstream
+          git remote add origin "https://github.com/${FORK_REPO}.git"
+          bash scripts/ci/ppap/sync-fork-main.sh "$FORK_REPO"
+          gh auth setup-git
+          gh repo set-default "$FORK_REPO"
+          LOGIN=$(gh api user --jq .login)
+          git config user.name "$LOGIN"
+          git config user.email "${LOGIN}@users.noreply.github.com"
           git checkout -b "$BRANCH"
           echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          echo "✓ shipping from $BRANCH via $FORK_REPO as @$LOGIN"
 
       - uses: ./.github/actions/install
 
@@ -619,6 +650,8 @@ jobs:
       # as hunt-timeouts borrows strip-timeouts.mjs from the gate. Scoped to
       # the files the scan named rather than the whole tree, so every hunk is
       # attributable to a finding.
+      # Left in the tree for the session to ship along with its own fixes —
+      # /ship-pr stages everything, so this needs no commit of its own.
       - name: Fix the biome warnings the sweep named
         id: biome
         if: ${{ needs.hunt-noise.outputs.fixable != '' }}
@@ -654,12 +687,15 @@ jobs:
       # transient-5xx retries and a full transcript, none of which is worth a
       # second implementation here.
       #
-      # It edits the tree and stops — the brief says so explicitly, and the
-      # steps below own the branch, the commit and the PR. `continue-on-error`
-      # because a session that dies halfway may still have left good edits in
-      # the tree, and biome's rewrite is certainly still there; the `git diff`
-      # below is what decides whether there is anything to ship.
-      - name: Fix the flaky sites
+      # It fixes AND ships: the brief tells it to run /ship-pr and drive the
+      # PR's CI to truly clean, and HUNT_BRANCH lets the harness own the CI
+      # wait so a turn ending with the PR open is resumed rather than lost.
+      #
+      # `continue-on-error` because a session that dies halfway may still have
+      # opened a PR worth looking at, and because a dead session must not take
+      # the sticky issue and the rest of the run down with it. The step after
+      # says plainly what happened.
+      - name: Fix the flaky sites and ship the PR
         id: fixer
         if: ${{ needs.hunt-noise.outputs.sites != '0' }}
         continue-on-error: true
@@ -667,6 +703,7 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           HUNT_BRIEF: ${{ runner.temp }}/noise/fix-brief.md
+          HUNT_BRANCH: ${{ env.BRANCH }}
           AGENT_STATE_DIR: ${{ runner.temp }}
         run: bash scripts/agent/run/claude.sh
 
@@ -690,134 +727,40 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
-      # No diff is a legitimate outcome, not a failure: the session may have
-      # read the evidence and concluded honestly that none of the sites is
-      # fixable from what the logs show. Ending green here — rather than
-      # opening an empty PR or failing the job — is what keeps that an
-      # available answer instead of one the harness punishes.
-      - name: Commit and push what the tree now holds
-        id: push
+      # Nothing here commits, pushes, opens a PR, fans out or merges. The
+      # session does all five by running /ship-pr, exactly as a task lane
+      # does, and then drives its own PR's CI with /fix-ci.
+      #
+      # Those five used to be workflow steps, and it was the wrong place for
+      # them. A step can commit and open a PR; it cannot read a failing shard
+      # log, work out which signal the spec is racing, and push a fix — so the
+      # best it could ever do was report that the bar was unmet and stop. That
+      # is the job the session is already good at, and /ship-pr + /fix-ci are
+      # already the repo's answer for it, tested by every lane that ships.
+      #
+      # What the harness contributes is the part a headless turn cannot do for
+      # itself: a turn ending with the PR open parks on the harness-owned CI
+      # wait and is resumed with the settled result, so a ~20-minute run does
+      # not cost a continuation per poll. Terminal = the PR MERGED, via the
+      # API. See scripts/agent/run/claude.sh § HUNT mode.
+      - name: Say plainly whether the session got its PR merged
+        if: ${{ always() }}
         env:
-          KEYS: ${{ needs.hunt-noise.outputs.keys }}
-          SUMMARY: ${{ needs.hunt-noise.outputs.summary }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -uo pipefail
-          git add -A
-          # Name anything NEW the session left behind. A flake fix is almost
-          # always an edit to a file that already exists, so an added file is
-          # either a genuine new helper or scratch the session forgot — and
-          # the PR's own hygiene gate will red on the second kind rather than
-          # letting it into a squash-merged main forever. Saying so here is
-          # what makes that red attributable instead of mysterious.
-          ADDED=$(git diff --cached --name-only --diff-filter=A)
-          [ -n "$ADDED" ] && echo "::notice::new file(s) in this batch: $(echo "$ADDED" | tr '\n' ' ')"
-          if git diff --cached --quiet; then
-            echo "::notice::nothing to ship — neither biome nor the fixer changed a file"
-            echo 'pushed=false' >> "$GITHUB_OUTPUT"
+          FORK_OWNER="${FORK_REPO%%/*}"
+          PR=$(gh api "repos/NamThuanVn/erp-namthuan/pulls?state=all&head=${FORK_OWNER}:${BRANCH}&per_page=5" \
+                 --jq '.[0] | "\(.number) \(.state) \(.merged_at // "-")"' 2>/dev/null || true)
+          if [ -z "$PR" ] || [ "$PR" = "null" ]; then
+            echo "::warning::the session opened no pull request for $BRANCH — nothing shipped. Its transcript is in the hunter-fixer-session artifact; the sites stay in the sweep and the next run will pick them up again."
             exit 0
           fi
-          # NOT `set -e`, because the `[ -n "$ADDED" ] && echo` above is a
-          # legitimate false. So the commit's status is checked by hand — and
-          # it has to be: `pnpm install` put lefthook's hooks in this
-          # checkout, so `git commit` runs the full pre-commit audit over the
-          # fixer's work. That gate is worth having (a bad fix should not
-          # reach a PR), but without this check a rejected commit fell
-          # straight through to the push, which then asked an unattended
-          # runner for `Username for 'https://github.com':` and buried the
-          # real reason under an auth error. Measured: run 35602930767.
-          if ! git commit -q -F - <<EOF
-          fix(ci): kill the ambient noise the fleet sweep found
-
-          Sites: ${KEYS:-none}
-          Fleet window: ${SUMMARY}
-          Swept by ${RUN_URL}
-
-          Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
-          EOF
-          then
-            echo "::error::the commit was rejected — the pre-commit audit above says why. The fixer's work is NOT being pushed; read the gate output rather than re-running."
-            echo 'pushed=false' >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          git push "https://x-access-token:${RESOLVED_PAT}@github.com/NamThuanVn/erp-namthuan.git" "$BRANCH"
-          echo 'pushed=true' >> "$GITHUB_OUTPUT"
-
-      - name: Open the PR
-        id: pr
-        if: ${{ steps.push.outputs.pushed == 'true' }}
-        env:
-          GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          KEYS: ${{ needs.hunt-noise.outputs.keys }}
-          SUMMARY: ${{ needs.hunt-noise.outputs.summary }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          {
-            printf 'Automated kill from the CI noise hunter.\n\n'
-            printf 'The nightly sweep pools CI logs across every ppap repo, so it sees what no\n'
-            printf 'single PR can: a spec that fails one run in thirty is green on almost every\n'
-            printf 'PR and unmistakable once forty runs are pooled. Every site below is AMBIENT —\n'
-            printf 'it failed on `main` itself, or on more than one unrelated branch — so there\n'
-            printf 'is a real defect behind it rather than one branch being at fault.\n\n'
-            printf '**Sites:** %s\n\n' "${KEYS:-none — biome warnings only}"
-            printf '**Fleet window:** `%s`\n\n' "$SUMMARY"
-            printf 'Sweep: %s\n\n' "$RUN_URL"
-            printf -- '---\n\n'
-            printf 'This PR does NOT merge on one green run. The hunter takes **five CI runs\n'
-            printf 'across the fleet** — as many at a time as it can carry, in waves — and adds\n'
-            printf '`auto-merge` only if all five come back with zero failing sites. One green run\n'
-            printf 'proves almost nothing about a flake. Each run reports as its own\n'
-            printf '`CI verify w<wave>.<n>` check below, and the first dirty one ends the fan-out:\n'
-            printf 'the answer is already known.\n'
-          } > "$RUNNER_TEMP/pr-body.md"
-          URL=$(gh pr create --repo NamThuanVn/erp-namthuan \
-                  --base main --head "$BRANCH" \
-                  --title "fix(ci): kill the ambient noise the fleet sweep found" \
-                  --body-file "$RUNNER_TEMP/pr-body.md")
-          NUM="${URL##*/}"
-          echo "number=$NUM" >> "$GITHUB_OUTPUT"
-          echo "::notice::opened $URL"
-
-      # The bar. Five runs at once, and every one of them must come back with
-      # zero failing SITES — not merely `conclusion: success`, and not the
-      # report's own `clean` field, which is computed after the blast radius
-      # defers what the PR could not have caused. That is the right question
-      # for an ordinary merge and the wrong one here: a deferred site still
-      # ran and still flaked, and this PR exists precisely to stop it doing so.
-      - name: Prove it with five fleet runs
-        id: prove
-        if: ${{ steps.pr.outputs.number != '' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node scripts/ci/prove-clean.mjs --pr "${{ steps.pr.outputs.number }}" --need 5 --go
-
-      - name: Merge on five clean, or leave it open with the reason
-        if: ${{ always() && steps.pr.outputs.number != '' }}
-        env:
-          GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          PR: ${{ steps.pr.outputs.number }}
-          PROVED: ${{ steps.prove.outcome }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -uo pipefail
-          if [ "$PROVED" = "success" ]; then
-            # `auto-merge` rather than `gh pr merge`: the label is the repo's
-            # own lever (ppap CI marks the PR ready and squash-merges it once
-            # its required checks are green), so the kill lands through the
-            # same path every other PR does instead of around it.
-            gh pr edit "$PR" --repo NamThuanVn/erp-namthuan --add-label auto-merge \
-              && echo "::notice::five clean fan-out runs — labelled auto-merge, PR #$PR lands on green"
-            jq -n --arg b "✅ **Five for five.** The fleet fan-out came back with zero failing sites across all five runs, which is the bar this PR was opened against. Labelled \`auto-merge\`; it lands as soon as its own required checks are green. ([fan-out]($RUN_URL))" \
-              '{body: $b}' | gh api -X POST "repos/NamThuanVn/erp-namthuan/issues/$PR/comments" --input - >/dev/null 2>&1 || true
-            exit 0
-          fi
-          echo "::warning::the fan-out did not come back five-for-five — PR #$PR stays open and unlabelled"
-          jq -n --arg b "⚠️ **The fan-out did not clear the bar.** This PR is NOT being merged. Either a site in the batch is still flaking, or the fix moved the failure somewhere else — the per-run verdicts and the sites each run saw are in the [fan-out log]($RUN_URL), and each run also reported as its own \`CI verify n/5\` check.
-
-          Tomorrow's sweep will hold rather than open a second batch on top of this one, so this PR wants a human before the hunter runs again." \
-            '{body: $b}' | gh api -X POST "repos/NamThuanVn/erp-namthuan/issues/$PR/comments" --input - >/dev/null 2>&1 || true
+          set -- $PR
+          case "${3:-}" in
+            -) echo "::warning::PR #$1 for $BRANCH is $2 but NOT merged — the fix did not land. Read its CI comment for what the fan-out saw; tomorrow's sweep holds while it is open." ;;
+            *) echo "::notice::PR #$1 merged — the noise it names is gone from main" ;;
+          esac
           exit 0
 
   # ── HUNT WHEN THE WINDOW IS QUIET ────────────────────────────────────────
