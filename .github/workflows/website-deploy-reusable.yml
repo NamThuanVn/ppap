@@ -34,11 +34,13 @@ on:
         required: true
       domain:
         description: >-
-          Optional public-host override. Normally EMPTY: the host is read from
-          `terraform output -raw hostname`, which is its single source of truth
-          (see terraform/locals.tf). Passing a literal here re-introduces the
-          duplication rule 1 of #1 exists to prevent — use it only to point a
-          one-off manual dispatch somewhere else.
+          Optional public-host override. Normally EMPTY: the hosts are read from
+          `terraform output -raw hostnames`, whose single source of truth is
+          terraform/locals.tf. Passing a literal here re-introduces the
+          duplication rule 1 of #1 exists to prevent, and PINS THE DEPLOY TO
+          THAT ONE HOST — every other host of the environment is detached from
+          the worker. Use it only to point a one-off manual dispatch somewhere
+          else.
         type: string
         required: false
         default: ''
@@ -210,6 +212,10 @@ jobs:
           ACC="$(jq -r '.cloudflare_account_id.value' /tmp/tf-outputs.json)"
           TOKEN="$(jq -r '.cloudflare_api_token.value' /tmp/tf-outputs.json)"
           HOST="$(jq -r '.hostname.value' /tmp/tf-outputs.json)"
+          # Every host of this environment, comma-separated, primary first.
+          # HOST stays the PRIMARY alone: it is what environment_url and the
+          # step summary point at.
+          HOSTS="$(jq -r '.hostnames.value // empty' /tmp/tf-outputs.json)"
           # Secrets Store wiring for CONTACT_WEBHOOK_URL. Both empty is valid:
           # until the endpoint decision lands the secret is not created, and the
           # contact route falls back to logging the enquiry. `// empty` so a
@@ -230,20 +236,27 @@ jobs:
             echo "::error::terraform outputs carry no Cloudflare credentials — check the ${TF_WORKSPACE} workspace variables"
             exit 1
           fi
-          # The hostname's single source of truth is terraform/locals.tf. The
-          # `domain` input is an override for one-off manual dispatches only.
+          # The hostnames' single source of truth is terraform/locals.tf. The
+          # `domain` input is an override for one-off manual dispatches only —
+          # it pins the deploy to a single host, detaching the rest.
           if [ -n "${DOMAIN_OVERRIDE:-}" ]; then
-            echo "::notice::domain overridden by workflow input: $DOMAIN_OVERRIDE (terraform says $HOST)"
+            echo "::notice::domain overridden by workflow input: $DOMAIN_OVERRIDE (terraform says ${HOSTS:-$HOST}) — the worker is attached to that host ALONE"
             HOST="$DOMAIN_OVERRIDE"
+            HOSTS="$DOMAIN_OVERRIDE"
           fi
           if [ -z "$HOST" ] || [ "$HOST" = "null" ]; then
             echo "::error::no hostname output from terraform and no domain input — nothing to attach the worker to"
             exit 1
           fi
+          # A workspace applied before `output.hostnames` existed emits only
+          # `hostname`. Falling back keeps such a run deploying its one host
+          # instead of dying on an empty route list.
+          [ -n "$HOSTS" ] && [ "$HOSTS" != "null" ] || HOSTS="$HOST"
           {
             echo "CLOUDFLARE_ACCOUNT_ID=$ACC"
             echo "CLOUDFLARE_API_TOKEN=$TOKEN"
             echo "SITE_HOSTNAME=$HOST"
+            echo "SITE_HOSTNAMES=$HOSTS"
             echo "SECRETS_STORE_ID=$STORE_ID"
             echo "CONTACT_WEBHOOK_SECRET_NAME=$SECRET_NAME"
             echo "ERP_SECRET_NAME=$ERP_SECRET_NAME"
@@ -266,10 +279,11 @@ jobs:
             echo "::warning::no enquiry delivery target configured for this environment — POST /api/contact will LOG and return delivered:false while still showing the visitor success. Set erp_gateway_url + erp_client_id + erp_client_secret, or contact_webhook_url, on the ${TF_WORKSPACE} workspace."
           fi
           echo "host=$HOST" >> "$GITHUB_OUTPUT"
-          echo "deploying to $HOST"
+          echo "deploying to $HOSTS (primary: $HOST)"
 
       # `pnpm deploy:<env>` renders wrangler.jsonc into wrangler.generated.jsonc
-      # with SITE_HOSTNAME as a custom_domain route, then runs wrangler deploy.
+      # with one custom_domain route per host in SITE_HOSTNAMES, then runs
+      # wrangler deploy.
       # See scripts/wrangler-config.mjs — wrangler has no config interpolation
       # and custom_domain cannot be set via --route.
       - name: Deploy worker
