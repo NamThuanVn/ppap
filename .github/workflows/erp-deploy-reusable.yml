@@ -1007,6 +1007,17 @@ jobs:
             echo "✓ Vectorize index '${INDEX}' created with metadata indexes."
           fi
 
+      # UC-09 MO release cutover gate (slice B, #3904) — read-only: refuses THIS
+      # deploy while an active DO-keyed Material Requirement release unit remains in
+      # the environment being deployed to, and names it (plus any Draft/Submitted
+      # Internal PO exposure) rather than trusting an authoring-time count. Runs after
+      # bindings resolve above so PROCUREMENT_DB already points at this environment,
+      # and before the leaf deploy below so a non-empty module blocks it.
+      # See docs/ba/1-projects/scnpms/tasks/UC-09-mo-release-cutover.
+      - name: MO release cutover gate (procurement)
+        if: ${{ contains(fromJSON(needs.changes.outputs.workers), 'procurement') }}
+        run: node scripts/ci/mo-release-cutover-gate.mjs
+
       # ── Tier order ────────────────────────────────────────────────────────
       - name: Deploy monitor (tail logs)
         if: ${{ contains(fromJSON(needs.changes.outputs.workers), 'monitor') }}
