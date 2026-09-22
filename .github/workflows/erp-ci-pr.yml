@@ -751,27 +751,15 @@ jobs:
 
           [View CI run]($RUN_URL)"
           fi
-          CID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
-            --jq '[.[] | select(.body|startswith("<!-- ci-report -->"))][0].id' 2>/dev/null)
-          if [ -n "$CID" ] && [ "$CID" != "null" ]; then
-            gh api -X PATCH "repos/$REPO/issues/comments/$CID" -f body="$BODY" >/dev/null 2>&1 \
-              && echo "✓ Updated CI report comment on PR #$PR_NUMBER" \
-              || echo "::warning::could not update CI report comment (PAT missing issues:write?)"
-          else
-            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$BODY" >/dev/null 2>&1 \
-              && echo "✓ Posted CI report comment on PR #$PR_NUMBER" \
-              || echo "::warning::could not post CI report comment (PAT missing issues:write?)"
-          fi
-          # ── The run log ──────────────────────────────────────────────────
-          # The report comment above is REPLACED every run, so a PR only ever
-          # shows its latest one. That answers "is it green now" and nothing a
-          # second run raises: was this flake here last time, did the push
-          # change anything, how many runs has it been clean. This keeps a
-          # second sticky comment with one row per run — a table for a human,
-          # the same rows as JSON in a hidden block for an agent.
+          # ── ONE comment: the latest report, then every run so far ────────
           #
-          # Scope is this PR only. The daily sweep owns the fleet-wide, multi-day
-          # picture; a second copy of it here would be a second answer.
+          # These used to be two. The report is REPLACED on every run, so a
+          # reader scrolling a PR found the latest verdict and no trace of the
+          # ones before it; the log held that sequence but sat in a separate
+          # comment the report's own text had to point at. Two comments, two
+          # lookups, two PATCHes — and the question a second run actually
+          # raises, *did my push change anything*, answered in neither place
+          # on its own. Current state on top, history beneath, one comment.
           #
           # `HEAD_SHA` comes from the dispatch payload and is EMPTY on a manual
           # workflow_dispatch re-run — which is exactly how a PR is driven
@@ -780,29 +768,58 @@ jobs:
           # the head column is how a reader tells which runs share a tree, and
           # a column of dashes would make the streak unreadable.
           #
-          # Best-effort: the log must never be why the report fails to post, so
-          # every step of it swallows its own errors.
+          # Best-effort throughout: the log must never be why the verdict
+          # fails to reach the PR, so a failure here falls back to posting the
+          # report on its own.
+          CID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq '[.[] | select(.body|startswith("<!-- ci-report -->"))][0].id' 2>/dev/null)
+          PREV=''
+          if [ -n "${CID:-}" ] && [ "$CID" != "null" ]; then
+            PREV=$(gh api "repos/$REPO/issues/comments/$CID" --jq .body 2>/dev/null || true)
+          fi
+
+          # A PR opened before the merge has its history in the OLD standalone
+          # log comment. Seed from it so the table carries over instead of
+          # restarting at row 1, and retire it once its rows have a new home —
+          # otherwise the PR keeps a stale, frozen copy of its own history
+          # directly under the live one.
+          OLD_LOG_CID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq '[.[] | select(.body|startswith("<!-- ci-run-log -->"))][0].id' 2>/dev/null || true)
+          if [ -n "${OLD_LOG_CID:-}" ] && [ "$OLD_LOG_CID" != "null" ]; then
+            case "$PREV" in
+              *ci-run-log-data*) : ;;  # already merged — the old one is just litter
+              *) PREV=$(gh api "repos/$REPO/issues/comments/$OLD_LOG_CID" --jq .body 2>/dev/null || printf '%s' "$PREV") ;;
+            esac
+          fi
+
+          COMBINED=''
           if [ -s "$LOGDIR/report2/data.json" ]; then
-            LOG_CID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
-              --jq '[.[] | select(.body|startswith("<!-- ci-run-log -->"))][0].id' 2>/dev/null || true)
-            PREV=''
-            if [ -n "${LOG_CID:-}" ] && [ "$LOG_CID" != "null" ]; then
-              PREV=$(gh api "repos/$REPO/issues/comments/$LOG_CID" --jq .body 2>/dev/null || true)
-            fi
-            LOG_BODY=$(printf '%s' "$PREV" | node scripts/ci/run-log.mjs \
+            printf '%s' "$BODY" > "$RUNNER_TEMP/ci-report-body.md"
+            COMBINED=$(printf '%s' "$PREV" | node scripts/ci/run-log.mjs \
               --report "$LOGDIR/report2/data.json" \
+              --report-body "$RUNNER_TEMP/ci-report-body.md" \
               --run-url "$RUN_URL" --head-sha "${HEAD_SHA:-${CURRENT_HEAD:-}}" 2>/dev/null || true)
-            if [ -n "$LOG_BODY" ]; then
-              if [ -n "${LOG_CID:-}" ] && [ "$LOG_CID" != "null" ]; then
-                gh api -X PATCH "repos/$REPO/issues/comments/$LOG_CID" -f body="$LOG_BODY" >/dev/null 2>&1 \
-                  && echo "✓ Updated CI run log on PR #$PR_NUMBER"
-              else
-                gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$LOG_BODY" >/dev/null 2>&1 \
-                  && echo "✓ Started CI run log on PR #$PR_NUMBER"
-              fi
-            else
-              echo "::warning::run-log render failed — skipping it"
-            fi
+          fi
+          if [ -z "$COMBINED" ]; then
+            echo "::warning::run-log render failed — posting the report without the history table"
+            COMBINED="$BODY"
+          fi
+
+          if [ -n "${CID:-}" ] && [ "$CID" != "null" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$CID" -f body="$COMBINED" >/dev/null 2>&1 \
+              && echo "✓ Updated CI comment on PR #$PR_NUMBER" \
+              || echo "::warning::could not update CI comment (PAT missing issues:write?)"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$COMBINED" >/dev/null 2>&1 \
+              && echo "✓ Posted CI comment on PR #$PR_NUMBER" \
+              || echo "::warning::could not post CI comment (PAT missing issues:write?)"
+          fi
+
+          # Retire the pre-merge log comment only AFTER its rows are safely in
+          # the combined one, so a failed PATCH above never loses history.
+          if [ -n "${OLD_LOG_CID:-}" ] && [ "$OLD_LOG_CID" != "null" ] && [ "$COMBINED" != "$BODY" ]; then
+            gh api -X DELETE "repos/$REPO/issues/comments/$OLD_LOG_CID" >/dev/null 2>&1 \
+              && echo "✓ Retired the standalone run-log comment — its rows are in the report now"
           fi
 
           # The consolidated comment is up, so the per-job progress comments have
