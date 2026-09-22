@@ -262,12 +262,14 @@ jobs:
 
       - name: Job summary
         if: always()
+        env:
+          UNPLANNED: ${{ steps.sweep.outputs.unplanned || 'n/a' }}
         run: |
           set -uo pipefail
           {
             echo "### Rel-plan — one planning pass"
             echo ""
-            echo "- **Unplanned at start:** ${{ steps.sweep.outputs.unplanned || 'n/a' }}"
+            printf -- '- **Unplanned at start:** %s\n' "$UNPLANNED"
             if [ -s "${AGENT_STATE_DIR}/agent-result.json" ]; then
               echo ""
               echo '```'

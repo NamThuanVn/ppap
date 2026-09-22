@@ -198,10 +198,11 @@ jobs:
       # reasoning tier rather than re-running an identical session. An explicit
       # `model` input always wins.
       - name: Resolve model
+        env:
+          EXPLICIT: ${{ github.event.client_payload.model || inputs.model || '' }}
         run: |
           set -euo pipefail
-          EXPLICIT="${{ github.event.client_payload.model || inputs.model || '' }}"
-          if [ -n "$EXPLICIT" ]; then
+          if [ -n "${EXPLICIT:-}" ]; then
             echo "CLAUDE_MODEL=$EXPLICIT" >> "$GITHUB_ENV"
             echo "· model: $EXPLICIT (explicit)"
           elif [ "${ATTEMPT}" -ge 2 ]; then
@@ -256,6 +257,23 @@ jobs:
       # REPAIR=1 → the wrapper runs `/repair-harness` (MCP stripped — nothing
       # registered them in this light bootstrap) with the usual token-pool probe,
       # rotation and mid-run failover, and owns the PR-CI wait on REPAIR_BRANCH.
+      #
+      # RUN A FROZEN COPY, never the checkout. bash reads a script LAZILY: it
+      # parses one command, remembers the byte offset, and seeks back to that
+      # offset for the next one. This is the ONE session whose job is to rewrite
+      # the harness, and scripts/agent/run/claude.sh is the file it most often
+      # has to fix — so the wrapper gets rewritten underneath the shell that is
+      # still executing it, which then resumes at a stale offset in the NEW file
+      # and runs whatever text now sits there. Run 35593143205 (2026-09-21) did
+      # exactly that: it diagnosed the fault, landed PR #3836, confirmed the
+      # merge — and then executed the middle of a COMMENT as a command and died
+      # `File name too long`, exit 126. A completed repair, filed as a failure.
+      #
+      # Copying scripts/ wholesale rather than claude.sh alone is deliberate: the
+      # wrapper resolves lib/continuation.sh, log-format.mjs, usage.mjs and
+      # ../../ci/parts.mjs through BASH_SOURCE, so they have to travel with it or
+      # a frozen wrapper would call live helpers. cwd stays the checkout, so
+      # everything the wrapper reads, writes or commits is unchanged.
       - name: Run ambulance
         id: run
         env:
@@ -263,7 +281,12 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           DEPS_OUTCOME: ${{ steps.deps.outcome }}
-        run: bash scripts/agent/run/claude.sh
+        run: |
+          set -euo pipefail
+          SNAPSHOT="$RUNNER_TEMP/harness-snapshot"
+          rm -rf "$SNAPSHOT"
+          cp -a scripts "$SNAPSHOT"
+          bash "$SNAPSHOT/agent/run/claude.sh"
 
       - name: Parse repair verdict
         id: verdict
@@ -305,25 +328,43 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      # Every dynamic value arrives as an ENVIRONMENT VARIABLE, never as a `${{ }}`
+      # substitution inside the script. A `${{ }}` in a `run:` block is textual: the
+      # runner splices the value into the shell SOURCE before bash ever sees it,
+      # so one shell metacharacter in it rewrites the program. `diagnosis` is
+      # free prose written by the repair session and then truncated, and on
+      # 2026-09-21 run 35650314680 truncated it mid-token, leaving an unbalanced
+      # backtick: bash read the rest of the step as an unterminated command
+      # substitution and died `unexpected EOF while looking for matching`,
+      # exit 2 — after the repair had landed as PR #3856 and the hold had
+      # already been cleared. A green repair, a red run, for a summary line.
+      # scripts/gate/ci/workflows.sh pass 0c keeps it that way.
       - name: Job summary
         if: always()
+        env:
+          FINGERPRINT: ${{ steps.hold.outputs.fingerprint || 'unknown' }}
+          VERDICT: ${{ steps.verdict.outputs.verdict || 'none' }}
+          OUTCOME: ${{ steps.execute.outputs.outcome || 'n/a' }}
+          PARKED: ${{ steps.execute.outputs.parked }}
+          REPAIR_PR: ${{ steps.verdict.outputs.pr }}
+          DIAGNOSIS: ${{ steps.verdict.outputs.diagnosis }}
         run: |
           set -euo pipefail
           {
             echo "### Agent · ambulance"
             echo
-            echo "- fingerprint: \`${{ steps.hold.outputs.fingerprint || 'unknown' }}\`"
-            echo "- attempt: ${ATTEMPT}"
-            echo "- verdict: **${{ steps.verdict.outputs.verdict || 'none' }}**"
-            echo "- outcome: ${{ steps.execute.outputs.outcome || 'n/a' }}"
-            if [ "${{ steps.execute.outputs.parked }}" = "true" ]; then
+            printf -- '- fingerprint: `%s`\n' "$FINGERPRINT"
+            printf -- '- attempt: %s\n' "$ATTEMPT"
+            printf -- '- verdict: **%s**\n' "$VERDICT"
+            printf -- '- outcome: %s\n' "$OUTCOME"
+            if [ "${PARKED:-}" = "true" ]; then
               echo "- **the loop is PARKED** — the repair budget is spent and the hold still stands"
             fi
-            if [ -n "${{ steps.verdict.outputs.pr }}" ]; then
-              echo "- PR: ${{ steps.verdict.outputs.pr }}"
+            if [ -n "${REPAIR_PR:-}" ]; then
+              printf -- '- PR: %s\n' "$REPAIR_PR"
             fi
             echo
-            echo "${{ steps.verdict.outputs.diagnosis }}"
+            printf '%s\n' "${DIAGNOSIS:-}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Alert only when the loop is genuinely stuck — the repair budget is gone

@@ -715,6 +715,8 @@ jobs:
 
       - name: Job summary
         if: always()
+        env:
+          SALVAGED: ${{ steps.salvage.outputs.salvaged || 'n/a' }}
         run: |
           set -uo pipefail
           {
@@ -728,7 +730,7 @@ jobs:
             if [ -s "${AGENT_STATE_DIR}/solve-verdict.json" ]; then
               echo "- **Verdict:** $(jq -r '.verdict + (if .data.pr then " (PR #\(.data.pr))" else "" end)' "${AGENT_STATE_DIR}/solve-verdict.json")"
             fi
-            echo "- **Salvaged:** ${{ steps.salvage.outputs.salvaged || 'n/a' }}"
+            printf -- '- **Salvaged:** %s\n' "$SALVAGED"
             echo ""
             if [ -s "${AGENT_STATE_DIR}/agent-result.json" ]; then
               SUBTYPE=$(jq -r '.subtype // "n/a"' "${AGENT_STATE_DIR}/agent-result.json")
