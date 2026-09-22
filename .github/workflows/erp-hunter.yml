@@ -273,7 +273,8 @@ jobs:
       keys: ${{ steps.batch.outputs.keys }}
       fixable: ${{ steps.scan.outputs.fixable_files }}
       summary: ${{ steps.scan.outputs.summary }}
-      pr_open: ${{ steps.guard.outputs.open }}
+      open_pr: ${{ steps.guard.outputs.open_pr }}
+      open_branch: ${{ steps.guard.outputs.open_branch }}
     # ~1.5k REST calls for a 7-day window over the 16-repo fleet (two run
     # listings per repo, one job listing per run, one log download per
     # test-bearing job), six in flight at a time. Measured serially at ~35
@@ -415,7 +416,20 @@ jobs:
       # tomorrow's before today's has landed makes a red run unattributable —
       # and the second PR would be cut from a main that still carries the
       # first one's flake, so its fan-out would fail on work already done.
-      - name: Hold the kill while a hunter PR is still open
+      # An already-open hunter PR is ADOPTED, not waited on.
+      #
+      # This used to hold: one open `chore/ci-noise*` PR and every later sweep
+      # skipped the kill entirely, for ever, until a human closed it. A bad
+      # trade both ways — the flakes that PR was fixing stay ambient AND the
+      # ones it never reached are never looked for. #3845 was closed by hand
+      # purely to unblock the next run, which is the shape of a mechanism that
+      # parks itself.
+      #
+      # Only the NEWEST is adopted. Two open hunter PRs should be impossible
+      # (this is what stops a second being opened), but if it ever happens,
+      # picking one deterministically beats guessing, and the older one is
+      # named in the log so a human can see it.
+      - name: Adopt an open hunter PR, if there is one
         id: guard
         if: ${{ always() }}
         env:
@@ -423,13 +437,22 @@ jobs:
         run: |
           set -uo pipefail
           OPEN=$(gh pr list --repo NamThuanVn/erp-namthuan --state open \
-                   --json number,headRefName \
-                   --jq '[.[] | select(.headRefName | startswith("chore/ci-noise"))] | length' 2>/dev/null || echo 0)
-          if [ "${OPEN:-0}" -gt 0 ]; then
-            echo "::notice::a noise-hunter PR is still open — holding today's kill until it lands"
-            echo 'open=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'open=false' >> "$GITHUB_OUTPUT"
+                   --json number,headRefName,updatedAt \
+                   --jq '[.[] | select(.headRefName | startswith("chore/ci-noise"))]
+                         | sort_by(.updatedAt) | reverse' 2>/dev/null || echo '[]')
+          N=$(printf '%s' "$OPEN" | jq 'length' 2>/dev/null || echo 0)
+          if [ "${N:-0}" -eq 0 ]; then
+            echo 'open_pr=' >> "$GITHUB_OUTPUT"
+            echo "no hunter PR open — this run starts a fresh batch"
+            exit 0
+          fi
+          PR=$(printf '%s' "$OPEN" | jq -r '.[0].number')
+          BR=$(printf '%s' "$OPEN" | jq -r '.[0].headRefName')
+          echo "open_pr=$PR" >> "$GITHUB_OUTPUT"
+          echo "open_branch=$BR" >> "$GITHUB_OUTPUT"
+          echo "::notice::adopting the open hunter PR #$PR ($BR) — finishing it instead of opening a second"
+          if [ "$N" -gt 1 ]; then
+            echo "::warning::$N hunter PRs are open, which should not happen. Adopting the most recently updated (#$PR); the rest want a human: $(printf '%s' "$OPEN" | jq -r '.[1:][].number' | tr '\n' ' ')"
           fi
           exit 0
 
@@ -545,11 +568,11 @@ jobs:
     # is neither a count nor zero and must not be read as "go".
     if: >-
       ${{ !inputs.dry_run
-          && needs.hunt-noise.outputs.pr_open == 'false'
-          && ((needs.hunt-noise.outputs.sites != '0'
-               && needs.hunt-noise.outputs.sites != 'unknown'
-               && needs.hunt-noise.outputs.sites != '')
-              || needs.hunt-noise.outputs.fixable != '') }}
+          && (needs.hunt-noise.outputs.open_pr != ''
+              || ((needs.hunt-noise.outputs.sites != '0'
+                   && needs.hunt-noise.outputs.sites != 'unknown'
+                   && needs.hunt-noise.outputs.sites != '')
+                  || needs.hunt-noise.outputs.fixable != '')) }}
     runs-on: ubuntu-latest
     # A fixer session plus five watched CI runs. The session is bounded by the
     # harness's own budgets; the fan-out is ~20 min for the slowest run. Five
@@ -625,13 +648,16 @@ jobs:
       - name: Branch + fork layout + identity
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          OPEN_PR: ${{ needs.hunt-noise.outputs.open_pr }}
+          OPEN_BRANCH: ${{ needs.hunt-noise.outputs.open_branch }}
         run: |
           set -euo pipefail
           [ -n "${FORK_REPO:-}" ] || {
             echo "::error::AGENT_FORK_REPO is unset on this repo — the session has nowhere to push. Set it to the shared agent fork (docs/engineering/platform/ppap-agent-runs.md § Agent runs)."
             exit 1
           }
-          BRANCH="chore/ci-noise-$(date -u +%Y%m%d-%H%M)"
+          # Adopting? Take the PR's own branch. Cutting fresh? A new one.
+          BRANCH="${OPEN_BRANCH:-chore/ci-noise-$(date -u +%Y%m%d-%H%M)}"
           git remote rename origin upstream
           git remote add origin "https://github.com/${FORK_REPO}.git"
           bash scripts/ci/ppap/sync-fork-main.sh "$FORK_REPO"
@@ -640,9 +666,18 @@ jobs:
           LOGIN=$(gh api user --jq .login)
           git config user.name "$LOGIN"
           git config user.email "${LOGIN}@users.noreply.github.com"
-          git checkout -b "$BRANCH"
+          if [ -n "${OPEN_BRANCH:-}" ]; then
+            # The commits are already on the fork; check them out rather than
+            # branching off main, or the session would "continue" an empty
+            # branch and re-do work that is already in the PR.
+            git fetch origin "$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+            echo "✓ continuing PR #${OPEN_PR} on $BRANCH via $FORK_REPO as @$LOGIN"
+          else
+            git checkout -b "$BRANCH"
+            echo "✓ shipping from $BRANCH via $FORK_REPO as @$LOGIN"
+          fi
           echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
-          echo "✓ shipping from $BRANCH via $FORK_REPO as @$LOGIN"
 
       - uses: ./.github/actions/install
 
@@ -654,7 +689,7 @@ jobs:
       # /ship-pr stages everything, so this needs no commit of its own.
       - name: Fix the biome warnings the sweep named
         id: biome
-        if: ${{ needs.hunt-noise.outputs.fixable != '' }}
+        if: ${{ needs.hunt-noise.outputs.fixable != '' && needs.hunt-noise.outputs.open_pr == '' }}
         env:
           FIXABLE: ${{ needs.hunt-noise.outputs.fixable }}
         run: |
@@ -667,6 +702,22 @@ jobs:
             echo "biome rewrote $(git diff --name-only | wc -l | tr -d ' ') file(s)"
           fi
           exit 0
+
+      # Adopting an open PR? The sweep's batch is not what this run is for —
+      # finishing #N is. Overwrite the brief rather than teaching hunt-noise
+      # about a decision the guard has already made.
+      - name: Write the continue brief when adopting a PR
+        if: ${{ needs.hunt-noise.outputs.open_pr != '' }}
+        env:
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          node scripts/ci/noise-fix.mjs plan \
+            --continue-pr "${{ needs.hunt-noise.outputs.open_pr }}" \
+            --continue-branch "${{ needs.hunt-noise.outputs.open_branch }}" \
+            --run-url "$RUN_URL" \
+            --brief "$RUNNER_TEMP/noise/fix-brief.md"
+          echo "✓ brief rewritten to finish PR #${{ needs.hunt-noise.outputs.open_pr }}"
 
       - name: Install Claude Code CLI
         if: ${{ needs.hunt-noise.outputs.sites != '0' }}
@@ -697,7 +748,7 @@ jobs:
       # says plainly what happened.
       - name: Fix the flaky sites and ship the PR
         id: fixer
-        if: ${{ needs.hunt-noise.outputs.sites != '0' }}
+        if: ${{ needs.hunt-noise.outputs.open_pr != '' || needs.hunt-noise.outputs.sites != '0' }}
         continue-on-error: true
         env:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
@@ -718,7 +769,7 @@ jobs:
           exit 0
 
       - name: Upload the fixer session
-        if: ${{ always() && needs.hunt-noise.outputs.sites != '0' }}
+        if: ${{ always() && steps.fixer.conclusion != 'skipped' }}
         continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
@@ -794,14 +845,18 @@ jobs:
   hunt-fresh:
     name: Hunt fresh noise on main
     needs: hunt-noise
-    # The gate is "the sweep found nothing to kill": no ambient site and no
-    # biome warning. `''` (the step never ran) and `unknown` (the planner
+    # The gate is "the sweep found nothing to kill AND nothing is already in
+    # flight": no ambient site, no biome warning, and no open hunter PR. That
+    # last one matters — a run that is finishing an existing PR has plenty to
+    # do, and sampling the trunk on top of it would spend five more runs of
+    # fleet on a question nobody asked. `''` (the step never ran) and `unknown` (the planner
     # crashed) both fall through and sample nothing — an absent answer is not
     # a clean one, and sampling the trunk on the strength of a crash would
     # spend five CI runs to learn what we already failed to read.
     if: >-
       ${{ needs.hunt-noise.outputs.sites == '0'
           && needs.hunt-noise.outputs.fixable == ''
+          && needs.hunt-noise.outputs.open_pr == ''
           && inputs.fresh_hunt && !inputs.dry_run }}
     runs-on: ubuntu-latest
     # Five CI runs dispatched at once and watched to completion: ~20 minutes
