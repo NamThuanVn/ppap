@@ -635,6 +635,33 @@ jobs:
           name: ci-noise-fleet
           path: ${{ runner.temp }}/noise/
 
+      # BEFORE the branch switch below, and that ordering is the whole point.
+      #
+      # Adopting checks out the PR's own branch, which replaces the working
+      # tree with THAT branch's copy of the repo — including this very script.
+      # A hunter PR is cut from whatever `main` was when it opened, so its copy
+      # can predate the continue mode entirely: run 35703945588 failed with
+      # "--report is required and must parse" because it was executing #3885's
+      # month-old noise-fix.mjs, not main's. The brief is written here, while
+      # the tree is still main's, and lands in RUNNER_TEMP, which the checkout
+      # cannot touch.
+      #
+      # Adopting an open PR? The sweep's batch is not what this run is for —
+      # finishing #N is. Overwriting the brief keeps that decision with the
+      # guard rather than teaching hunt-noise about it.
+      - name: Write the continue brief when adopting a PR
+        if: ${{ needs.hunt-noise.outputs.open_pr != '' }}
+        env:
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          node scripts/ci/noise-fix.mjs plan \
+            --continue-pr "${{ needs.hunt-noise.outputs.open_pr }}" \
+            --continue-branch "${{ needs.hunt-noise.outputs.open_branch }}" \
+            --run-url "$RUN_URL" \
+            --brief "$RUNNER_TEMP/noise/fix-brief.md"
+          echo "✓ brief rewritten to finish PR #${{ needs.hunt-noise.outputs.open_pr }}"
+
       # The SAME layout every agent lane uses, and for the same reason: the
       # session ships with /ship-pr, which pushes to `origin` and opens the PR
       # against `upstream`. Give it anything else and /ship-pr — a command
@@ -672,6 +699,24 @@ jobs:
             # branch and re-do work that is already in the PR.
             git fetch origin "$BRANCH"
             git checkout -B "$BRANCH" "origin/$BRANCH"
+
+            # …and then bring main IN. Checking out the PR's branch replaces
+            # the whole working tree with that branch's copy of the repo,
+            # tooling included — so a PR cut a week ago runs the session on a
+            # week-old scripts/agent/run/claude.sh, which may not even have the
+            # mode this job invokes. It also means the session would be fixing
+            # flakes against a base nobody is on any more.
+            #
+            # A conflict is not this job's to resolve: it means the PR needs a
+            # human or a session that can read the conflict, so leave the
+            # branch as it was and say so rather than guessing at a merge.
+            git fetch upstream main
+            if git merge --no-edit upstream/main; then
+              echo "✓ merged main into $BRANCH — the session runs current tooling against a current base"
+            else
+              git merge --abort || true
+              echo "::warning::$BRANCH conflicts with main; continuing on the branch as-is. The session is running OLDER tooling from that branch and fixing against an older base — if it cannot resolve this, the PR wants a human."
+            fi
             echo "✓ continuing PR #${OPEN_PR} on $BRANCH via $FORK_REPO as @$LOGIN"
           else
             git checkout -b "$BRANCH"
@@ -702,22 +747,6 @@ jobs:
             echo "biome rewrote $(git diff --name-only | wc -l | tr -d ' ') file(s)"
           fi
           exit 0
-
-      # Adopting an open PR? The sweep's batch is not what this run is for —
-      # finishing #N is. Overwrite the brief rather than teaching hunt-noise
-      # about a decision the guard has already made.
-      - name: Write the continue brief when adopting a PR
-        if: ${{ needs.hunt-noise.outputs.open_pr != '' }}
-        env:
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          node scripts/ci/noise-fix.mjs plan \
-            --continue-pr "${{ needs.hunt-noise.outputs.open_pr }}" \
-            --continue-branch "${{ needs.hunt-noise.outputs.open_branch }}" \
-            --run-url "$RUN_URL" \
-            --brief "$RUNNER_TEMP/noise/fix-brief.md"
-          echo "✓ brief rewritten to finish PR #${{ needs.hunt-noise.outputs.open_pr }}"
 
       - name: Install Claude Code CLI
         if: ${{ needs.hunt-noise.outputs.sites != '0' }}
