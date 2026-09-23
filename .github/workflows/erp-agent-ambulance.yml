@@ -50,7 +50,12 @@ name: ERP · Agent · ambulance
 # only, never to the CI fleet. NOTE the transcript artifact and logs are PUBLIC
 # (accepted trade-off — see docs/engineering/platform/ppap-agent-runs.md).
 
-run-name: 'ERP · Agent · ambulance'
+# The scope is IN THE NAME, and load-bearing: gate.mjs's ambulanceInFlight()
+# reads it to tell a hunter repair from a fleet one, so that a hunter fault
+# cannot stop the loop dispatching a repair the BA lanes are waiting on. A run
+# with no scope is a fleet repair — which is every run before the hunter was
+# wired in, and every lane repair since.
+run-name: "ERP · Agent · ambulance${{ github.event.client_payload.scope && format(' · {0}', github.event.client_payload.scope) || '' }}"
 
 on:
   repository_dispatch:
@@ -73,8 +78,14 @@ permissions: read-all
 # One ambulance at a time. cancel-in-progress stays false: an ambulance mid-fix
 # must never be killed halfway — it could leave a half-pushed branch and an
 # unspent verdict, and the controller would read that as "no repair happened".
+#
+# PER SCOPE. A lane repair and a hunter repair are independent subsystems, and
+# one group for both would make a hunter fault serialise — and therefore
+# delay — a repair the whole BA fleet is waiting on. The scope also reaches
+# `ambulanceInFlight()` in the loop's gate, which must not see a hunter repair
+# and conclude the fleet already has one.
 concurrency:
-  group: agent-ambulance
+  group: agent-ambulance-${{ github.event.client_payload.scope || 'fleet' }}
   cancel-in-progress: false
 
 env:

@@ -84,6 +84,10 @@ on:
         description: 'When the pooled window has nothing to kill, sample main to make fresh evidence. The re-entry pass sets this false so a hunt can never chain into another.'
         type: boolean
         default: true
+      smoke:
+        description: 'Prove the kill job WIRING without spending a session: every step runs for real, the fixer is stubbed, and the branch is deleted at the end. Minutes instead of the ~2 hours a real run costs to surface an env or ordering fault. Nothing is merged and no PR is opened.'
+        type: boolean
+        default: false
       round:
         description: 'Handoff round. A session that spends its budget with its PR still open re-calls the hunter to carry on, and each re-call increments this. Bounded by MAX_ROUNDS in the recall step so a PR that cannot be finished stops asking.'
         type: string
@@ -277,6 +281,7 @@ jobs:
       keys: ${{ steps.batch.outputs.keys }}
       fixable: ${{ steps.scan.outputs.fixable_files }}
       summary: ${{ steps.scan.outputs.summary }}
+      held: ${{ steps.held.outputs.blocked }}
       open_pr: ${{ steps.guard.outputs.open_pr }}
       open_branch: ${{ steps.guard.outputs.open_branch }}
     # ~1.5k REST calls for a 7-day window over the 16-repo fleet (two run
@@ -340,8 +345,25 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      # ── THE GAP THIS CLOSES ───────────────────────────────────────────────
+      #
+      # A hold standing means the harness is known-broken and a repair is
+      # either in flight or has given up. Sweeping anyway costs a ~2-hour run
+      # to rediscover a fault someone is already fixing — and worse, a second
+      # failure raises a second fingerprint and burns another of only three
+      # repair attempts on the same root cause.
+      #
+      # Only the hunter stops. This reads HUNTER_HOLD; the lanes gate on
+      # AGENT_LOOP_HOLD and never see it.
+      - name: Stand down while the harness is being repaired
+        id: held
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node scripts/agent/board/recover/hunter-hold.mjs check
+
       - name: Scan the fleet's CI logs
         id: scan
+        if: ${{ steps.held.outputs.blocked != 'true' }}
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           DAYS: ${{ inputs.days || '7' }}
@@ -570,9 +592,15 @@ jobs:
     # Three conditions, and the middle one is the one that is easy to get
     # wrong: `sites` is the string `unknown` when the planner crashed, which
     # is neither a count nor zero and must not be read as "go".
+    #
+    # `smoke` runs it regardless of what the sweep found: the point is to
+    # exercise the WIRING, and a night with nothing to kill is exactly when a
+    # broken step would otherwise go unnoticed until the next real batch.
     if: >-
       ${{ !inputs.dry_run
-          && (needs.hunt-noise.outputs.open_pr != ''
+          && needs.hunt-noise.outputs.held != 'true'
+          && (inputs.smoke
+              || needs.hunt-noise.outputs.open_pr != ''
               || ((needs.hunt-noise.outputs.sites != '0'
                    && needs.hunt-noise.outputs.sites != 'unknown'
                    && needs.hunt-noise.outputs.sites != '')
@@ -656,15 +684,26 @@ jobs:
       - name: Write the continue brief when adopting a PR
         if: ${{ needs.hunt-noise.outputs.open_pr != '' }}
         env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          # The PR's own CI comment carries the run log — one row per run, with
+          # the head each was measuring. That is what lets a recalled session
+          # see which sites survived an earlier fix, i.e. which explanations
+          # have already been tried and disproved. Best-effort: a comment that
+          # cannot be read costs the hindsight, not the run.
+          gh api "repos/NamThuanVn/erp-namthuan/issues/${{ needs.hunt-noise.outputs.open_pr }}/comments" \
+            --jq '[.[] | select(.body | startswith("<!-- ci-report -->"))][0].body // ""' \
+            > "$RUNNER_TEMP/noise/pr-comment.md" 2>/dev/null || : > "$RUNNER_TEMP/noise/pr-comment.md"
           node scripts/ci/noise-fix.mjs plan \
             --continue-pr "${{ needs.hunt-noise.outputs.open_pr }}" \
             --continue-branch "${{ needs.hunt-noise.outputs.open_branch }}" \
             --run-url "$RUN_URL" \
+            --round "${{ inputs.round || '1' }}" \
+            --run-log "$RUNNER_TEMP/noise/pr-comment.md" \
             --brief "$RUNNER_TEMP/noise/fix-brief.md"
-          echo "✓ brief rewritten to finish PR #${{ needs.hunt-noise.outputs.open_pr }}"
+          echo "✓ brief rewritten to finish PR #${{ needs.hunt-noise.outputs.open_pr }} (round ${{ inputs.round || '1' }})"
 
       # The SAME layout every agent lane uses, and for the same reason: the
       # session ships with /ship-pr, which pushes to `origin` and opens the PR
@@ -681,6 +720,7 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           OPEN_PR: ${{ needs.hunt-noise.outputs.open_pr }}
           OPEN_BRANCH: ${{ needs.hunt-noise.outputs.open_branch }}
+          SMOKE: ${{ inputs.smoke }}
         run: |
           set -euo pipefail
           [ -n "${FORK_REPO:-}" ] || {
@@ -688,7 +728,16 @@ jobs:
             exit 1
           }
           # Adopting? Take the PR's own branch. Cutting fresh? A new one.
-          BRANCH="${OPEN_BRANCH:-chore/ci-noise-$(date -u +%Y%m%d-%H%M)}"
+          #
+          # A SMOKE run never takes either: `chore/ci-noise*` is the prefix the
+          # adopt guard and the 5-way sampling rule both key on, so a scratch
+          # branch wearing it would be adopted by the next real run and
+          # sampled five ways. `smoke/` is outside every one of those rules.
+          if [ "${SMOKE:-}" = "true" ]; then
+            BRANCH="smoke/hunter-${GITHUB_RUN_ID}"
+          else
+            BRANCH="${OPEN_BRANCH:-chore/ci-noise-$(date -u +%Y%m%d-%H%M)}"
+          fi
           git remote rename origin upstream
           git remote add origin "https://github.com/${FORK_REPO}.git"
           bash scripts/ci/ppap/sync-fork-main.sh "$FORK_REPO"
@@ -697,7 +746,7 @@ jobs:
           LOGIN=$(gh api user --jq .login)
           git config user.name "$LOGIN"
           git config user.email "${LOGIN}@users.noreply.github.com"
-          if [ -n "${OPEN_BRANCH:-}" ]; then
+          if [ -n "${OPEN_BRANCH:-}" ] && [ "${SMOKE:-}" != "true" ]; then
             # The commits are already on the fork; check them out rather than
             # branching off main, or the session would "continue" an empty
             # branch and re-do work that is already in the PR.
@@ -752,8 +801,10 @@ jobs:
           fi
           exit 0
 
+      # Not in smoke: AGENT_SMOKE exits before the CLI is ever invoked, and
+      # installing it would add ~30s to a path whose whole point is speed.
       - name: Install Claude Code CLI
-        if: ${{ needs.hunt-noise.outputs.sites != '0' }}
+        if: ${{ !inputs.smoke && needs.hunt-noise.outputs.sites != '0' }}
         env:
           CLAUDE_VERSION: '2.1.267'
         run: |
@@ -781,7 +832,7 @@ jobs:
       # says plainly what happened.
       - name: Fix the flaky sites and ship the PR
         id: fixer
-        if: ${{ needs.hunt-noise.outputs.open_pr != '' || needs.hunt-noise.outputs.sites != '0' }}
+        if: ${{ inputs.smoke || needs.hunt-noise.outputs.open_pr != '' || needs.hunt-noise.outputs.sites != '0' }}
         continue-on-error: true
         env:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
@@ -789,6 +840,10 @@ jobs:
           HUNT_BRIEF: ${{ runner.temp }}/noise/fix-brief.md
           HUNT_BRANCH: ${{ env.BRANCH }}
           AGENT_STATE_DIR: ${{ runner.temp }}
+          # Runs mode detection, the env preconditions and the budget
+          # resolution, then stops. That is where both of the expensive
+          # env faults lived, and it costs a second instead of a session.
+          AGENT_SMOKE: ${{ inputs.smoke && '1' || '' }}
         run: bash scripts/agent/run/claude.sh
 
       # `continue-on-error` above keeps a half-finished session's edits, which
@@ -848,8 +903,105 @@ jobs:
       # Only ever recalls for a PR that EXISTS and is OPEN. A merged PR is
       # done, and no PR means nothing shipped — recalling for either would
       # spend a runner to re-derive what is already known.
+      # ── SMOKE: prove the half a stubbed session cannot ────────────────────
+      #
+      # AGENT_SMOKE covers everything up to the session. This covers what comes
+      # after it: that a commit survives the pre-commit gate and that the push
+      # has a working credential. Those are not theoretical — the push once
+      # asked an unattended runner for `Username for 'https://github.com':`
+      # because the checkout is `persist-credentials: false` and nothing had
+      # run `gh auth setup-git` (run 35602930767).
+      #
+      # A token change to a file git already tracks, so `git add -A` behaves as
+      # it would on a real fix. The branch is deleted at the end whatever
+      # happens — a `smoke/` branch left on the fork is litter, and the `always()`
+      # is what stops a failure above leaving one behind.
+      - name: Smoke — commit and push for real, then clean up
+        if: ${{ inputs.smoke }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          printf '\n<!-- hunter smoke %s -->\n' "$GITHUB_RUN_ID" >> docs/engineering/platform/ppap-hunters.md
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::error::smoke staged nothing — 'git add -A' is not seeing the change, which a real fix would hit too"
+            exit 1
+          fi
+          if ! git commit -q -m "chore(ci): hunter smoke run ${GITHUB_RUN_ID}"; then
+            echo "::error::smoke could not commit — the pre-commit gate rejected a one-line docs change, so it would reject a real fix too. Read the gate output above."
+            exit 1
+          fi
+          if ! git push "https://x-access-token:${RESOLVED_PAT}@github.com/${FORK_REPO}.git" "$BRANCH"; then
+            echo "::error::smoke could not push — a real session would reach this point with a finished fix and lose it. Check gh auth setup-git and the pooled PAT's scope."
+            exit 1
+          fi
+          echo "✓ smoke: commit survived the pre-commit gate and the push authenticated"
+
+      - name: Smoke — delete the scratch branch
+        if: ${{ always() && inputs.smoke }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          case "${BRANCH:-}" in
+            smoke/*) ;;
+            *) echo "::warning::refusing to delete '${BRANCH:-}' — smoke only ever deletes a smoke/ branch"; exit 0 ;;
+          esac
+          gh api -X DELETE "repos/${FORK_REPO}/git/refs/heads/${BRANCH}" >/dev/null 2>&1 \
+            && echo "✓ smoke: deleted ${BRANCH}" \
+            || echo "· smoke: ${BRANCH} was never pushed, nothing to delete"
+          exit 0
+
+      # ── CALL AN AMBULANCE WHEN THE HARNESS BREAKS ─────────────────────────
+      #
+      # The agent lanes have repaired their own harness for months: a lane
+      # dies, a hold is raised, the ambulance runs /repair-harness, and the fix
+      # merges. Three of those landed in scripts/agent/run/claude.sh in two
+      # days — the very file this job runs on. The hunter was the one consumer
+      # outside that loop, and it showed: nineteen harness fixes in two days,
+      # every one diagnosed by a human.
+      #
+      # SCOPED, so a flaky-test fixer crashing cannot stop BA work. The hold
+      # goes in this job's own HUNTER_HOLD variable and travels to the
+      # ambulance in the dispatch payload; AGENT_LOOP_HOLD — the one the lanes
+      # gate on — is never touched. Same trick salvage-or-revert.mjs already
+      # uses for an item-scoped hold.
+      #
+      # Only a HARNESS fault qualifies. A handoff (budget spent, PR open) exits
+      # 0 as `handed-off` and is a success; a session that shipped a PR but
+      # could not finish is the work being hard. Treating either as a fault
+      # would burn one of only three repair attempts on nothing.
+      - name: Call an ambulance if the harness broke
+        if: ${{ always() && !inputs.dry_run && !inputs.smoke }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          AGENT_STATE_DIR: ${{ runner.temp }}
+          JOB_STATUS: ${{ job.status }}
+          FAILED_STEP: ${{ steps.fixer.outcome == 'failure' && 'Fix the flaky sites and ship the PR' || '' }}
+        run: |
+          set -uo pipefail
+          # The exit reason claude.sh recorded, when it got that far. Absent
+          # means it never started — which is itself a harness fault.
+          REASON=$(jq -r '.reason // ""' "$RUNNER_TEMP/agent-exit.json" 2>/dev/null || echo '')
+          PR_OPENED=false
+          if [ -n "${BRANCH:-}" ]; then
+            FORK_OWNER="${FORK_REPO%%/*}"
+            COUNT=$(gh api "repos/NamThuanVn/erp-namthuan/pulls?state=all&head=${FORK_OWNER}:${BRANCH}&per_page=1" --jq 'length' 2>/dev/null || echo 0)
+            [ "${COUNT:-0}" -gt 0 ] && PR_OPENED=true
+          fi
+          node scripts/agent/board/recover/hunter-hold.mjs raise \
+            --step "${FAILED_STEP:-Fix the flaky sites and ship the PR}" \
+            --job-conclusion "${JOB_STATUS}" \
+            --exit-reason "$REASON" \
+            --pr-opened "$PR_OPENED" \
+            --error "$(printf '%s' "${REASON:-}" | head -c 200)"
+          exit 0
+
       - name: Recall the hunter to finish an open PR
-        if: ${{ always() && !inputs.dry_run }}
+        if: ${{ always() && !inputs.dry_run && !inputs.smoke }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
@@ -884,7 +1036,7 @@ jobs:
           exit 0
 
       - name: Say plainly whether the session got its PR merged
-        if: ${{ always() }}
+        if: ${{ always() && !inputs.smoke }}
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
@@ -943,7 +1095,8 @@ jobs:
     # a clean one, and sampling the trunk on the strength of a crash would
     # spend five CI runs to learn what we already failed to read.
     if: >-
-      ${{ needs.hunt-noise.outputs.sites == '0'
+      ${{ needs.hunt-noise.outputs.held != 'true'
+          && needs.hunt-noise.outputs.sites == '0'
           && needs.hunt-noise.outputs.fixable == ''
           && needs.hunt-noise.outputs.open_pr == ''
           && inputs.fresh_hunt && !inputs.dry_run }}
