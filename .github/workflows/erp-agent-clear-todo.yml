@@ -16,9 +16,12 @@ name: ERP · Agent · clear-todo-issue
 #      confirmed-merged PR, or emits a typed solve-verdict block. ZERO board
 #      writes inside the session.
 #   3. EXECUTORS (typed on the parsed verdict): finalize-merged / execute-park /
-#      execute-split / execute-abandoned mutate the board — every verdict has
-#      one, and each lands the item in a TERMINAL column (Done or Pending), so
-#      no verdict can return it to Todo to be re-claimed and re-decided;
+#      execute-split / execute-abandoned / execute-blocked mutate the board —
+#      every verdict has one. MERGED/PARK/SPLIT/ABANDONED land the item in a
+#      TERMINAL column (Done or Pending); BLOCKED instead returns it to Todo,
+#      but with an open `blocked by` edge the claim walk and COUNT_ONLY probe
+#      both exclude — so no verdict can return a CLAIMABLE item to Todo to be
+#      re-claimed and re-decided;
 #      salvage-or-revert is the backstop for a
 #      run that died without a verdict — it preserves WIP on a
 #      salvage/<issue>-<run_id> branch + draft PR + Claude-session artifact,
@@ -536,6 +539,18 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: node scripts/agent/board/verdict/execute-split.mjs
 
+      # BLOCKED is the one verdict that returns the item to Todo instead of a
+      # terminal column — safe only because it never leaves without a
+      # confirmed OPEN blockedBy edge (falling back to PARK otherwise), which
+      # is what keeps it invisible to the claim walk and COUNT_ONLY probe
+      # until the blocker closes.
+      - name: Execute blocked
+        id: blocked
+        if: always() && steps.outcome.outputs.verdict == 'BLOCKED'
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node scripts/agent/board/verdict/execute-blocked.mjs
+
       # ABANDONED is a TERMINAL verdict and needs an executor like the other
       # three: without one the run exited success with the item still In
       # Progress + assigned, the stranded sweep pushed it back to Todo ~30 min
@@ -588,7 +603,7 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           RUN_OUTCOME: ${{ steps.run.outcome }}
           VERDICT: ${{ steps.outcome.outputs.verdict || 'NONE' }}
-          EXECUTOR_FAILED: ${{ steps.finalize.outcome == 'failure' || steps.park.outcome == 'failure' || steps.split.outcome == 'failure' || steps.abandoned.outcome == 'failure' }}
+          EXECUTOR_FAILED: ${{ steps.finalize.outcome == 'failure' || steps.park.outcome == 'failure' || steps.split.outcome == 'failure' || steps.abandoned.outcome == 'failure' || steps.blocked.outcome == 'failure' }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           STALE_REF_HOURS: ${{ vars.STALE_REF_HOURS || '3.5' }}
         run: node scripts/agent/board/recover/salvage-or-revert.mjs
@@ -840,7 +855,8 @@ jobs:
           steps.finalize.outcome != 'failure' &&
           steps.park.outcome != 'failure' &&
           steps.split.outcome != 'failure' &&
-          steps.abandoned.outcome != 'failure'
+          steps.abandoned.outcome != 'failure' &&
+          steps.blocked.outcome != 'failure'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}

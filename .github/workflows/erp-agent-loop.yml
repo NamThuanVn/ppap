@@ -12,7 +12,7 @@ name: ERP · Agent · loop
 #   · by ba-to-issues.yml in the private repo after a merged BA-docs PR minted
 #     at least one sweepable (`bug`/`task`) issue;
 #   · by each agent run that EXECUTED a solve-verdict (MERGED / PARK / SPLIT /
-#     ABANDONED with green executor steps) — the "Continue loop" step in
+#     ABANDONED / BLOCKED with green executor steps) — the "Continue loop" step in
 #     erp-agent-clear-todo.yml chains the next lane immediately (lowest latency);
 #   · by the `workflow_run` trigger on ANY agent-clear-todo / rel-plan
 #     completion — success, failure, cancelled, or spot-reclaimed. This is what
