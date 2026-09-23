@@ -425,6 +425,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm duplicates
 
+      # The e2e zone bundle cache key must name every package a zone is BUILT
+      # from. It skips the build on a hit, so a key that misses one serves a
+      # bundle compiled from source this PR never contained — and the e2e suite
+      # then tests yesterday's code, green all the way. Runs here as well as
+      # locally because the key lives in THIS file, which a PR can edit.
+      - name: Zone bundle cache key covers every build input
+        if: ${{ !cancelled() }}
+        run: node scripts/gate/ci/zone-cache-key.mjs
+
       # ...and the gate that keeps the two lists in step. `audit.sh` owns the gate
       # list; this workflow re-enumerates it BY HAND. Nothing compared them, which
       # is how the seven above drifted out of CI unnoticed. This fails when a gate
@@ -1041,12 +1050,28 @@ jobs:
       # whole of `apps/**` busts all ten zones whenever any one app changes,
       # i.e. on almost every PR. Scoped this way, a PR touching apps/quotation
       # rebuilds quotation and restores the other nine.
+      #
+      # The package side is scoped for the same reason, and it was NOT: the key
+      # hashed all of `packages/**`, so editing one busted all eleven zones even
+      # when no bundle could contain it. packages/e2e-kit is Playwright helper
+      # code that only specs import, and touching it rebuilt every zone — ~25
+      # runner-minutes and ~3.5 wall-clock minutes for a change that cannot alter
+      # an emitted byte. The three named below are the real closure: a zone's
+      # source imports api-types, utils and dashboard-shell, and of those only
+      # utils and dashboard-shell have workspace dependencies of their own (both
+      # on api-types).
+      #
+      # That closure is computed from source and compared with this key by
+      # scripts/gate/ci/zone-cache-key.mjs, on every commit and in CI, because
+      # the failure it prevents is invisible: a zone importing a fourth package
+      # would keep hitting this cache, and e2e would test source the key never
+      # saw. Add the package here AND let that gate confirm it.
       - name: Cache zone bundle
         id: zonetar
         uses: actions/cache@v6
         with:
           path: zone-${{ matrix.zone.name }}.tar
-          key: zonetar-v1-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'packages/**') }}
+          key: zonetar-v1-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}
           # No restore-keys ON PURPOSE: a partial-match restore would hand back
           # a bundle built from different source. Exact key or rebuild.
 
@@ -1066,7 +1091,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: apps/${{ matrix.zone.name }}/.next/cache
-          key: next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('apps/{0}/**', matrix.zone.name), 'packages/**') }}
+          key: next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('apps/{0}/**', matrix.zone.name), 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}
           restore-keys: |
             next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-
             next-${{ runner.os }}-${{ matrix.zone.name }}-

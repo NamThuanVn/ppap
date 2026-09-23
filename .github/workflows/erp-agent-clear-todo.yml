@@ -435,6 +435,29 @@ jobs:
       # restore → fast `codegraph sync`, miss → full `init -i`) — there is
       # deliberately NO separate build step (it would run the same script
       # twice).
+      # Warm the monolith Next compiler cache across lane runs.
+      #
+      # `pnpm e2e:changed:local` boots the e2e stack with ONE `next build` of the
+      # monolith app (scripts/ci/e2e/run.sh → serve-monolith.sh MODE=build), which
+      # is the only way a lane can check its own e2e before pushing. Cold, that
+      # build is the whole cost of the exercise; warm, it is a fraction of it —
+      # and a lane that cannot afford the check skips it, which is how every e2e
+      # break ends up costing a ~14 minute CI round trip plus a continuation.
+      #
+      # `.next-e2e` is the BUILD output and is deliberately not cached: MODE=build
+      # always re-runs the build, so a stale output could never be served, and
+      # caching it would only slow the job down. `restore-keys` are kept for the
+      # same reason the zone jobs keep theirs — a partially-matching compiler
+      # cache makes a build faster, never wrong.
+      - name: Cache monolith Next build
+        uses: actions/cache@v6
+        with:
+          path: monolith/app/.next-e2e/cache
+          key: mono-next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/*/src/**', 'packages/*/src/**') }}
+          restore-keys: |
+            mono-next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+            mono-next-${{ runner.os }}-
+
       - name: Cache codegraph index
         if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         uses: actions/cache@v6
