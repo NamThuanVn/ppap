@@ -1059,9 +1059,41 @@ jobs:
             echo "no open PR for $BRANCH — nothing to arm"
             exit 0
           fi
+          # Already armed? Then the SESSION labelled it, which it does while it
+          # still has CI in flight, so those runs see the label and the bar lands
+          # the PR without help. Dispatching another wave here would spend ~12
+          # minutes of fleet re-proving what is already being proved. Measured on
+          # PR #3940, labelled by the session at 13:03 with three runs already
+          # dispatched behind it.
+          ARMED=$(gh api "repos/NamThuanVn/erp-namthuan/issues/$PR/labels" \
+                    --jq '[.[].name] | index("auto-merge") // empty' 2>/dev/null || true)
+          if [ -n "$ARMED" ]; then
+            echo "::notice::PR #$PR is already armed — the session did it, and its own runs will read the bar"
+            exit 0
+          fi
           if gh api -X POST "repos/NamThuanVn/erp-namthuan/issues/$PR/labels" \
                -f "labels[]=auto-merge" >/dev/null 2>&1; then
-            echo "::notice::armed PR #$PR with auto-merge — it lands when the whole wave comes back clean, not before"
+            echo "::notice::armed PR #$PR with auto-merge — the session did not, so this is the fallback"
+            # …and then give the bar something to be read BY.
+            #
+            # The label changes nothing retroactively. erp-ci-pr.yml evaluates
+            # the merge bar INSIDE a CI run, and this step runs after the session
+            # has finished — so when the session did not label the PR itself, it
+            # also left no run behind to read a label applied now. That is the
+            # case this branch is for: a session that died, ran out of budget or
+            # handed off mid-drive.
+            #
+            # One more wave fixes the ORDERING rather than the logic: its runs
+            # see the label, and its LAST run is the one the bar lets merge.
+            # Sampling accumulates on a head, so these rows add to the ones
+            # already there rather than replacing them — the evidence a dead
+            # session did gather is not thrown away and re-earned.
+            if gh workflow run pr-triage-and-ci-dispatch.yml -R NamThuanVn/erp-namthuan \
+                 -f pr_number="$PR" >/dev/null 2>&1; then
+              echo "::notice::dispatched a wave to evaluate the bar on #$PR — its last clean run merges it"
+            else
+              echo "::warning::could not dispatch the evaluating wave for #$PR; the label stands and its next run will read the bar"
+            fi
           else
             echo "::warning::could not label PR #$PR auto-merge; it will need a human to merge"
           fi
