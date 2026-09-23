@@ -167,27 +167,29 @@ jobs:
           git config user.email "${LOGIN}@users.noreply.github.com"
           echo "✓ workspace on upstream main $(git rev-parse --short HEAD) · acting as @$LOGIN"
 
-      # The SAME query as erp-agent-loop.yml's gate and the recount below: open
-      # leaf (by leaf marker — parents never plan) lacking `rel-planned`.
-      # The parent exclusion runs FIRST and is not optional: a batch main can
-      # QUOTE a leaf marker in its body (e.g. #2252 pasting the re-mint guard
-      # marker into its PR description), and a SPLIT-decomposed original
-      # (`ba-decomposed-into:`) genuinely carries one — both match the leaf
-      # regex and would make this query see a leaf the planner correctly
-      # refuses to plan — gate says 1, planner says 0, recount fails forever.
+      # The SAME sweep as erp-agent-loop.yml's gate and the recount below —
+      # literally, now: all three call scripts/agent/board/loop/unplanned.mjs,
+      # which owns the definition of "open leaf lacking rel-planned" and the
+      # parent exclusion the three used to restate in copied jq. It retries and
+      # reports `readable=false` rather than dying, because one 503 in a step
+      # like this used to take the whole controller down.
       - name: Detect unplanned leaves
         id: sweep
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node scripts/agent/board/loop/unplanned.mjs
+
+      - name: Planning gate
+        id: plangate
+        env:
+          UNPLANNED: ${{ steps.sweep.outputs.unplanned }}
+          READABLE: ${{ steps.sweep.outputs.readable }}
         run: |
           set -euo pipefail
-          UNPLANNED=$(for L in bug task slice feature ba-bug ba-task ba-slice ba-change ba-change-package ba-feature; do
-            gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
-              --json number,body,labels --limit 200 \
-              --jq '.[] | select(.body | test("<!--\\s*ba-((bugs|change-packages|features)-batch|decomposed-into):") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
-          done | sort -u | wc -l | tr -d ' ')
-          echo "unplanned=$UNPLANNED" >> "$GITHUB_OUTPUT"
-          if [ "$UNPLANNED" -eq 0 ]; then
+          if [ "$READABLE" != "true" ]; then
+            echo "::notice::the backlog could not be read in full — planning nothing rather than planning a partial view (still chaining the loop, which re-asks)"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          elif [ "$UNPLANNED" -eq 0 ]; then
             echo "::notice::every open leaf is already rel-planned — nothing to plan (still chaining the loop)"
             echo "proceed=false" >> "$GITHUB_OUTPUT"
           else
@@ -196,7 +198,7 @@ jobs:
           fi
 
       - name: Install Claude Code CLI
-        if: steps.sweep.outputs.proceed == 'true'
+        if: steps.plangate.outputs.proceed == 'true'
         run: |
           set -euo pipefail
           curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
@@ -208,7 +210,7 @@ jobs:
       # addBlockedBy edges + the rel-planned label — no assign/board/close.
       - name: Run planner
         id: run
-        if: steps.sweep.outputs.proceed == 'true'
+        if: steps.plangate.outputs.proceed == 'true'
         env:
           REL_PLAN: '1'
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
@@ -218,17 +220,29 @@ jobs:
       # Deterministic enforcement: any leaf still unplanned → red job → no
       # chain (loop stalls safely; Telegram fires). Never label-backfill here —
       # a rel-planned mark must mean a real assessment happened.
-      - name: Verify plan coverage
-        if: steps.sweep.outputs.proceed == 'true'
+      - name: Re-sweep after planning
+        id: recount
+        if: steps.plangate.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node scripts/agent/board/loop/unplanned.mjs
+
+      - name: Verify plan coverage
+        if: steps.plangate.outputs.proceed == 'true'
+        env:
+          LEFT: ${{ steps.recount.outputs.unplanned }}
+          READABLE: ${{ steps.recount.outputs.readable }}
         run: |
           set -euo pipefail
-          LEFT=$(for L in bug task slice feature ba-bug ba-task ba-slice ba-change ba-change-package ba-feature; do
-            gh issue list --repo "$PRIVATE_REPO" --label "$L" --state open \
-              --json number,body,labels --limit 200 \
-              --jq '.[] | select(.body | test("<!--\\s*ba-((bugs|change-packages|features)-batch|decomposed-into):") | not) | select(.body | test("<!--\\s*ba-(bug-file|change-package|feature):")) | select([.labels[].name] | index("rel-planned") | not) | .number'
-          done | sort -u | wc -l | tr -d ' ')
+          # An unreadable board is NOT a failed planning pass. Failing here
+          # captures a `harness-broken` hold, so a GitHub blip would park the
+          # fleet over weather — exactly the outage this sweep was rewritten to
+          # stop. Say nothing was verified and chain; the loop's own gate
+          # re-asks next tick and re-dispatches planning if leaves remain.
+          if [ "$READABLE" != "true" ]; then
+            echo "::warning::could not read the backlog to verify coverage — not failing the run over an unreadable API; the loop's gate re-checks next tick"
+            exit 0
+          fi
           if [ "$LEFT" -gt 0 ]; then
             echo "::error::$LEFT leaf/leaves still unplanned after the session — failing (the loop will not chain; re-dispatch agent-rel-plan after investigating)"
             exit 1
