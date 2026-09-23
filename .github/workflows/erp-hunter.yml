@@ -84,6 +84,10 @@ on:
         description: 'When the pooled window has nothing to kill, sample main to make fresh evidence. The re-entry pass sets this false so a hunt can never chain into another.'
         type: boolean
         default: true
+      round:
+        description: 'Handoff round. A session that spends its budget with its PR still open re-calls the hunter to carry on, and each re-call increments this. Bounded by MAX_ROUNDS in the recall step so a PR that cannot be finished stops asking.'
+        type: string
+        default: '1'
 
 permissions:
   contents: read
@@ -823,6 +827,62 @@ jobs:
       # wait and is resumed with the settled result, so a ~20-minute run does
       # not cost a continuation per poll. Terminal = the PR MERGED, via the
       # API. See scripts/agent/run/claude.sh § HUNT mode.
+      # ── RECALL ────────────────────────────────────────────────────────────
+      #
+      # A hunt is allowed to stop before it finishes: once its PR is pushed,
+      # the next run adopts it. But "the next run" was the nightly one, so a
+      # PR that needed three sessions took three nights — and in the meantime
+      # the sweep holds, so nothing else gets fixed either.
+      #
+      # So it calls itself. A session that ends with its PR open and unmerged
+      # re-dispatches the hunter, which adopts that PR and carries on. Each
+      # recall increments `round`.
+      #
+      # BOUNDED, because this is a workflow that re-triggers itself on the
+      # outcome it is trying to change. Three rounds is roughly a session's
+      # budget times three — enough for a PR that needs a few settle-and-fix
+      # cycles, and short of a loop that would re-run all night on a PR no
+      # session can finish. At the bound it stops and says so; the PR stays
+      # open for a human, and the nightly sweep will still adopt it tomorrow.
+      #
+      # Only ever recalls for a PR that EXISTS and is OPEN. A merged PR is
+      # done, and no PR means nothing shipped — recalling for either would
+      # spend a runner to re-derive what is already known.
+      - name: Recall the hunter to finish an open PR
+        if: ${{ always() && !inputs.dry_run }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          ROUND: ${{ inputs.round || '1' }}
+          DAYS: ${{ inputs.days || '7' }}
+        run: |
+          set -uo pipefail
+          MAX_ROUNDS=3
+          FORK_OWNER="${FORK_REPO%%/*}"
+          STATE=$(gh api "repos/NamThuanVn/erp-namthuan/pulls?state=all&head=${FORK_OWNER}:${BRANCH}&per_page=5" \
+                    --jq '.[0] | "\(.number) \(.state) \(.merged_at // "-")"' 2>/dev/null || true)
+          if [ -z "$STATE" ] || [ "$STATE" = "null" ]; then
+            echo "no PR for $BRANCH — nothing to recall for"
+            exit 0
+          fi
+          set -- $STATE
+          if [ "${2:-}" != "open" ] || [ "${3:-}" != "-" ]; then
+            echo "PR #$1 is ${2}${3:+ (merged $3)} — no recall needed"
+            exit 0
+          fi
+          if [ "${ROUND:-1}" -ge "$MAX_ROUNDS" ]; then
+            echo "::warning::PR #$1 is still open after $ROUND round(s) — not recalling again. Three sessions could not finish it, so it wants a human. Tonight's sweep will still adopt it."
+            exit 0
+          fi
+          NEXT=$((ROUND + 1))
+          if gh workflow run erp-hunter.yml -R "${GITHUB_REPOSITORY}" \
+               -f dry_run=false -f days="$DAYS" -f fresh_hunt=false -f round="$NEXT"; then
+            echo "::notice::recalled the hunter (round $NEXT of $MAX_ROUNDS) to adopt PR #$1 and carry on"
+          else
+            echo "::warning::could not recall the hunter — PR #$1 stays open and tonight's sweep will adopt it"
+          fi
+          exit 0
+
       - name: Say plainly whether the session got its PR merged
         if: ${{ always() }}
         env:
