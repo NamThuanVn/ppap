@@ -1035,6 +1035,38 @@ jobs:
           fi
           exit 0
 
+      # Arm the PR the session shipped.
+      #
+      # The label does not merge anything by itself: erp-ci-pr.yml only lands a
+      # labelled PR once the whole wave has reported and every run-log row on
+      # that head is clean (scripts/ci/merge-bar.mjs). Before that bar existed
+      # the label WOULD have merged on the first clean sample, which is why this
+      # workflow withheld it and left merging to a session — one that had to
+      # still be alive, and still have budget, to notice the bar was met. Now
+      # the bar is the authority and the label is only consent, so it is applied
+      # here, deterministically, rather than asked of a session that may already
+      # have handed off.
+      - name: Arm the PR for auto-merge
+        if: ${{ always() && !inputs.dry_run && !inputs.smoke }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          FORK_OWNER="${FORK_REPO%%/*}"
+          PR=$(gh api "repos/NamThuanVn/erp-namthuan/pulls?state=open&head=${FORK_OWNER}:${BRANCH}&per_page=5" \
+                 --jq '.[0].number' 2>/dev/null || true)
+          if [ -z "$PR" ] || [ "$PR" = "null" ]; then
+            echo "no open PR for $BRANCH — nothing to arm"
+            exit 0
+          fi
+          if gh api -X POST "repos/NamThuanVn/erp-namthuan/issues/$PR/labels" \
+               -f "labels[]=auto-merge" >/dev/null 2>&1; then
+            echo "::notice::armed PR #$PR with auto-merge — it lands when the whole wave comes back clean, not before"
+          else
+            echo "::warning::could not label PR #$PR auto-merge; it will need a human to merge"
+          fi
+          exit 0
+
       - name: Say plainly whether the session got its PR merged
         if: ${{ always() && !inputs.smoke }}
         env:

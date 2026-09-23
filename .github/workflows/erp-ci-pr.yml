@@ -631,6 +631,7 @@ jobs:
           PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
           HEAD_SHA: ${{ github.event.client_payload.head_sha }}
           STATE: ${{ steps.status.outputs.state }}
+          STATUS_CONTEXT: ${{ github.event.client_payload.status_context || 'CI' }}
           NOISE_CLEAN: ${{ steps.noise.outputs.clean }}
           NOISE_SUMMARY: ${{ steps.noise.outputs.summary }}
           DESC: ${{ steps.status.outputs.desc }}
@@ -678,6 +679,55 @@ jobs:
           MERGED=$(jq -r '.merged // false' /tmp/pr.json 2>/dev/null)
           HAS_LABEL=false; case ",$LABELS," in *",auto-merge,"*) HAS_LABEL=true ;; esac
 
+          # ── The merge bar, for a PR that was SAMPLED ─────────────────────
+          #
+          # Everything above asks "is THIS run green and clean?" — the whole
+          # truth for a PR with one run. A head dispatched several ways is
+          # dispatched that way because one green run proves least there, so
+          # under that question alone the FIRST of five runs to come back clean
+          # would merge on a single sample and silently undo the bar.
+          #
+          # merge-bar.mjs adds the two conditions a wave needs: this run is the
+          # LAST (no sibling `CI n/N` context still pending), and EVERY run-log
+          # row for this commit is clean — the last run being clean says nothing
+          # about the four before it. With one run both collapse to "this run is
+          # clean", so unsampled PRs keep today's behaviour exactly.
+          #
+          # The previous rows come from the ci-report comment, which this step
+          # rewrites further down — so the bar reads it BEFORE that, and
+          # merge-bar.mjs folds this run in itself.
+          #
+          # ABSENT script → old rule. This job checks out the PR's own ref, so a
+          # PR opened before this landed has no merge-bar.mjs, and failing closed
+          # there would strand every in-flight auto-merge (the same shape that
+          # reddened five open PRs when a gate script reached main ahead of
+          # them). PRESENT but unreadable → fail CLOSED, matching the noise scan
+          # above: a missed auto-merge, never a wrongly-permitted one.
+          MERGE_BAR_OK=true
+          MERGE_BAR_WHY=""
+          if [ -n "${HEAD_SHA:-}" ] && [ -f scripts/ci/merge-bar.mjs ]; then
+            gh api "repos/$REPO/commits/$HEAD_SHA/status" >/tmp/bar-status.json 2>/dev/null \
+              || echo '{}' >/tmp/bar-status.json
+            gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+              --jq '[.[] | select(.body|startswith("<!-- ci-report -->"))][0].body' \
+              >/tmp/bar-log.md 2>/dev/null || : >/tmp/bar-log.md
+            BAR_GREEN=false; [ "$STATE" = "success" ] && BAR_GREEN=true
+            BAR_CLEAN=false; [ "$NOISE_CLEAN" = "true" ] && BAR_CLEAN=true
+            BAR=$(node scripts/ci/merge-bar.mjs \
+              --head "$HEAD_SHA" --context "${STATUS_CONTEXT:-CI}" \
+              --green "$BAR_GREEN" --clean "$BAR_CLEAN" \
+              --statuses /tmp/bar-status.json --log /tmp/bar-log.md 2>/dev/null)
+            MERGE_BAR_WHY=$(printf '%s\n' "$BAR" | sed -n 's/^why=//p')
+            case "$BAR" in
+              *"merge=true"*) MERGE_BAR_OK=true ;;
+              *"merge=false"*) MERGE_BAR_OK=false ;;
+              *) MERGE_BAR_OK=false; MERGE_BAR_WHY="merge bar produced no verdict" ;;
+            esac
+            case "$BAR" in
+              *"sampled=true"*) echo "· sampled PR — merge bar: $MERGE_BAR_OK ($MERGE_BAR_WHY)" ;;
+            esac
+          fi
+
           # Auto-ready: flip ANY draft to ready for review once CI is green +
           # noise-clean — independent of the `auto-merge` label. The draft state
           # keeps the merge button disabled while CI is still being driven; once the
@@ -714,6 +764,8 @@ jobs:
             MERGE_LINE="⏸️ Labeled \`auto-merge\`, but **CI is not green** — not merged."
           elif [ "$MERGEABLE" = "false" ]; then
             MERGE_LINE="⚠️ Labeled \`auto-merge\` and green+clean, but **has conflicts** — resolve before it can merge."
+          elif [ "$MERGE_BAR_OK" != "true" ]; then
+            MERGE_LINE="⏸️ Labeled \`auto-merge\` and this run is green + clean, but the **sampling bar is not met** — ${MERGE_BAR_WHY:-not proven}. Not merged."
           else
             # Eligible: green + noise-clean + labeled + mergeable (true/null). The PR
             # was already flipped ready by the auto-ready block above; squash-merge it.
