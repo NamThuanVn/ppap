@@ -30,10 +30,11 @@ name: ERP · Agent · loop
 #     controller-self-reclaim gap, kept in its own workflow so it can be toggled
 #     on/off from the Actions UI independently.
 #
-# Cap = repo variable AGENT_MAX_PARALLEL (unset → 6). A dispatch that passes
-# max_parallel is REMEMBERED for 24h (repo variable AGENT_CAP_OVERRIDE, written
-# by Resolve cap with a "<cap>|<expiry>" TTL) so every scheduled tick + chained
-# run in that window reuses the chosen cap, then it auto-reverts to the default.
+# Cap = repo variable AGENT_MAX_PARALLEL (unset → 6) — a hard CEILING only. How
+# many lanes actually run is computed every tick from the pool's own quota (see
+# "Count active runs + dispatch top-up"), so there is no per-dispatch override:
+# the old max_parallel input + its 24h sticky AGENT_CAP_OVERRIDE were retired
+# once the budget became automatic.
 # KILL SWITCH:
 #   gh variable set AGENT_MAX_PARALLEL -R NamThuanVn/ppap --body 0
 # → this controller dispatches nothing; in-flight agents finish their current
@@ -109,12 +110,6 @@ on:
   repository_dispatch:
     types: [agent-loop]
   workflow_dispatch:
-    inputs:
-      max_parallel:
-        description: 'Set the AGENT_MAX_PARALLEL cap. A value here is REMEMBERED for 24h — every scheduled tick + chained run reuses it, then it auto-reverts to the repo variable (unset = 6). Empty = keep the current remembered/default cap.'
-        required: false
-        default: ''
-        type: string
 
 permissions: read-all
 
@@ -149,13 +144,6 @@ jobs:
     # (a few dozen API calls on a big backlog) + a 20s settle.
     timeout-minutes: 10
     env:
-      # Both repository_dispatch client_payload values and workflow_dispatch
-      # inputs arrive as STRINGS; either side may be absent per trigger.
-      CAP_OVERRIDE: ${{ github.event.client_payload.max_parallel || inputs.max_parallel || '' }}
-      # Sticky override remembered from a prior manual dispatch, "<cap>|<expiry-epoch>".
-      # Resolve cap writes it with a 24h TTL and clears it once expired, so every
-      # scheduled tick + chained run in that window reuses the chosen cap.
-      CAP_STICKY: ${{ vars.AGENT_CAP_OVERRIDE || '' }}
       CAP_VAR: ${{ vars.AGENT_MAX_PARALLEL || '' }}
       TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
     steps:
@@ -217,53 +205,12 @@ jobs:
 
       - name: Resolve cap
         id: cap
-        env:
-          # Reading/writing the sticky-override repo variable needs a token with
-          # Actions Variables write — a classic pooled PAT (repo scope), not the
-          # read-all GITHUB_TOKEN.
-          GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -euo pipefail
-          NOW=$(date +%s)
-          DEFAULT="${CAP_VAR:-6}"
-          VAR_API="repos/${GITHUB_REPOSITORY}/actions/variables"
-
-          # An explicit dispatch override "sticks" for 24h: remember it as the
-          # repo variable AGENT_CAP_OVERRIDE ("<cap>|<expiry>") so every later
-          # scheduled tick + chained run reuses it, then auto-revert to DEFAULT
-          # once the TTL lapses. Best-effort — a persist failure (missing PAT
-          # scope) just means the override applies to this run only.
-          remember() { # $1 = cap
-            local exp=$(( NOW + 86400 )) val
-            val="$1|$exp"
-            if gh api --method PATCH "$VAR_API/AGENT_CAP_OVERRIDE" -f name=AGENT_CAP_OVERRIDE -f value="$val" >/dev/null 2>&1 \
-               || gh api --method POST "$VAR_API" -f name=AGENT_CAP_OVERRIDE -f value="$val" >/dev/null 2>&1; then
-              echo "::notice::remembered cap=$1 for 24h (expires epoch $exp)"
-            else
-              echo "::warning::could not persist cap override (pooled PAT missing Actions Variables write?) — applies to this run only"
-            fi
-          }
-          forget() { gh api --method DELETE "$VAR_API/AGENT_CAP_OVERRIDE" >/dev/null 2>&1 || true; }
-
-          if [ -n "$CAP_OVERRIDE" ]; then
-            CAP="$CAP_OVERRIDE"
-            remember "$CAP"
-          elif [ -n "$CAP_STICKY" ]; then
-            VAL="${CAP_STICKY%%|*}"; EXP="${CAP_STICKY##*|}"
-            if printf '%s' "$EXP" | grep -qE '^[0-9]+$' && [ "$NOW" -lt "$EXP" ]; then
-              CAP="$VAL"
-              echo "using remembered cap=$CAP (~$(( (EXP - NOW) / 3600 ))h left, then reverts to $DEFAULT)"
-            else
-              echo "::notice::remembered cap expired — reverting to default $DEFAULT"
-              forget
-              CAP="$DEFAULT"
-            fi
-          else
-            CAP="$DEFAULT"
-          fi
+          CAP="${CAP_VAR:-6}"
 
           if ! printf '%s' "$CAP" | grep -qE '^[0-9]+$'; then
-            echo "::error::cap '$CAP' is not a non-negative integer (override / sticky / AGENT_MAX_PARALLEL)"
+            echo "::error::cap '$CAP' is not a non-negative integer (AGENT_MAX_PARALLEL)"
             exit 1
           fi
           if [ "$CAP" -eq 0 ]; then
