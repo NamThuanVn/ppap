@@ -470,8 +470,8 @@ jobs:
       BINNED_PKGS: >-
         @namthuanvn/api-monolith @namthuanvn/oms @namthuanvn/assistant @namthuanvn/exms
         @namthuanvn/procurement @namthuanvn/sourcing @namthuanvn/zone-bom
-        @namthuanvn/shell @namthuanvn/zone-expense @namthuanvn/zone-oms @namthuanvn/zone-sourcing
-        @namthuanvn/auth @namthuanvn/bom @namthuanvn/expense @namthuanvn/social @namthuanvn/audit
+        @namthuanvn/shell @namthuanvn/zone-oms @namthuanvn/zone-sourcing
+        @namthuanvn/auth @namthuanvn/bom @namthuanvn/social @namthuanvn/audit
     strategy:
       fail-fast: false
       matrix:
@@ -479,7 +479,7 @@ jobs:
           - name: a      # 71
             pkgs: '@namthuanvn/api-monolith @namthuanvn/oms @namthuanvn/assistant @namthuanvn/exms @namthuanvn/procurement @namthuanvn/sourcing @namthuanvn/zone-bom'
           - name: b      # 76
-            pkgs: '@namthuanvn/shell @namthuanvn/zone-expense @namthuanvn/zone-oms @namthuanvn/zone-sourcing @namthuanvn/auth @namthuanvn/bom @namthuanvn/expense @namthuanvn/social @namthuanvn/audit'
+            pkgs: '@namthuanvn/shell @namthuanvn/zone-oms @namthuanvn/zone-sourcing @namthuanvn/auth @namthuanvn/bom @namthuanvn/social @namthuanvn/audit'
           - name: rest   # 76
             pkgs: ''   # catch-all — everything not in BINNED_PKGS
     steps:
