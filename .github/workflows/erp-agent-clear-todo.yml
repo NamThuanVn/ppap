@@ -112,6 +112,12 @@ jobs:
       ITEM_ARG: ${{ github.event.client_payload.item || inputs.item || '' }}
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.267' }}
+      # Read each account's REAL 5h/7d quota (scripts/agent/run/usage.mjs) instead
+      # of the blind haiku ping. Without it every usable account counts as exactly
+      # one lane, so a fresh account and one at 89% used look the same and the
+      # controller can neither use the fresh one's headroom nor spare the thin
+      # one. `gh variable set AGENT_USAGE_PROBE --body 0` reverts to the ping.
+      AGENT_USAGE_PROBE: ${{ vars.AGENT_USAGE_PROBE || '1' }}
     steps:
       # AGENT_STATE_DIR must be set HERE, not in the job-level `env:` block.
       # `runner` is not an available context for `jobs.<id>.env` — only from

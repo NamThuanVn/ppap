@@ -424,6 +424,52 @@ jobs:
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
         run: node scripts/agent/board/loop/gate.mjs
 
+      # ── Refresh a STALE pool probe before sizing K ────────────────────────
+      # AGENT_POOL_STATE is written by each lane's own pre-claim probe, so after a
+      # quiet spell (or on a manual start) it is older than its 15-min TTL and the
+      # gate above publishes an empty usable_accounts/capacity. The dispatch step
+      # used to read "unknown" as "uncapped" — controller 36113823869 sent 6 lanes
+      # at ONE account off a 79-min-old probe, and all 6 died on its usage limit.
+      # So the controller measures the pool itself in exactly that case: the same
+      # PROBE_ONLY pass a lane runs (real 5h/7d quota via the usage endpoint, at
+      # zero model cost; the haiku ping only as a per-account fallback), published
+      # the same way, so the lanes that follow reuse it too.
+      #
+      # Best-effort: a probe that cannot answer leaves the outputs empty and the
+      # dispatch step falls back to ONE lane, which re-probes on its own.
+      - name: Probe Claude pool (stale cache only)
+        id: pool
+        if: steps.cap.outputs.proceed == 'true' && steps.hold.outputs.proceed == 'true' && steps.hold.outputs.usable_accounts == ''
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          AGENT_USAGE_PROBE: ${{ vars.AGENT_USAGE_PROBE || '1' }}
+          PROBE_ONLY: '1'
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          # Keep in step with erp-agent-clear-todo.yml's default claude_version.
+          CLAUDE_VERSION: '2.1.267'
+        run: |
+          set -uo pipefail
+          # Only the per-account fallback probe needs the CLI; a failed install
+          # just means that fallback reports the account as available.
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION" >/dev/null 2>&1 \
+            && export PATH="$HOME/.local/bin:$PATH" \
+            || echo "::warning::Claude CLI install failed — the fallback probe cannot run"
+          RC=0
+          bash scripts/agent/run/claude.sh || RC=$?
+          node scripts/agent/board/loop/publish-pool.mjs || true
+          F="${AGENT_STATE_DIR}/pool-state.json"
+          if [ ! -s "$F" ]; then
+            echo "::warning::pool probe wrote nothing (rc=$RC) — dispatch falls back to one lane"
+            exit 0
+          fi
+          USABLE=$(jq -r '(.available // 0) + (.warn // 0)' "$F")
+          CAPACITY=$(jq -r '.capacity | numbers' "$F")
+          echo "usable_accounts=$USABLE" >> "$GITHUB_OUTPUT"
+          echo "capacity=$CAPACITY" >> "$GITHUB_OUTPUT"
+          echo "- fresh probe: $USABLE usable account(s), capacity ${CAPACITY:-unknown} lane(s) (rc=$RC)"
+
       - name: Count claimable candidates
         id: count
         if: steps.cap.outputs.proceed == 'true' && steps.hold.outputs.proceed == 'true'
@@ -510,12 +556,13 @@ jobs:
           CANDIDATES: ${{ steps.probe.outputs.candidates }}
           # How many Claude accounts the last pool probe found usable. Empty when
           # no probe is fresh enough to trust, in which case K is not capped by it.
-          USABLE_ACCOUNTS: ${{ steps.hold.outputs.usable_accounts }}
+          # The controller's own probe wins when it ran (the cache was stale).
+          USABLE_ACCOUNTS: ${{ steps.pool.outputs.usable_accounts || steps.hold.outputs.usable_accounts }}
           # How many lanes the pool's REMAINING QUOTA can actually fund — the
           # per-account 5h/7d headroom divided by one lane's assumed cost. Empty
           # when the probe predates this field (or is stale), in which case K is
           # not capped by it and the loop behaves exactly as it did before.
-          CAPACITY: ${{ steps.hold.outputs.capacity }}
+          CAPACITY: ${{ steps.pool.outputs.capacity || steps.hold.outputs.capacity }}
         run: |
           set -euo pipefail
           # The runs-list `status` param is single-valued → two calls. The list
@@ -548,32 +595,34 @@ jobs:
           echo "· live agent runs: $ACTIVE"
           K=$(( CAP - ACTIVE ))
           [ "$K" -gt "$CANDIDATES" ] && K="$CANDIDATES"
-          # Third term: never send out more lanes than there are Claude accounts
-          # to run them on. A lane whose pool is spent claims an item, discovers
-          # the exhaustion, and hands the item straight back — churn that buys
-          # nothing. Skipped when no fresh probe exists, so an unknown pool
-          # behaves exactly as it did before this term was added.
-          if [ -n "${USABLE_ACCOUNTS:-}" ] && [ "$K" -gt "$USABLE_ACCOUNTS" ]; then
-            echo "· capping K at $USABLE_ACCOUNTS usable Claude account(s) (was $K)"
-            K="$USABLE_ACCOUNTS"
-          fi
-          # Fourth term: never send out more lanes than the pool's remaining
-          # quota can pay for. The account COUNT above is a floor, not a budget —
-          # three accounts at 89% used are three usable accounts and about one
-          # lane's worth of headroom, so the count said 3, the controller
-          # dispatched 3, and all three hit the wall mid-flight. This term reads
-          # the real 5h/7d percentages instead.
+          # Third term: the POOL BUDGET — how many lanes the Claude accounts can
+          # fund IN TOTAL, running ones included. Preferred source is `capacity`
+          # (real 5h/7d headroom ÷ one lane's cost); the account count is the
+          # fallback when a probe carried no capacity. Either way it is a TOTAL,
+          # so the lanes already running come off it: comparing it against this
+          # tick's new lanes alone let every tick add `capacity` more on top,
+          # until the hard cap (6 lanes on one account).
           #
-          # Same null-guard as above, and for the same reason: an empty value
-          # (no fresh probe, or a probe written before the field existed) must
-          # leave K alone. It can only ever make K smaller, never larger, so the
-          # worst case of a wrong estimate is a slower loop — not a dead one.
-          if [ -n "${CAPACITY:-}" ] && [ "$K" -gt "$CAPACITY" ]; then
-            echo "· capping K at $CAPACITY lane(s) of real pool headroom (was $K)"
-            K="$CAPACITY"
+          # No fresh probe at all → ONE lane total. "Unknown" used to mean
+          # "uncapped": controller 36113823869 saw a 79-min-old probe, dispatched
+          # 6 lanes onto one account, and all 6 died on its usage limit. The
+          # "Probe Claude pool" step above normally refreshes a stale probe, so
+          # this floor only bites when that probe itself failed — and the one
+          # lane it lets through re-probes and publishes on its own.
+          if [ -n "${CAPACITY:-}" ]; then
+            BUDGET="$CAPACITY"; BUDGET_SRC="pool headroom"
+          elif [ -n "${USABLE_ACCOUNTS:-}" ]; then
+            BUDGET="$USABLE_ACCOUNTS"; BUDGET_SRC="usable Claude account(s)"
+          else
+            BUDGET=1; BUDGET_SRC="no fresh pool probe — one lane"
+          fi
+          ROOM=$(( BUDGET - ACTIVE ))
+          if [ "$K" -gt "$ROOM" ]; then
+            echo "· capping K at $ROOM: budget $BUDGET ($BUDGET_SRC) − $ACTIVE running (was $K)"
+            K="$ROOM"
           fi
           [ "$K" -lt 0 ] && K=0
-          echo "cap=$CAP · active=$ACTIVE · candidates=$CANDIDATES · usable-accounts=${USABLE_ACCOUNTS:-unknown} · capacity=${CAPACITY:-unknown} → dispatching $K run(s)"
+          echo "cap=$CAP · active=$ACTIVE · candidates=$CANDIDATES · usable-accounts=${USABLE_ACCOUNTS:-unknown} · capacity=${CAPACITY:-unknown} · budget=$BUDGET → dispatching $K run(s)"
           if [ "$K" -eq 0 ]; then
             echo "::notice::pool already at capacity (or no headroom) — nothing dispatched"
             exit 0
