@@ -445,6 +445,7 @@ jobs:
         env:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           AGENT_USAGE_PROBE: ${{ vars.AGENT_USAGE_PROBE || '1' }}
+          AGENT_BLIND_LANES_PER_ACCOUNT: ${{ vars.AGENT_BLIND_LANES_PER_ACCOUNT || '2' }}
           PROBE_ONLY: '1'
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           # Keep in step with erp-agent-clear-todo.yml's default claude_version.

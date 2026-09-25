@@ -118,6 +118,10 @@ jobs:
       # controller can neither use the fresh one's headroom nor spare the thin
       # one. `gh variable set AGENT_USAGE_PROBE --body 0` reverts to the ping.
       AGENT_USAGE_PROBE: ${{ vars.AGENT_USAGE_PROBE || '1' }}
+      # Lanes a clean account funds when its quota could not be read (every
+      # setup-token today). `gh variable set AGENT_BLIND_LANES_PER_ACCOUNT --body 1`
+      # restores one lane per usable account.
+      AGENT_BLIND_LANES_PER_ACCOUNT: ${{ vars.AGENT_BLIND_LANES_PER_ACCOUNT || '2' }}
     steps:
       # AGENT_STATE_DIR must be set HERE, not in the job-level `env:` block.
       # `runner` is not an available context for `jobs.<id>.env` — only from
