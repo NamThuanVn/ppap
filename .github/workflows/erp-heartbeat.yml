@@ -200,8 +200,14 @@ jobs:
               echo "$WF — $WHY, dispatching"
             fi
 
+            # `-R` is load-bearing. Without it gh resolves the repo from the git
+            # remote in the working directory, which after the decider checkout
+            # above is NamThuanVn/erp-namthuan, not this ppap repo. Every
+            # dispatch then 404'd ("workflow erp-hunter.yml not found on the
+            # default branch") as a ::warning:: on a green run, so the hunter and
+            # the fleet warmup went unrun for days without anyone noticing.
             # shellcheck disable=SC2086 — EXTRA is a flag LIST and must word-split.
-            if gh workflow run "$WF" --ref main $EXTRA; then
+            if gh workflow run "$WF" -R "$GITHUB_REPOSITORY" --ref main $EXTRA; then
               echo "  ✓ dispatched $WF"
             else
               echo "::warning::failed to dispatch $WF — the next tick retries in 15 minutes"
