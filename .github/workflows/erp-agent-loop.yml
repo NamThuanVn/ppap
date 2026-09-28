@@ -350,6 +350,19 @@ jobs:
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
         run: node scripts/agent/board/recover/reap-salvage.mjs
 
+      # #4338 stops NEW merged-head leftovers at merge time; this drains the
+      # existing pile (615 branches as of 2026-09-28) and catches anything
+      # #4338 misses (a delete that 403'd, a merge that landed another way). A
+      # branch is deleted only when a PR for it is MERGED and its tip never
+      # moved since — see docs/engineering/platform/ppap-agent-runs.md §
+      # Reaping merged heads.
+      - name: Reap merged-head branches
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+        run: node scripts/agent/board/recover/reap-merged-heads.mjs
+
       # ── Loop hold: the FIRST question, before the backlog matters ─────────
       # A lane that died outside its Claude session left a `harness-broken` hold;
       # a spent token pool left a timed `pool-exhausted` one. Either way no lane
