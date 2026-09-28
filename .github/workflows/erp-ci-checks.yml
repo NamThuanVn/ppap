@@ -197,6 +197,10 @@ jobs:
           TEST_SHARDS: ${{ inputs.test_shards }}
         run: |
           set -euo pipefail
+          if [ ! -f scripts/ci/checks/plan.mjs ]; then
+            echo "::error::scripts/ci/checks/plan.mjs is missing on this ref — rebase the PR onto main."
+            exit 1
+          fi
           UNITS="$(node scripts/ci/checks/plan.mjs units \
             "gates=$GATES_SHARDS" "lint=$LINT_SHARDS" \
             "typecheck=$TYPECHECK_SHARDS" "test=$TEST_SHARDS")"
