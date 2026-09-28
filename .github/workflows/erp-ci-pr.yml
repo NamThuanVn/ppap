@@ -786,6 +786,20 @@ jobs:
             if [ -n "${HEAD_SHA:-}" ]; then MERGE_ARGS+=(-f sha="$HEAD_SHA"); fi
             if gh api -X PUT "repos/$REPO/pulls/$PR_NUMBER/merge" "${MERGE_ARGS[@]}" >/tmp/merge.json 2>/tmp/merge.err; then
               MERGE_LINE="✅ **Auto-merged (squash)** — labeled \`auto-merge\`, CI green, noise-clean."
+              # Delete the PR's head branch now that the merge actually landed.
+              # PR heads live on the agent fork, and GitHub never deletes a
+              # fork's branch when the upstream PR merges (unlike a same-repo
+              # PR, which `delete_branch_on_merge` already covers). ABSENT
+              # script → this job checked out an older PR ref that predates
+              # this — say nothing rather than fail.
+              if [ -f scripts/ci/ppap/delete-merged-head.sh ]; then
+                DELETE_OUT=$(bash scripts/ci/ppap/delete-merged-head.sh /tmp/pr.json "$REPO")
+                read -r DELETE_KIND DELETE_DETAIL <<< "$DELETE_OUT"
+                case "$DELETE_KIND" in
+                  deleted) MERGE_LINE="$MERGE_LINE · head branch \`$DELETE_DETAIL\` deleted" ;;
+                  failed) MERGE_LINE="$MERGE_LINE · head branch not deleted ($DELETE_DETAIL)" ;;
+                esac
+              fi
             else
               MERGE_LINE="⚠️ Auto-merge attempt failed: $(tr -d '\n' </tmp/merge.err | sed 's/\"//g' | cut -c1-160). PR left green + ready."
             fi
