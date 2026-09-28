@@ -542,7 +542,7 @@ jobs:
               && echo "refreshed #$NUM — $SUMMARY"
           else
             NUM=$(jq -n --rawfile b noise/issue-body.md \
-                    '{title: "CI noise inventory — fleet log sweep", body: $b, labels: ["ci-noise", "chore", "scope:infra"]}' \
+                    '{title: "CI noise inventory — fleet log sweep", body: $b, labels: ["ci-noise", "chore", "module:infra"]}' \
                     | gh api -X POST "repos/$REPO/issues" --input - --jq '.number')
             echo "filed #$NUM — $SUMMARY"
           fi
