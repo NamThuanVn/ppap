@@ -542,11 +542,28 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: node scripts/agent/board/verdict/execute-park.mjs
 
+      # Every login in the PAT pool, so execute-split.mjs never @mentions a
+      # pool account on a slice/decompose-comment (accounts rotate — never
+      # hardcode one). Best-effort: on failure POOL_LOGINS stays empty and the
+      # script falls back to excluding only `[bot]` logins (with a warning).
+      - name: Resolve PAT pool logins
+        id: split-logins
+        if: always() && steps.outcome.outputs.verdict == 'SPLIT'
+        continue-on-error: true
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          L=$(bash scripts/ci/ppap/pat-pool.sh --logins || true)
+          echo "POOL_LOGINS=$L" >> "$GITHUB_ENV"
+          echo "pool logins: ${L:-<none — mention falls back to excluding [bot] only>}"
+
       - name: Execute split
         id: split
         if: always() && steps.outcome.outputs.verdict == 'SPLIT'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          POOL_LOGINS: ${{ env.POOL_LOGINS }}
         run: node scripts/agent/board/verdict/execute-split.mjs
 
       # BLOCKED is the one verdict that returns the item to Todo instead of a
