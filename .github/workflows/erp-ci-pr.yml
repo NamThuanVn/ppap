@@ -139,9 +139,10 @@ jobs:
             -f target_url="$RUN_URL"
           echo "✓ Pending $STATUS_CONTEXT status now targets $RUN_URL"
 
-  # Run the 4-job CI graph. erp-ci-checks.yml lives in the same repo and exposes
-  # each job's `result` as a workflow_call output, so the report job below
-  # can build a per-job summary without re-querying the API.
+  # Run the CI graph. erp-ci-checks.yml lives in the same repo and exposes one
+  # verdict per suite (gates, typecheck, lint, test, e2e) as a workflow_call
+  # output, so the report job below can build a per-suite summary without
+  # re-querying the API. Every suite runs as shards fanned out to the fleet.
   #
   # A PR (repository_dispatch, or workflow_dispatch WITH a number) checks out
   # refs/pull/<N>/merge — the merge commit GitHub computes between the PR head
@@ -381,7 +382,7 @@ jobs:
       #
       # Reusable-workflow jobs share THIS run, so `github.run_id` covers every
       # coordinator job; the fanned-out batches live in other repos and come
-      # from the `e2e_runs` output.
+      # from the `e2e_runs` and `check_runs` outputs.
       #
       # `continue-on-error` + `set +e`: a scan hiccup must never red a run whose
       # actual checks passed. When it cannot run, `clean` stays empty, which the
@@ -404,7 +405,8 @@ jobs:
           POOL_PAT: ${{ env.RESOLVED_PAT }}
           SELF_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
-          BATCH_RUNS: ${{ needs.checks.outputs.e2e_runs }}
+          E2E_RUNS: ${{ needs.checks.outputs.e2e_runs }}
+          CHECK_RUNS: ${{ needs.checks.outputs.check_runs }}
           # Which categories CI itself calls red. The digest uses this to tell
           # "this job passed" apart from "this job failed and I could not parse
           # why" — an unparsed red job must announce itself, not read as silence.
@@ -415,6 +417,14 @@ jobs:
           R_E2E: ${{ needs.checks.outputs.e2e }}
         run: |
           set +e -uo pipefail   # errexit OFF — zero-match greps below exit non-zero by design
+          # EVERY fanned-out run, e2e and checks alike: the gates, lint,
+          # typecheck and Vitest logs live in check batches in other repos now,
+          # and a run the scan does not list is a log it reports as clean.
+          # Exported because scripts/ci/report.mjs → job-index.mjs reads the
+          # same variable. The ci-sites download below walks it too; a check
+          # batch simply has no ci-sites artifact, which that loop tolerates.
+          BATCH_RUNS="$(jq -cn --argjson a "${E2E_RUNS:-[]}" --argjson b "${CHECK_RUNS:-[]}" '($a // []) + ($b // [])' 2>/dev/null || printf '%s' "${E2E_RUNS:-[]}")"
+          export BATCH_RUNS
           tmp="$(mktemp -d)"
           : > "$tmp/e2e.log"; : > "$tmp/biome.log"; : > "$tmp/test.log"
           : > "$tmp/typecheck.log"; : > "$tmp/eslint.log"

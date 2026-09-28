@@ -1,0 +1,224 @@
+name: ERP · CI · Checks batch (fan-out worker)
+
+# One BATCH of another repo's non-e2e checks — repo gates, ESLint, typecheck,
+# Vitest — as shard UNITS (`typecheck:2/4`, `gates:1/2`, …).
+#
+# The same shape as erp-ci-e2e-batch.yml, for the same reason: GitHub Free
+# allows ~20 concurrent jobs per org, and these checks used to hold 8 of the
+# coordinator's. erp-ci-checks.yml's `checks` job plans the units
+# (scripts/ci/checks/plan.mjs), splits them across idle fleet repos and
+# dispatches a batch to each (scripts/ci/fanout.mjs, SUITE=checks); this
+# workflow runs one. The dispatching repo stays the COORDINATOR — it owns the
+# commit Status and every PR write. A batch runs its units and concludes; the
+# coordinator reads each JOB's conclusion back by name and folds it into that
+# suite's verdict, failing a suite closed on any unit it has no job for.
+#
+# Unlike an e2e batch it needs no artifact from the coordinator: every unit
+# checks out and installs from source, so a batch can start the moment it is
+# dispatched — in parallel with the coordinator's zone builds, not after them.
+#
+# This file MUST keep its `ci-` prefix: sync-workflows-to-ppap.yml mirrors only
+# `erp-ci-*.yml` to the CI fleet, and a fleet repo without this workflow is
+# skipped by the fan-out's dispatchability guard.
+
+run-name: "ERP · Checks · ${{ github.event.client_payload.ctx.pr_number && format('PR #{0}', github.event.client_payload.ctx.pr_number) || 'manual' }} · batch ${{ github.event.client_payload.batch }}/${{ github.event.client_payload.batch_count }} · ${{ github.event.client_payload.correlation }}"
+
+on:
+  repository_dispatch:
+    types: [checks-batch]
+
+permissions: read-all
+
+# Keyed on the correlation token (coordinator run id + attempt) plus the batch
+# index, so a re-dispatched attempt supersedes its predecessor while leaving
+# other PRs' batches — and this PR's OTHER batches — alone.
+concurrency:
+  group: checks-batch-${{ github.event.client_payload.correlation }}-${{ github.event.client_payload.batch }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
+jobs:
+  # Cheap gate in front of the matrix, same two jobs as the e2e batch's plan:
+  #   1. Turn `client_payload.units` into the job matrix. Names come from
+  #      scripts/ci/checks/plan.mjs DISPLAY — the noise scan, job-index,
+  #      noise-hunter and progress all route a job's log by those names.
+  #   2. STALE CHECK — a cancelled coordinator does not cancel across repos, and
+  #      an orphan batch holds JOB SLOTS in this org. Fails OPEN: an unreadable
+  #      head still runs, and a skipped matrix fails its units closed at the
+  #      coordinator anyway.
+  plan:
+    name: Checks batch ${{ github.event.client_payload.batch }} · plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      run: ${{ steps.plan.outputs.run }}
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.RESOLVED_PAT }}
+          ref: ${{ github.event.client_payload.ctx.checkout_ref }}
+          sparse-checkout: scripts/ci
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - id: plan
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          UNITS: ${{ github.event.client_payload.units }}
+          PR_NUMBER: ${{ github.event.client_payload.ctx.pr_number }}
+          HEAD_SHA: ${{ github.event.client_payload.ctx.head_sha }}
+        run: |
+          set -euo pipefail
+          MATRIX="$(node scripts/ci/checks/plan.mjs matrix "$UNITS")"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+          RUN=true
+          if [ -n "${PR_NUMBER:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+            CURRENT=$(gh api "repos/${PRIVATE_REPO}/pulls/${PR_NUMBER}" --jq '.head.sha // ""' 2>/dev/null || true)
+            if [ -n "$CURRENT" ] && [ "$CURRENT" != "$HEAD_SHA" ]; then
+              echo "::notice::stale batch — coordinator tested $HEAD_SHA but PR #$PR_NUMBER is now $CURRENT; skipping."
+              RUN=false
+            fi
+          fi
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+          echo "▶ checks batch units=[$UNITS] run=$RUN" >&2
+
+  check:
+    name: ${{ matrix.unit.name }}
+    needs: plan
+    if: ${{ needs.plan.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # Every unit runs to completion: one red suite must not hide another,
+      # the same reason the old Repo-gates job guarded each step.
+      fail-fast: false
+      matrix:
+        unit: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.RESOLVED_PAT }}
+          ref: ${{ github.event.client_payload.ctx.checkout_ref }}
+          # 0 (full history) for the gates suite, which diffs against the PR's
+          # base parent (demo-migrations, ba-item-scope); 1 elsewhere.
+          fetch-depth: ${{ matrix.unit.fetch_depth }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      # Pinned to the version the deploy job uses, so `Terraform validate`
+      # checks against the binary that will later run `apply`.
+      - uses: hashicorp/setup-terraform@v4
+        if: ${{ matrix.unit.suite == 'gates' }}
+        with:
+          terraform_version: '1.9.0'
+          terraform_wrapper: false
+
+      # `bash ./scripts/…`, not `bash scripts/…`, on purpose: failure-digest.mjs
+      # names a gate from the `Run bash scripts/<gate>` group line, and this
+      # step's own group must not read as a gate called `run`. The runner opens
+      # one group per command inside it.
+      - name: Run ${{ matrix.unit.suite }} shard ${{ matrix.unit.shard }}
+        env:
+          SUITE: ${{ matrix.unit.suite }}
+          SHARD: ${{ matrix.unit.shard }}
+        run: bash ./scripts/ci/checks/run-shard.sh "$SUITE" "$SHARD"

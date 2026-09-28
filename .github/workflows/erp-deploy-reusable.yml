@@ -335,8 +335,9 @@ jobs:
       # infra touches Cloudflare. A failing job fails ci-gate, which blocks
       # tf-outputs — and with it the builds + deploy (needs: [ci-gate]).
       run_e2e: ${{ inputs.run_e2e_gate }}
-      # Forwarded so the production gate's e2e FANS OUT across the fleet like PR
-      # CI does. Before this it was empty here, so fanout found no pool, logged
+      # Forwarded so the production gate's e2e — and its gates / lint /
+      # typecheck / Vitest shards, which fan out the same way — spread across
+      # the fleet like PR CI does. Before this it was empty here, so fanout found no pool, logged
       # "no worker with room" and self-dispatched every shard back to this one repo
       # capped at COORD_FALLBACK_SLOTS (14) — a release tag ran the full suite on
       # 14 shards while a PR got 48. deploy-staging passes nothing because it

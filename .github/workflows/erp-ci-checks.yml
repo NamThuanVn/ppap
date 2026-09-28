@@ -1,9 +1,12 @@
 name: ERP · CI · Checks · Reusable
 
-# Reusable CI graph: biome / typecheck / lint / test in parallel against an
-# arbitrary erp-namthuan ref. Called by both PR-CI (ppap:erp-ci-pr.yml) and the
-# deploy gate (ppap:erp-deploy-reusable.yml). Outputs each job's `result` so
-# callers can build a per-job summary.
+# Reusable CI graph: repo gates / lint / typecheck / test and the e2e suite
+# against an arbitrary erp-namthuan ref. Called by both PR-CI
+# (ppap:erp-ci-pr.yml) and the deploy gate (ppap:erp-deploy-reusable.yml).
+# Every suite runs as SHARDS fanned out to idle fleet repos — the checks via
+# erp-ci-checks-batch.yml, e2e via erp-ci-e2e-batch.yml — and this run
+# coordinates. Outputs one verdict per suite so callers can build a per-suite
+# summary.
 
 on:
   workflow_call:
@@ -17,41 +20,62 @@ on:
         type: number
         default: 48
       fleet:
-        description: 'Comma-separated owner/repo list of ppap CI repos this run may borrow idle e2e capacity from (the erp-namthuan variable PPAP_CI_REPOS). Empty ⇒ no fan-out; every shard runs on this repo.'
+        description: 'Comma-separated owner/repo list of ppap CI repos this run may borrow idle capacity from, for the check shards and the e2e shards alike (the erp-namthuan variable PPAP_CI_REPOS). Empty ⇒ no fan-out; every shard runs in a batch on this repo.'
         type: string
         default: ''
       pr_number:
-        description: 'Source PR number, forwarded to e2e batches so they can detect a moved head and bail early.'
+        description: 'Source PR number, forwarded to check and e2e batches so they can detect a moved head and bail early.'
         type: string
         default: ''
       head_sha:
-        description: 'Head SHA under test, forwarded to e2e batches for the same stale check.'
+        description: 'Head SHA under test, forwarded to check and e2e batches for the same stale check.'
         type: string
         default: ''
       run_e2e:
         description: 'Whether to run the e2e matrix. PR CI keeps the default (true); the deploy gate passes false so staging/production builds are not blocked on dashboard e2e.'
         type: boolean
         default: true
+      gates_shards:
+        description: 'Shards for the repo gates (scripts/ci/checks/plan.mjs GATES). Capped at the gate count. Neither caller passes it, so PR CI and the deploy gate run the same split.'
+        type: number
+        default: 2
+      lint_shards:
+        description: 'Shards for ESLint (root config split by workspace directory, plus each workspace lint:js). Capped at the unit count.'
+        type: number
+        default: 2
+      typecheck_shards:
+        description: 'Shards for typecheck (one unit per workspace package with a typecheck script). Capped at the package count.'
+        type: number
+        default: 4
+      test_shards:
+        description: 'Shards for Vitest (one unit per workspace package with a test script). Capped at the package count.'
+        type: number
+        default: 6
       e2e_changed_only:
         description: 'Scope e2e to the changed service''s specs (broad/shared change → full suite, nothing relevant → skip). NOBODY passes true any more: PR CI stopped scoping in #3722 because a PR could be green while the suite was red, and the deploy gate always ran full. Kept because the scoping logic below is still the right tool if a caller ever needs it. See scripts/ci/e2e/plan.sh.'
         type: boolean
         default: false
     outputs:
+      # The four check verdicts keep the names (and meaning) they had as
+      # separate jobs, so erp-ci-pr.yml and erp-deploy-reusable.yml read them
+      # unchanged. `biome` is the repo-gates suite — the key stayed when the job
+      # was renamed, and callers read it as R_BIOME. Each is `success` only when
+      # every shard of that suite passed; anything else, empty included, is red.
       biome:
-        description: 'Result of the biome job'
-        value: ${{ jobs.biome.result }}
+        description: 'Verdict of the sharded repo-gates suite.'
+        value: ${{ jobs.checks.outputs.gates }}
       typecheck:
-        # `result` on a MATRIX job is already the aggregate — success only when
-        # every leg succeeded — so the former typecheck-aggregate job existed
-        # purely to copy that value into an output. Same for `test` below.
-        description: 'Aggregated result of the sharded typecheck matrix.'
-        value: ${{ jobs.typecheck.result }}
+        description: 'Verdict of the sharded typecheck suite.'
+        value: ${{ jobs.checks.outputs.typecheck }}
       lint:
-        description: 'Result of the lint job'
-        value: ${{ jobs.lint.result }}
+        description: 'Verdict of the sharded ESLint suite.'
+        value: ${{ jobs.checks.outputs.lint }}
       test:
-        description: 'Aggregated result of the sharded Vitest matrix.'
-        value: ${{ jobs.test.result }}
+        description: 'Verdict of the sharded Vitest suite.'
+        value: ${{ jobs.checks.outputs.test }}
+      check_runs:
+        description: 'JSON array of the fanned-out check batch runs ([{repo, batch, run_id, conclusion}]), the checks counterpart of e2e_runs.'
+        value: ${{ jobs.checks.outputs.runs }}
       e2e:
         description: 'e2e verdict: success when every batch passed OR the plan had nothing relevant to test; failure otherwise. Empty (⇒ red) if the job itself died.'
         value: ${{ jobs.e2e.outputs.result }}
@@ -80,408 +104,37 @@ env:
   GIT_CONFIG_VALUE_0: main
 
 jobs:
-  biome:
-    # NAMED for the bundle, not for its first step. As `Biome (format + lint)`
-    # this job described one of its nine gates and mislabelled the other eight:
-    # `pnpm ba:check-links` was the failing step in 7 of 7 measured red runs, and
-    # every one of them showed up on the PR as "biome is red".
-    #
-    # The job ID stays `biome:` — it is the workflow_call output key read as
-    # `needs.checks.outputs.biome` in erp-ci-pr.yml (R_BIOME) and in
-    # erp-deploy-reusable.yml's ci-gate. Renaming the ID breaks both.
-    #
-    # erp-ci-pr.yml's `noise` step routes per-job logs by DISPLAY NAME and must be
-    # changed with this, in the same commit: a rename it does not know about sends
-    # this job's log nowhere, and the run reports `biome_warnings: 0, clean: true`
-    # on a genuinely warning-laden PR — worse than the bad name ever was.
-    name: 1 · CI · Repo gates (biome, BA vault, shell, terraform)
+  # ONE job for the repo gates, ESLint, typecheck and Vitest: plan their shards,
+  # dispatch them to idle fleet repos, wait, and emit one verdict per suite.
+  #
+  # These were four fixed jobs here — Repo gates, Lint, and two 3-leg matrices
+  # whose legs were hand-binned package lists — holding 8 of this org's 20
+  # concurrent-job slots next to the 10 zone builds on the e2e critical path.
+  # Now scripts/ci/checks/plan.mjs discovers each suite's units (packages,
+  # gates, ESLint directories), bin-packs them by measured weight into
+  # `<suite>_shards` shards, and scripts/ci/fanout.mjs (SUITE=checks) sends them
+  # to erp-ci-checks-batch.yml on whichever fleet repos have room — the same
+  # recruitment the e2e shards use. Widening a suite is changing its input.
+  #
+  # Starts at t=0 with no `needs:`: a checks batch needs no build artifact, so
+  # it runs alongside the zone builds and is usually done before e2e starts.
+  # The e2e dispatch that follows sees the check batches in each host's
+  # in-flight job count, so the two never over-commit a host.
+  #
+  # FAILS CLOSED per suite: an output is `success` only when every unit of
+  # that suite reported a green job (scripts/ci/lib/fanout-plan.mjs
+  # suiteVerdicts). A dispatch failure, a timeout or a missing job is red.
+  checks:
+    name: 1 · CI · Checks
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
-      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
-      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
-      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
-      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
-      # probing every token is free. Inlined rather than calling
-      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
-      # because a private-repo checkout itself needs a token, so the pool cannot live
-      # behind it.
-      #
-      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
-      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
-      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
-      # to one account's quota, i.e. straight back to the outage above, looking healthy
-      # the entire time. Now a missing pool fails the job loudly instead.
-      - name: Resolve PAT from pool
-        env:
-          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
-        run: |
-          set -uo pipefail
-          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
-          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
-          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
-          # account reads 5000 — so one account served every job while the rest idled,
-          # which is the concentration the pool exists to prevent. Jobs shuffle
-          # independently, so a fan-out spreads instead of stampeding onto one token.
-          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
-          BEST=''; BEST_REM=-1
-          while IFS= read -r T; do
-            [ -n "$T" ] || continue
-            echo "::add-mask::$T"
-            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
-                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
-            case "$R" in ''|*[!0-9]*) continue ;; esac
-            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
-          done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
-          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
-          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
-          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
-          if [ "$BEST_REM" -lt 500 ]; then
-            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
-          fi
-          exit 0
-
-      - uses: actions/checkout@v7
-        with:
-          repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ env.RESOLVED_PAT }}
-          ref: ${{ inputs.checkout_ref }}
-          # Full history so HEAD^1 (the PR's base parent on the merge ref) is
-          # available for the demo-migration-guard diff below.
-          fetch-depth: 0
-          persist-credentials: false
-
-      - uses: ./.github/actions/install
-
-      # Every gate below carries `if: ${{ !cancelled() }}` AND an explicit `name:`.
-      # These nine checks are INDEPENDENT — each reads the filesystem (or live
-      # DNS) and none consumes another's output — but Actions skips the rest of a
-      # job once a step fails, so the first one to go red used to hide the other
-      # eight, and the job then named a single gate while an agent fixed them one
-      # round trip at a time (the same pathology the e2e fail-fast layers had).
-      # Guarding each step makes the job's step list the report: every failing
-      # gate is named in one run. The job still concludes `failure` if any fails.
-      #
-      # The `name:`s are load-bearing for the same reason and were the missing
-      # half. Unnamed, Actions labels a step with its raw command, so the job's
-      # one visible fact stayed its own name — and the name described only the
-      # FIRST gate. Measured across the fleet, `pnpm ba:check-links` was the
-      # failing step in 7 of 7 red runs of this job, every one of which reads as
-      # "biome is red" on the PR. See `.claude/playbooks/ci-failure-catalog.md`
-      # § Repo gates.
-      #
-      # `scripts/gate/data/exports.sh` was the one gate missing the guard the
-      # paragraph above already claimed they all had, so a red no-suppressions
-      # silently skipped it — the precise failure this guarding exists to stop,
-      # living inside the comment describing it.
-      #
-      # Resolve-PAT / checkout / install stay UNGUARDED above: if one of those
-      # fails nothing downstream can run, and pretending otherwise would just
-      # produce ten identical cascade errors.
-      - name: Biome — format + lint
-        run: pnpm biome ci .
-
-      # Repo-wide suppression/skip gate: no biome-ignore / eslint-disable /
-      # @ts-ignore and no test skip in ANY form may exist in the codebase
-      # (.claude/rules.md § "Never skip checks, never suppress").
-      - name: No suppressions / skipped tests
-        if: ${{ !cancelled() }}
-        run: bash scripts/gate/shape/no-suppressions.sh
-
-      # Timeout ratchet: the number of hand-written waits in the test suite may
-      # go DOWN, never up. Widening a timeout until CI goes green masks the
-      # defect and the number never comes back down — messenger-group-manage
-      # went 15s to 150s across five PRs before anyone noticed the assertion was
-      # waiting on a toast that expires after 4s. The gate counts rather than
-      # judging; a stale baseline fails too, because slack is where a re-added
-      # timeout hides (.claude/skills/remove-test-waits).
-      - name: Timeout ratchet
-        if: ${{ !cancelled() }}
-        run: bash scripts/gate/shape/no-timeouts.sh
-
-      # Tailwind colour-token gate: fail when a `bg-`/`text-`/`border-`/…
-      # utility names a design token `apps/shell/src/styles/globals.css` never
-      # declares. Tailwind v4 emits no rule and no warning for an unknown theme
-      # key, so the class compiles, passes typecheck, passes lint (a class name
-      # is just a string literal) and paints nothing — `bg-surface-2` shipped
-      # this way in the first social-feed PR and spread by copy for eight weeks
-      # before anyone noticed (#3703). 125 pre-existing violations (8 stems)
-      # are tolerated via a STEM-list baseline until the separate cleanup
-      # issues (#3704, #3705) land.
-      - name: Tailwind colour tokens are declared
-        if: ${{ !cancelled() }}
-        run: node scripts/gate/shape/tailwind-colors.mjs
-
-      # Export-engine gate: no hand-built SheetJS workbook, no leaf route
-      # streaming a spreadsheet/CSV inside the request, and no dataset in the
-      # registry without its `_export` read. The estate this replaced had seven
-      # exports and seven shapes; without a gate the eighth is the eighth way
-      # (docs/engineering/architecture/exports.md).
-      - name: Export-engine gate
-        if: ${{ !cancelled() }}
-        run: bash scripts/gate/data/exports.sh
-
-      # Demo/test fixtures must never ship as a schema migration under
-      # apis/*/migrations/ — they apply to Staging AND Production with no
-      # environment filter (this has recurred twice; see
-      # docs/ba/4-archive/scnpms/bugs/cross-module/2026-08-04-demo-fixture-data-live-in-staging-and-production.md).
-      # Diff-scoped to files ADDED by this PR (HEAD^1 = the base parent on
-      # refs/pull/N/merge, same convention as scripts/ci/e2e/plan.sh) — the 22
-      # already-shipped demo migrations stay in place and must not retrigger.
-      - name: No demo fixtures in migrations
-        if: ${{ !cancelled() }}
-        run: bash scripts/gate/data/demo-migrations.sh
-
-      # Email-authentication gate for the OTP sender domains: DKIM at
-      # cf-bounce._domainkey, SPF at cf-bounce, bounce MX, exactly one DMARC
-      # record. Live DNS only — no Cloudflare credentials. Lives here rather
-      # than in a job of its own because it takes seconds and needs no build;
-      # grouped with the other repo-wide gates on this job.
-      #
-      # `dig` is installed if absent rather than assumed: the script treats a
-      # missing resolver as a hard failure under CI (see its NO_RESOLVER note),
-      # because a gate that silently skips itself is worth no more than no gate.
-      - name: Assert sender-domain email DNS
-        if: ${{ !cancelled() }}
-        run: |
-          command -v dig >/dev/null 2>&1 || {
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq dnsutils
-          }
-          bash scripts/gate/data/email-dns.sh
-
-      # The SHELL half of scripts/ — including scripts/gate/hook/**, the change-scoped
-      # resolver (base-ref.sh), the e2e-plan decision that picks which specs THIS
-      # workflow runs, the repo-wide gates, and the CI-repo resolver. Every one of
-      # them fails silently in the direction that matters: a wrong answer still
-      # exits 0 and the run reports success having checked less than it claimed.
-      # Vitest cannot drive them (shell processes judged by exit code and stdout),
-      # and `require-tests.sh` carves out scripts/, so this step is the only gate.
-      #
-      # It runs in CI and not only via lefthook because that carve-out means a hook
-      # or script change is never in `test:changed`'s scope, so the pre-commit gate
-      # never reaches this suite. Before a step like this existed the suite had gone
-      # red unnoticed (scripts/gate/hook/remind/audit-vocab.sh had no test file, and the completeness
-      # check was flagging it into an empty room).
-      #
-      # Shallow-clone safe: scripts/lib/bash/base-ref.sh falls back to HEAD when no
-      # upstream/main, origin/main or main exists, so the change-set-driven tests
-      # see the same uncommitted+untracked scope here as they do locally. (This job
-      # checks out fetch-depth 0 anyway, for the demo-migration guard.)
-      #
-      # `test:hooks` is kept as an ALIAS of this in package.json and deliberately
-      # not run here: ppap runs the mirrored copy of this workflow, so the previous
-      # revision still calls `test:hooks` until the next sync lands. Running both
-      # would run the same 37 files twice.
-      - name: Shell test suite (scripts/)
-        if: ${{ !cancelled() }}
-        run: pnpm test:scripts:bash
-
-      # The BA tree's ~2,700 relative links, its `status:` vocabulary and its
-      # channel READMEs had NO gate at all — `ba:check-links` existed and ran on
-      # precisely zero triggers, local or CI. It fails on a status outside the
-      # seven-word vocabulary (a value in neither set neither mints nor archives:
-      # `status: open` hid a critical data-loss report for 26 days), on a channel
-      # folder with no README (git does not track empty dirs, so the channel
-      # vanishes), on a finished item STRANDED in 1-projects/ (terminal at the
-      # change's base too — a PR flipping its OWN item to `done` is exempt, since
-      # the post-merge sweep on main archives it), and on any link a move broke.
-      # It also asserts the sweep can still SEE the tree — point it one level
-      # off and every other check passes vacuously.
-      #
-      # Seconds, filesystem-only, no network. Not in pre-commit: docs PRs go
-      # through /ship-docs, which deliberately runs nothing.
-      - name: BA vault — links, statuses, stranded items
-        if: ${{ !cancelled() }}
-        run: pnpm ba:check-links
-
-      # NOTE — the two generator freshness gates that used to sit here
-      # (`spine.mjs --check` and `docs-index.mjs --check`) were REMOVED on
-      # 2026-08-26. They were the reason a lane had to regenerate a SHARED block
-      # inside its own PR: the hubs carry one row per item, so two lanes whose
-      # rows happen to sort adjacently conflicted on a file neither of them was
-      # really editing (measured on UC-09: three rows apart merged clean, adjacent
-      # rows conflicted). Freshness is not lost — `archive.mjs` regenerates the
-      # spine and `archive-to-main.sh` regenerates the folder indexes, both
-      # against `main` after the merge, where a pure function of the tree
-      # converges on a rebase instead of disagreeing.
-      #
-      # The VALIDATORS below stay: they only read, so they never conflict, and
-      # they are what actually catches a broken link or a bad status.
-
-      # `ba:check-links` above covers docs/ only, because scripts/ba/archive.mjs exists to
-      # sweep the BA tree. That left the larger half unchecked: CLAUDE.md, the root
-      # README, ONBOARDING.md, all of .claude/, and every apis/*/README.md — 974
-      # references with no gate at all. The 2026-08 split that moved seventeen
-      # system-design docs out of .claude/ into docs/engineering/ rewrote every one
-      # of them; without this, nothing could have said whether one was wrong. It
-      # found 150 broken links on the first run, and 7 that had been broken since
-      # the PARA move a day earlier.
-      - name: Doc links (CLAUDE.md, .claude/, READMEs)
-        if: ${{ !cancelled() }}
-        run: node scripts/ba/doc-links.mjs
-
-      # scripts/README.md's Quick reference is generated, and until now nothing
-      # in CI checked it was current — it ran only in `audit.sh full/preflight`,
-      # i.e. locally. So #3125 landed scripts/dev/ops/bom-cleanup-candidates.mjs
-      # without its row and main went stale, which made `pnpm preflight` RED on a
-      # clean checkout for EVERY agent lane: S5 reads a red preflight as "CI is
-      # about to be red", so each lane either chased a failure its change did not
-      # cause or pushed unrelated README churn. One of the two generator
-      # freshness gates the NOTE above retired for shared-block conflicts — this
-      # one has none of that: the block is one row per script, so two lanes only
-      # collide by adding adjacent scripts in the same window, and the row is
-      # THEIRS to add.
-      - name: scripts/README.md Quick reference is current
-        if: ${{ !cancelled() }}
-        run: node scripts/gate/shape/scripts-index.mjs --check
-
-      # terraform/ used to be executed for the FIRST time at deploy, inside the
-      # deploy job's `terraform apply`. A bad module reference or undeclared
-      # variable therefore surfaced mid-deploy, after CI was green and the release
-      # was already rolling — the one thing the ci-gate comment in
-      # erp-deploy-reusable.yml calls out as "before infra touches Cloudflare".
-      # `-backend=false` inside the script keeps it credential-free: no HCP token,
-      # no remote state, nothing to leak into a public CI runner.
-      #
-      # Pinned to the version the deploy job uses, so this validates against the
-      # binary that will later run `apply`.
-      - uses: hashicorp/setup-terraform@v4
-        if: ${{ !cancelled() }}
-        with:
-          terraform_version: '1.9.0'
-          terraform_wrapper: false
-
-      - name: Terraform validate
-        if: ${{ !cancelled() }}
-        run: bash scripts/gate/ci/terraform.sh
-
-      # ── Gates that ran in `audit.sh` and NOWHERE in CI until #3709 ──────────
-      #
-      # Each was local-only: enforced on every agent turn, invisible to a PR, and
-      # gone the moment someone did not run it locally. That is precisely how
-      # #3125 landed (see the scripts-index note above), and it had already
-      # happened a second time with root ESLint — 575 errors piled up unseen.
-      # All seven are green and cost ~10s together, measured, against a ~20-minute
-      # round trip to discover afterwards that main went stale.
-
-      # Every executable lives in scripts/, in the folder matching its concern,
-      # inside the closed folder set, with a mirrored test under scripts/tests/.
-      # CLAUDE.md calls this rule load-bearing and names this gate as what
-      # enforces it. Nothing else does: a script dropped into .claude/ or
-      # .github/ would merge and become the precedent for the next one.
-      - name: Repo layout (scripts/ folder set, lib boundary, mirrored tests)
-        if: ${{ !cancelled() }}
-        run: bash scripts/gate/shape/layout.sh
-
-      # A BA archive sweep, or a regenerated hub / folder-index block, must never
-      # ride along in a branch. The block is one row per item in a file every item
-      # shares, so two lanes inserting rows conflict INSIDE it. PR #2773 was
-      # docs-only across 67 files and its single such conflict left GitHub unable
-      # to build refs/pull/2773/merge — every job died at checkout with exit 128.
-      # `main` regenerates these blocks after the merge; a branch never should.
-      - name: No BA archive sweep or regenerated block in a branch
-        if: ${{ !cancelled() }}
-        run: bash scripts/gate/data/ba-item-scope.sh
-
-      # Every workspace (apis/*, apps/*, packages/*, monolith/*) ships a
-      # README.md — .claude/rules.md § Documentation.
-      - name: Every workspace has a README
-        if: ${{ !cancelled() }}
-        run: bash scripts/gate/shape/readmes.sh
-
-      # shellcheck over scripts/** — ~80 files of bash that gate every turn,
-      # choose which e2e specs CI runs, and reset databases. The class of bug it
-      # catches is the class that hurts here: an unquoted expansion that
-      # word-splits a path, an unchecked `cd` that leaves the rest of the script
-      # running in the wrong directory, an `rm -rf "$a/$b"` that becomes `rm -rf /`
-      # when a variable is empty.
-      - name: Shell scripts pass shellcheck
-        if: ${{ !cancelled() }}
-        run: bash scripts/gate/shape/shell.sh
-
-      # A workflow can be flawless YAML and still be rejected wholesale by
-      # GitHub — `runner` used in a job-level `env:` took out two agent workflows
-      # for two hours in 0s-failing sync pushes, while the controller kept
-      # reporting success. This tree is the source of truth that auto-syncs to the
-      # satellite ppap repos on merge, so a broken workflow here cannot be fixed
-      # by the PR that broke it.
-      - name: Workflows are valid, not merely parseable
-        if: ${{ !cancelled() }}
-        run: bash scripts/gate/ci/workflows.sh
-
-      # Dead code — unused files, exports and dependencies. Needs the whole module
-      # graph, which is why it is never change-scoped in the per-turn hook.
-      - name: Dead code (knip)
-        if: ${{ !cancelled() }}
-        run: pnpm dead-code
-
-      # Copy-paste detection. Duplication is never introduced-and-must-block
-      # within a single turn, so it stays out of the per-turn hook — but a PR is
-      # exactly where it should be visible.
-      - name: Duplicate code (jscpd)
-        if: ${{ !cancelled() }}
-        run: pnpm duplicates
-
-      # The e2e zone bundle cache key must name every package a zone is BUILT
-      # from. It skips the build on a hit, so a key that misses one serves a
-      # bundle compiled from source this PR never contained — and the e2e suite
-      # then tests yesterday's code, green all the way. Runs here as well as
-      # locally because the key lives in THIS file, which a PR can edit.
-      - name: Zone bundle cache key covers every build input
-        if: ${{ !cancelled() }}
-        run: node scripts/gate/ci/zone-cache-key.mjs
-
-      # ...and the gate that keeps the two lists in step. `audit.sh` owns the gate
-      # list; this workflow re-enumerates it BY HAND. Nothing compared them, which
-      # is how the seven above drifted out of CI unnoticed. This fails when a gate
-      # in audit.sh has neither a step here nor a documented exception — so the
-      # eighth cannot go missing the same way.
-      - name: Every audit.sh gate also runs in CI
-        if: ${{ !cancelled() }}
-        run: node scripts/gate/ci/audit-parity.mjs
-
-  # Typecheck, split across parallel legs — same reasoning as the Vitest matrix
-  # above (389s as one job, and the dominant cost on any PR whose e2e is
-  # skipped).
-  #
-  # The legs are INDEPENDENT: every workspace package resolves its siblings to
-  # raw TypeScript (`packages/api-types` exports `./src/index.ts`,
-  # `packages/dashboard-shell` exports `./src/*`), so no leg needs another
-  # leg's emitted `.d.ts` and there is no build ordering to preserve. If a
-  # package is ever changed to publish `dist/`, that assumption breaks and the
-  # legs must gain a `needs:` on whichever leg builds it.
-  #
-  # Three legs, for the same 20-job concurrency reason as the Vitest matrix.
-  # Weights from measured per-package runtime (local seconds), 223s over 34
-  # packages:
-  #   a 71 · b 76 · rest 76
-  # `api-monolith` (27s) and `shell` (26s) are the outliers; they anchor
-  # separate legs, so ~27 is this branch's floor at any leg count.
-  #
-  # BINNED_PKGS / `rest` catch-all: see the note on the Vitest matrix.
-  typecheck:
-    name: 1 · CI · Typecheck (${{ matrix.leg.name }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      BINNED_PKGS: >-
-        @namthuanvn/api-monolith @namthuanvn/oms @namthuanvn/assistant @namthuanvn/exms
-        @namthuanvn/procurement @namthuanvn/sourcing @namthuanvn/zone-bom
-        @namthuanvn/shell @namthuanvn/zone-oms @namthuanvn/zone-sourcing
-        @namthuanvn/auth @namthuanvn/bom @namthuanvn/social @namthuanvn/audit
-    strategy:
-      fail-fast: false
-      matrix:
-        leg:
-          - name: a      # 71
-            pkgs: '@namthuanvn/api-monolith @namthuanvn/oms @namthuanvn/assistant @namthuanvn/exms @namthuanvn/procurement @namthuanvn/sourcing @namthuanvn/zone-bom'
-          - name: b      # 76
-            pkgs: '@namthuanvn/shell @namthuanvn/zone-oms @namthuanvn/zone-sourcing @namthuanvn/auth @namthuanvn/bom @namthuanvn/social @namthuanvn/audit'
-          - name: rest   # 76
-            pkgs: ''   # catch-all — everything not in BINNED_PKGS
+    # Bounded by the slowest remote unit (20 min) plus queueing on a busy host.
+    timeout-minutes: 45
+    outputs:
+      gates: ${{ steps.verdict.outputs.gates }}
+      lint: ${{ steps.verdict.outputs.lint }}
+      typecheck: ${{ steps.verdict.outputs.typecheck }}
+      test: ${{ steps.verdict.outputs.test }}
+      runs: ${{ steps.collect.outputs.runs }}
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
       # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
@@ -535,269 +188,95 @@ jobs:
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
-      - uses: ./.github/actions/install
-
-      - name: Run typecheck leg
+      - name: Plan check shards
+        id: plan
         env:
-          LEG: ${{ matrix.leg.name }}
-          PKGS: ${{ matrix.leg.pkgs }}
+          GATES_SHARDS: ${{ inputs.gates_shards }}
+          LINT_SHARDS: ${{ inputs.lint_shards }}
+          TYPECHECK_SHARDS: ${{ inputs.typecheck_shards }}
+          TEST_SHARDS: ${{ inputs.test_shards }}
         run: |
           set -euo pipefail
-          ARGS=()
-          if [ -z "$PKGS" ]; then
-            for p in $BINNED_PKGS; do ARGS+=(--filter "!$p"); done
-          else
-            for p in $PKGS; do
-              case " $BINNED_PKGS " in
-                *" $p "*) ;;
-                *) echo "::error::typecheck leg '$LEG' runs $p but BINNED_PKGS does not list it — the 'rest' leg would run it a second time. Add it to BINNED_PKGS."; exit 1 ;;
-              esac
-              ARGS+=(--filter "$p")
-            done
-          fi
-          echo "▶ typecheck leg '$LEG': pnpm -r ${ARGS[*]} typecheck"
-          pnpm -r "${ARGS[@]}" typecheck
+          UNITS="$(node scripts/ci/checks/plan.mjs units \
+            "gates=$GATES_SHARDS" "lint=$LINT_SHARDS" \
+            "typecheck=$TYPECHECK_SHARDS" "test=$TEST_SHARDS")"
+          echo "units=$UNITS" >> "$GITHUB_OUTPUT"
+          echo "▶ check units: $UNITS" >&2
 
-
-  lint:
-    name: 1 · CI · Lint workspaces (ESLint)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
-      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
-      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
-      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
-      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
-      # probing every token is free. Inlined rather than calling
-      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
-      # because a private-repo checkout itself needs a token, so the pool cannot live
-      # behind it.
-      #
-      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
-      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
-      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
-      # to one account's quota, i.e. straight back to the outage above, looking healthy
-      # the entire time. Now a missing pool fails the job loudly instead.
-      - name: Resolve PAT from pool
+      - name: Dispatch check batches
+        id: dispatch
         env:
-          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
-        run: |
-          set -uo pipefail
-          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
-          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
-          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
-          # account reads 5000 — so one account served every job while the rest idled,
-          # which is the concentration the pool exists to prevent. Jobs shuffle
-          # independently, so a fan-out spreads instead of stampeding onto one token.
-          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
-          BEST=''; BEST_REM=-1
-          while IFS= read -r T; do
-            [ -n "$T" ] || continue
-            echo "::add-mask::$T"
-            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
-                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
-            case "$R" in ''|*[!0-9]*) continue ;; esac
-            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
-          done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
-          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
-          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
-          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
-          if [ "$BEST_REM" -lt 500 ]; then
-            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
-          fi
-          exit 0
+          # A pooled PAT, not GITHUB_TOKEN: the probe and the dispatch both cross
+          # org boundaries, and events created with GITHUB_TOKEN do not trigger
+          # workflows at all.
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          SUITE: checks
+          CHECK_UNITS: ${{ steps.plan.outputs.units }}
+          SELF: ${{ github.repository }}
+          FLEET: ${{ inputs.fleet }}
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          CORRELATION: ${{ github.run_id }}-${{ github.run_attempt }}
+          COORD_FALLBACK_SLOTS: '14'
+          # Per-host cap. 14 default units over 8 lands on two hosts, leaving
+          # the rest of the fleet to the e2e shards that dispatch minutes later.
+          WORKER_SLOTS: '8'
+        run: node scripts/ci/fanout.mjs dispatch
 
-      - uses: actions/checkout@v7
+      # Uploaded BEFORE collect as well as after it: scripts/ci/progress.mjs
+      # reads this map while the run is still going, to find the batch runs
+      # whose failures it publishes early. After collect it also carries each
+      # batch's run id, for scripts/ci/ppap/ci-repo.sh --fanout.
+      - name: Upload check fan-out map (dispatched)
+        if: ${{ steps.dispatch.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
         with:
-          repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ env.RESOLVED_PAT }}
-          ref: ${{ inputs.checkout_ref }}
-          persist-credentials: false
+          name: ci-fanout-checks
+          path: ci-fanout-checks.json
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: ignore
 
-      - uses: ./.github/actions/install
-
-      # TWO commands, because neither one alone sees the whole repo.
-      #
-      # `lint:js:packages` is `pnpm -r lint:js`, and `pnpm -r` runs a script only
-      # where that script EXISTS — which is `apps/shell` and `apis/*`, nothing
-      # else. It also excludes the workspace root by design. So for as long as
-      # this was the only ESLint job, `packages/*`, `scripts/**`, `monolith/api`
-      # and all ten zone apps were linted by NOTHING. That is not theoretical:
-      # when root ESLint was finally run on a green `main` it reported 575
-      # errors, accumulated invisibly because no gate had ever opened those
-      # files.
-      #
-      # `pnpm lint:js` is the root `eslint .`, whose flat config covers exactly
-      # the packages the per-workspace pass misses (it ignores `apps/shell`,
-      # which has its own config and its own script). Root + packages together
-      # are the whole tree; drop either and a hole reopens silently.
-      - run: pnpm lint:js
-      - run: pnpm lint:js:packages
-
-      # ...and a third, because "root + packages are the whole tree" is a CLAIM,
-      # and the two commands above cannot check it. Either pass stays green when
-      # a file stops being linted — an `ignores` entry, a new top-level folder no
-      # config matches, a workspace that drops its `lint:js` script. That is how
-      # the 1,689-file hole opened in the first place: nothing was red, because
-      # nothing was looking.
-      #
-      # `lint-coverage.mjs` enumerates every lintable file in the repo and
-      # asserts each one is claimed by root ESLint or by a workspace pass, so the
-      # claim is mechanical rather than a comment. It also refuses to pass when
-      # its own scan matches nothing, since an empty scan reports zero
-      # uncovered files and reads exactly like success.
-      #
-      # It runs here and not only in `audit.sh` deliberately. `scripts/README.md`
-      # above records what happens otherwise: that gate "ran only in `audit.sh
-      # full/preflight`, i.e. locally", so #3125 landed without it and main went
-      # stale for every agent lane. A gate CI does not run is a gate that stops
-      # existing the moment someone does not run it locally.
-      - name: Every lintable file is covered by a lint pass
-        if: ${{ !cancelled() }}
-        run: node scripts/gate/shape/lint-coverage.mjs
-
-  # Vitest, split across parallel legs. `pnpm test:ci` (= `pnpm -r test --
-  # --run`) as ONE job was 474s and the second-longest branch in the graph —
-  # long enough that it becomes the critical path the moment the e2e matrix is
-  # widened, so sharding e2e without sharding this buys nothing past ~28
-  # shards. It is also the WHOLE cost of a PR whose e2e plan says `skip`: run
-  # 31667489668 (a .github/-only change) took 7.3 min with no e2e at all.
-  #
-  # Two effects, both wins. The obvious one is parallelism. The subtler one is
-  # that `pnpm -r` defaults to a workspace concurrency of ~4 while each vitest
-  # then spawns its own worker pool — on a 4-vCPU runner that is ~16 test
-  # processes fighting over 4 cores. Measured locally the same 32 packages take
-  # ~93s wall-clock; CI spends 474s. Fewer packages per leg means far less
-  # oversubscription, so the legs should beat a naive 474/6.
-  #
-  # LEG COUNT IS CAPPED BY THE ORG'S CONCURRENCY BUDGET, not by how finely the
-  # suite splits. A coordinator run must fit GitHub Free's 20 concurrent jobs:
-  # biome 1 + lint 1 + e2e-plan 1 + zone builds 10 + seed 1 = 14 are fixed and
-  # the zone builds sit on the critical path, so typecheck + vitest legs must
-  # total at most 6 or the scheduler queues something — quite possibly a zone
-  # build, which would cost more wall-clock than the extra legs save. Hence 3
-  # here and 3 for typecheck: peak lands exactly on 20 with nothing queued.
-  #
-  # Leg weights come from measured per-package runtime (local seconds, used as
-  # a relative proxy — CI is uniformly slower). Total 93s over 32 packages:
-  #   app-shell 30 · shell-ui 31 · rest 32
-  # `shell` (17) and `dashboard-shell` (15) are single packages too big to
-  # split, so each anchors a leg and is topped up with small ones.
-  #
-  # COVERAGE IS BY CONSTRUCTION, not by review: the `rest` leg is a catch-all
-  # that EXCLUDES the explicitly-binned packages instead of listing its own, so
-  # a newly added workspace package automatically runs there. The dangerous
-  # failure (a package silently tested by NO leg) is therefore unreachable.
-  # `pnpm -r` skips packages with no `test` script, so the 4 script-less
-  # packages are free no-ops.
-  #
-  # BINNED_PKGS must list exactly the packages named in the five explicit legs
-  # — it is what `rest` subtracts. Each named leg asserts its own packages
-  # appear here, so the two drift loudly rather than silently. Worst case if
-  # they do drift, a package runs in two legs: wasteful, never unsafe.
-  test:
-    name: 1 · CI · Unit tests (Vitest · ${{ matrix.leg.name }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      BINNED_PKGS: >-
-        @namthuanvn/shell @namthuanvn/oms @namthuanvn/procurement @namthuanvn/notifications
-        @namthuanvn/dashboard-shell @namthuanvn/sourcing @namthuanvn/hris @namthuanvn/exms
-        @namthuanvn/zone-oms @namthuanvn/api-types @namthuanvn/auth
-    strategy:
-      # Report every leg's failures in one run — unlike the e2e matrix these
-      # are cheap, and a single aggregated red is more useful than the first
-      # leg cancelling its siblings.
-      fail-fast: false
-      matrix:
-        leg:
-          - name: app-shell   # 30
-            pkgs: '@namthuanvn/shell @namthuanvn/oms @namthuanvn/procurement @namthuanvn/notifications'
-          - name: shell-ui    # 31
-            pkgs: '@namthuanvn/dashboard-shell @namthuanvn/sourcing @namthuanvn/hris @namthuanvn/exms @namthuanvn/zone-oms @namthuanvn/api-types @namthuanvn/auth'
-          - name: rest        # 32
-            pkgs: ''   # catch-all — everything not in BINNED_PKGS
-    steps:
-      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
-      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
-      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
-      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
-      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
-      # probing every token is free. Inlined rather than calling
-      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
-      # because a private-repo checkout itself needs a token, so the pool cannot live
-      # behind it.
-      #
-      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
-      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
-      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
-      # to one account's quota, i.e. straight back to the outage above, looking healthy
-      # the entire time. Now a missing pool fails the job loudly instead.
-      - name: Resolve PAT from pool
+      - name: Wait for check batches
+        id: collect
+        if: ${{ steps.dispatch.outcome == 'success' }}
         env:
-          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
-        run: |
-          set -uo pipefail
-          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
-          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
-          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
-          # account reads 5000 — so one account served every job while the rest idled,
-          # which is the concentration the pool exists to prevent. Jobs shuffle
-          # independently, so a fan-out spreads instead of stampeding onto one token.
-          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
-          BEST=''; BEST_REM=-1
-          while IFS= read -r T; do
-            [ -n "$T" ] || continue
-            echo "::add-mask::$T"
-            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
-                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
-            case "$R" in ''|*[!0-9]*) continue ;; esac
-            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
-          done <<< "$POOL"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
-          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
-          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
-          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
-          if [ "$BEST_REM" -lt 500 ]; then
-            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
-          fi
-          exit 0
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          SUITE: checks
+          FANOUT: ${{ steps.dispatch.outputs.fanout }}
+          TIMEOUT_S: '2400'
+        run: node scripts/ci/fanout.mjs collect
 
-      - uses: actions/checkout@v7
+      - name: Upload check fan-out map (resolved)
+        if: ${{ always() && steps.dispatch.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
         with:
-          repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ env.RESOLVED_PAT }}
-          ref: ${{ inputs.checkout_ref }}
-          persist-credentials: false
+          name: ci-fanout-checks
+          path: ci-fanout-checks.json
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: ignore
 
-      - uses: ./.github/actions/install
-
-      - name: Run vitest leg
+      - name: Emit per-suite verdicts
+        id: verdict
+        if: ${{ always() }}
         env:
-          LEG: ${{ matrix.leg.name }}
-          PKGS: ${{ matrix.leg.pkgs }}
+          R_GATES: ${{ steps.collect.outputs.result_gates }}
+          R_LINT: ${{ steps.collect.outputs.result_lint }}
+          R_TYPECHECK: ${{ steps.collect.outputs.result_typecheck }}
+          R_TEST: ${{ steps.collect.outputs.result_test }}
         run: |
           set -euo pipefail
-          ARGS=()
-          if [ -z "$PKGS" ]; then
-            # Catch-all leg: start from every workspace package and subtract the
-            # binned ones. pnpm treats a filter set containing only negations as
-            # "all packages except these".
-            for p in $BINNED_PKGS; do ARGS+=(--filter "!$p"); done
-          else
-            for p in $PKGS; do
-              # Drift guard — see the BINNED_PKGS note above.
-              case " $BINNED_PKGS " in
-                *" $p "*) ;;
-                *) echo "::error::leg '$LEG' runs $p but BINNED_PKGS does not list it — the 'rest' leg would run it a second time. Add it to BINNED_PKGS."; exit 1 ;;
-              esac
-              ARGS+=(--filter "$p")
-            done
-          fi
-          echo "▶ vitest leg '$LEG': pnpm -r ${ARGS[*]} test -- --run"
-          pnpm -r "${ARGS[@]}" test -- --run
+          # Anything but a literal `success` is red — including an empty value
+          # from a dispatch that failed or a collect that never ran.
+          for s in gates lint typecheck test; do
+            var="R_$(printf '%s' "$s" | tr '[:lower:]' '[:upper:]')"
+            v="${!var:-}"
+            [ "$v" = success ] || v=failure
+            echo "$s=$v" >> "$GITHUB_OUTPUT"
+            echo "▶ $s: $v" >&2
+          done
 
   # Plan the e2e run. Two responsibilities:
   #   1. Decide SCOPE — when e2e_changed_only is true (PR CI), diff the PR
