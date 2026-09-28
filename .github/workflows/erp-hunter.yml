@@ -52,14 +52,20 @@ name: ERP · Hunter · Timeouts + CI noise
 on:
   # No `schedule:`. The daily clock moved OUT of GitHub — it delayed the schedule
   # EVENT at its own scheduler and dropped ticks it could not place.
-  # erp-heartbeat.yml now dispatches this workflow when its last run is over a
-  # day old, driven by a Cloudflare cron on the ERP's service-utilities worker.
+  # erp-heartbeat.yml now dispatches this workflow inside a fixed nightly SLOT,
+  # driven by a Cloudflare cron on the ERP's service-utilities worker.
   #
-  # The intent is unchanged: run in the middle of the Vietnam night, when the
-  # fleet is idle and a ~1.5k-call REST sweep competes with nobody's PR CI. The
-  # heartbeat preserves that by only dispatching once the previous run is 24h
-  # old, so the daily slot drifts by at most one 15-minute tick from wherever it
-  # last landed.
+  # The intent: run in the middle of the Vietnam night, when the fleet is idle
+  # and a ~1.5k-call REST sweep competes with nobody's PR CI — 01:30–06:00 ICT
+  # (18:30–23:00 UTC). This USED to be an age floor ("dispatch once the
+  # previous run is 24h old"), which reads a run that DIED as a run that
+  # happened AND drifts the slot to wherever anything — a manual dispatch, this
+  # workflow's own recall below, the ambulance — last started a run, with
+  # nothing ever pulling it back to the night (issue #4360: the sweep drifted
+  # into the Vietnam afternoon). The slot fixes that: only a run started at or
+  # after 18:30 UTC counts as tonight's sweep, so a daytime run never moves it,
+  # and the window closes for good at 23:00 UTC rather than waiting a further
+  # day. See `scripts/ci/heartbeat-due.mjs`'s `slotDueDecision`.
   #
   # NOTE FOR ANYONE EDITING `dry_run` BELOW: under `schedule` its value was NULL
   # (falsy → `--apply`). Under `workflow_dispatch` GitHub substitutes the
