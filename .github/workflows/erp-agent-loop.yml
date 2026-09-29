@@ -619,7 +619,9 @@ jobs:
               exit 1
             fi
             echo "✓ dispatched agent run $I/$K"
-            sleep 0.5
+            # 1s, GitHub's guidance between writes: back-to-back dispatches from
+            # one account are what trips its per-account secondary rate limit.
+            sleep 1
           done
           # Hold the concurrency slot while the just-created runs become
           # visible to the Actions API — the NEXT queued controller then
