@@ -20,7 +20,7 @@ on:
         type: number
         default: 48
       fleet:
-        description: 'Comma-separated owner/repo list of ppap CI repos this run may borrow idle capacity from, for the check shards and the e2e shards alike (the erp-namthuan variable PPAP_CI_REPOS). Empty ⇒ no fan-out; every shard runs in a batch on this repo.'
+        description: 'Comma-separated owner/repo list of ppap CI repos this run may borrow idle capacity from, for the check shards and the e2e shards alike (the erp-namthuan variable PPAP_CI_REPOS). Empty ⇒ scripts/ci/fanout.mjs reads PPAP_CI_REPOS from erp-namthuan itself; only an unreadable variable keeps every shard on this repo.'
         type: string
         default: ''
       pr_number:

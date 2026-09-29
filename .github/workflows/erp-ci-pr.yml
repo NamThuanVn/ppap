@@ -28,7 +28,7 @@ on:
         required: false
         type: number
       fleet:
-        description: 'Comma-separated owner/repo ppap list to borrow idle e2e capacity from (the erp-namthuan variable PPAP_CI_REPOS). Empty on a manual run ⇒ no fan-out, every shard lands on this repo.'
+        description: 'Comma-separated owner/repo ppap list to borrow idle e2e capacity from (the erp-namthuan variable PPAP_CI_REPOS). Empty ⇒ scripts/ci/fanout.mjs reads PPAP_CI_REPOS itself, so a manual run fans out like PR CI.'
         required: false
         default: ''
         type: string
@@ -174,14 +174,12 @@ jobs:
       # shrink the slow-shard tail that sets the batch job's 40-minute ceiling.
       # Revert to 32 here if concurrent PRs start finding the fleet busy.
       e2e_shards: ${{ fromJSON(inputs.e2e_shards || '48') }}
-      # The fleet this run may borrow e2e capacity from, forwarded by the
-      # private dispatcher (which owns PPAP_CI_REPOS). Absent on a manual
-      # workflow_dispatch → no fan-out, every shard stays here.
-      # A repository_dispatch carries the list; a manual run has to be given it,
-      # otherwise fanout finds no pool, logs "no worker with room" and collapses every
-      # shard onto this one repo (up to COORD_FALLBACK_SLOTS). That made manual
-      # main smoke tests unrepresentative of real PR CI — and unusable for
-      # measuring a shard-count change.
+      # The fleet this run may borrow capacity from, forwarded by the private
+      # dispatcher (which owns PPAP_CI_REPOS). A manual workflow_dispatch
+      # usually leaves it empty; scripts/ci/fanout.mjs then reads PPAP_CI_REPOS
+      # itself. Before that fallback an empty list collapsed every shard onto
+      # this one repo (up to COORD_FALLBACK_SLOTS), so a manual main run never
+      # touched the fleet.
       fleet: ${{ github.event.client_payload.fleet || inputs.fleet }}
       pr_number: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
       head_sha: ${{ github.event.client_payload.head_sha }}
