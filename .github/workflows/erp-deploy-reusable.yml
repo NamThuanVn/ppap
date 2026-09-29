@@ -712,7 +712,7 @@ jobs:
           jq -r .sentry_org.value               /tmp/tf-outputs.json | xargs -I {} echo "org={}"         >> "$GITHUB_OUTPUT"
           jq -r .sentry_project_dashboard.value /tmp/tf-outputs.json | xargs -I {} echo "project={}"     >> "$GITHUB_OUTPUT"
 
-      - name: Build (OpenNext — Cloudflare Workers)
+      - name: Build (shell — OpenNext; service zone — remote)
         run: pnpm --filter ${{ matrix.zone.pkg }} run build:pages
         env:
           NEXT_PUBLIC_APP_ENV: ${{ inputs.environment }}
@@ -727,10 +727,14 @@ jobs:
 
       # tar (not a raw many-small-files upload) so the .open-next file count
       # doesn't make upload/download slow. Already minified → skip artifact gzip.
-      # tar preserves the `apps/<zone>/.open-next` path so the deploy job
-      # reassembles the tree verbatim by untarring.
+      # tar preserves the app-relative path so the deploy job reassembles the
+      # tree verbatim by untarring. The shell builds `.open-next` (OpenNext); a
+      # service zone builds `.remote` (its client bundle — scripts/ci/remote/build.mjs).
       - name: Package zone build
-        run: tar -cf zone-${{ matrix.zone.name }}.tar apps/${{ matrix.zone.name }}/.open-next
+        run: |
+          app=apps/${{ matrix.zone.name }}
+          if [ -d "$app/.open-next" ]; then out="$app/.open-next"; else out="$app/.remote"; fi
+          tar -cf zone-${{ matrix.zone.name }}.tar "$out"
 
       - uses: actions/upload-artifact@v7
         with:

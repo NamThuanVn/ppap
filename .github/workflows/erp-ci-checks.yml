@@ -552,12 +552,18 @@ jobs:
       # the failure it prevents is invisible: a zone importing a fourth package
       # would keep hitting this cache, and e2e would test source the key never
       # saw. Add the package here AND let that gate confirm it.
+      #
+      # The three non-package entries are the App Shell's CSS coupling: the
+      # shell's stylesheet `@source`s every zone's route tree, and a zone remote
+      # (scripts/ci/remote/build.mjs) ships only the utilities that scan missed —
+      # so any zone's `src/app`, the shell's styles, or the remote builder can
+      # change another zone's emitted CSS.
       - name: Cache zone bundle
         id: zonetar
         uses: actions/cache@v6
         with:
           path: zone-${{ matrix.zone.name }}.tar
-          key: zonetar-v1-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}
+          key: zonetar-v2-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'apps/*/src/app/**', 'apps/shell/src/styles/**', 'scripts/ci/remote/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}
           # No restore-keys ON PURPOSE: a partial-match restore would hand back
           # a bundle built from different source. Exact key or rebuild.
 
@@ -584,17 +590,21 @@ jobs:
 
       # Generic relative `/api` build — no host/port baked, so the same bundle
       # boots on every shard's free port.
-      - name: Build zone (OpenNext)
+      - name: Build zone (OpenNext shell / zone remote)
         if: steps.zonetar.outputs.cache-hit != 'true'
         run: pnpm --filter ${{ matrix.zone.pkg }} run build:pages
 
-      # tar (not a raw many-small-files upload) so the .open-next file count
-      # doesn't make upload/download slow. The bundle is already minified, so
-      # skip artifact gzip. tar preserves the `apps/<zone>/.open-next` path so
-      # the shard reassembles the tree verbatim by untarring every zone tar.
+      # tar (not a raw many-small-files upload) so the file count doesn't make
+      # upload/download slow. The bundle is already minified, so skip artifact
+      # gzip. tar preserves the `apps/<zone>/.open-next` (shell) or
+      # `apps/<zone>/.remote` (zone remote) path so the shard reassembles the
+      # tree verbatim by untarring every zone tar.
       - name: Package zone build
         if: steps.zonetar.outputs.cache-hit != 'true'
-        run: tar -cf zone-${{ matrix.zone.name }}.tar apps/${{ matrix.zone.name }}/.open-next
+        run: |
+          app=apps/${{ matrix.zone.name }}
+          if [ -d "$app/.open-next" ]; then out="$app/.open-next"; else out="$app/.remote"; fi
+          tar -cf zone-${{ matrix.zone.name }}.tar "$out"
 
       # Runs on hit AND miss — on a hit the tar came from the cache, on a miss
       # from the step above. Either way the shards' `pattern: e2e-*` download
