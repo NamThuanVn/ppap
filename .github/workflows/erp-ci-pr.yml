@@ -132,12 +132,18 @@ jobs:
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          gh api repos/${{ env.PRIVATE_REPO }}/statuses/"$HEAD_SHA" \
-            -f state=pending \
-            -f context="$STATUS_CONTEXT" \
-            -f description="Running on ppap" \
-            -f target_url="$RUN_URL"
-          echo "✓ Pending $STATUS_CONTEXT status now targets $RUN_URL"
+          # Non-fatal: the dispatcher already posted this context as pending, so
+          # a refusal here (e.g. GitHub's per-account secondary rate limit) only
+          # costs the Details link — it must not fail the whole run.
+          if gh api repos/${{ env.PRIVATE_REPO }}/statuses/"$HEAD_SHA" \
+               -f state=pending \
+               -f context="$STATUS_CONTEXT" \
+               -f description="Running on ppap" \
+               -f target_url="$RUN_URL" >/dev/null; then
+            echo "✓ Pending $STATUS_CONTEXT status now targets $RUN_URL"
+          else
+            echo "::warning::could not re-point the pending $STATUS_CONTEXT status at this run — the dispatcher's pending status stands"
+          fi
 
   # Run the CI graph. erp-ci-checks.yml lives in the same repo and exposes one
   # verdict per suite (gates, typecheck, lint, test, e2e) as a workflow_call
@@ -564,6 +570,9 @@ jobs:
         id: status
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          # scripts/ci/ppap/gh-write.sh moves a write to another pooled account on GitHub's
+          # per-account secondary rate limit, which the pool's probe cannot see.
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           HEAD_SHA: ${{ github.event.client_payload.head_sha }}
           # Must match the context the pending status used, or the run leaves a
           # pending check behind forever and posts its verdict under a second one.
@@ -617,7 +626,11 @@ jobs:
             echo "No head_sha in payload (manual workflow_dispatch?) — skipping pingback."
             exit 0
           fi
-          gh api repos/${{ env.PRIVATE_REPO }}/statuses/"$HEAD_SHA" \
+          # Writes go through scripts/ci/ppap/gh-write.sh (secondary-rate-limit failover). The
+          # checkout above is continue-on-error, so fall back to plain gh
+          # rather than lose the write when the helper is absent.
+          ghw() { if [ -f scripts/ci/ppap/gh-write.sh ]; then bash scripts/ci/ppap/gh-write.sh "$@"; else gh "$@"; fi; }
+          ghw api repos/${{ env.PRIVATE_REPO }}/statuses/"$HEAD_SHA" \
             -f state="$STATE" \
             -f context="${STATUS_CONTEXT:-CI}" \
             -f description="$DESC" \
@@ -638,6 +651,9 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          # scripts/ci/ppap/gh-write.sh moves a write to another pooled account on GitHub's
+          # per-account secondary rate limit, which the pool's probe cannot see.
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
           HEAD_SHA: ${{ github.event.client_payload.head_sha }}
           STATE: ${{ steps.status.outputs.state }}
@@ -656,6 +672,10 @@ jobs:
         run: |
           set +e -o pipefail
           [ -n "${PR_NUMBER:-}" ] || { echo "No PR number (manual dispatch?) — skipping PR report."; exit 0; }
+          # Writes go through scripts/ci/ppap/gh-write.sh (secondary-rate-limit failover). The
+          # checkout above is continue-on-error, so fall back to plain gh
+          # rather than lose the write when the helper is absent.
+          ghw() { if [ -f scripts/ci/ppap/gh-write.sh ]; then bash scripts/ci/ppap/gh-write.sh "$@"; else gh "$@"; fi; }
           REPO="${{ env.PRIVATE_REPO }}"
           NOISE_SUMMARY="${NOISE_SUMMARY:-unknown (scan unavailable)}"
           # PR metadata.
@@ -749,7 +769,7 @@ jobs:
           if [ "$MERGED" != "true" ] && [ "$DRAFT" = "true" ] && [ "$STATE" = "success" ] && [ "$NOISE_CLEAN" = "true" ]; then
             PR_NODE_ID=$(jq -r '.node_id' /tmp/pr.json 2>/dev/null)
             if [ -n "$PR_NODE_ID" ] && [ "$PR_NODE_ID" != "null" ] \
-               && gh api graphql -f query='mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}' \
+               && ghw api graphql -f query='mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}' \
                     -f id="$PR_NODE_ID" >/dev/null 2>&1; then
               DRAFT=false
               READY_LINE="✅ **Marked ready for review** — green + noise-clean."
@@ -784,7 +804,7 @@ jobs:
             # unvalidated content. (Empty on manual reruns — precondition skipped.)
             MERGE_ARGS=(-f merge_method=squash)
             if [ -n "${HEAD_SHA:-}" ]; then MERGE_ARGS+=(-f sha="$HEAD_SHA"); fi
-            if gh api -X PUT "repos/$REPO/pulls/$PR_NUMBER/merge" "${MERGE_ARGS[@]}" >/tmp/merge.json 2>/tmp/merge.err; then
+            if ghw api -X PUT "repos/$REPO/pulls/$PR_NUMBER/merge" "${MERGE_ARGS[@]}" >/tmp/merge.json 2>/tmp/merge.err; then
               MERGE_LINE="✅ **Auto-merged (squash)** — labeled \`auto-merge\`, CI green, noise-clean."
               # Delete the PR's head branch now that the merge actually landed.
               # PR heads live on the agent fork, and GitHub never deletes a
@@ -882,11 +902,11 @@ jobs:
           fi
 
           if [ -n "${CID:-}" ] && [ "$CID" != "null" ]; then
-            gh api -X PATCH "repos/$REPO/issues/comments/$CID" -f body="$COMBINED" >/dev/null 2>&1 \
+            ghw api -X PATCH "repos/$REPO/issues/comments/$CID" -f body="$COMBINED" >/dev/null 2>&1 \
               && echo "✓ Updated CI comment on PR #$PR_NUMBER" \
               || echo "::warning::could not update CI comment (PAT missing issues:write?)"
           else
-            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$COMBINED" >/dev/null 2>&1 \
+            ghw api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$COMBINED" >/dev/null 2>&1 \
               && echo "✓ Posted CI comment on PR #$PR_NUMBER" \
               || echo "::warning::could not post CI comment (PAT missing issues:write?)"
           fi
@@ -894,7 +914,7 @@ jobs:
           # Retire the pre-merge log comment only AFTER its rows are safely in
           # the combined one, so a failed PATCH above never loses history.
           if [ -n "${OLD_LOG_CID:-}" ] && [ "$OLD_LOG_CID" != "null" ] && [ "$COMBINED" != "$BODY" ]; then
-            gh api -X DELETE "repos/$REPO/issues/comments/$OLD_LOG_CID" >/dev/null 2>&1 \
+            ghw api -X DELETE "repos/$REPO/issues/comments/$OLD_LOG_CID" >/dev/null 2>&1 \
               && echo "✓ Retired the standalone run-log comment — its rows are in the report now"
           fi
 

@@ -214,6 +214,9 @@ jobs:
           # org boundaries, and events created with GITHUB_TOKEN do not trigger
           # workflows at all.
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          # The whole pool, so fanout.mjs can move a dispatch refused by GitHub's
+          # per-account secondary rate limit to another account.
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           SUITE: checks
           CHECK_UNITS: ${{ steps.plan.outputs.units }}
           SELF: ${{ github.repository }}
@@ -813,6 +816,9 @@ jobs:
           # org boundaries, and events created with GITHUB_TOKEN do not trigger
           # workflows at all.
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          # The whole pool, so fanout.mjs can move a dispatch refused by GitHub's
+          # per-account secondary rate limit to another account.
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           SELF: ${{ github.repository }}
           FLEET: ${{ inputs.fleet }}
           MODE: ${{ needs.e2e-plan.outputs.mode }}
