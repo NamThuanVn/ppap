@@ -82,9 +82,9 @@ on:
           - ubuntu-latest
           - macos-latest
           - windows-latest
-  schedule:
-    # Mondays 06:00 UTC — before the week starts, after any weekend image roll.
-    - cron: '0 6 * * 1'
+  # No `schedule:` (ppap workflows never carry one — ppap-secrets.md). The
+  # weekly Monday run is the `local-stack` job in the heartbeat's
+  # HEARTBEAT_SCHEDULE, edited from the ERP's /settings/cron page.
 
 permissions:
   contents: read

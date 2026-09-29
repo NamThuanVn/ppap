@@ -18,8 +18,10 @@ name: ERP · Heartbeat
 #
 # WHAT IT DOES. Two things, in this order:
 #
-#   1. Fans out to the scheduled workflows that are due. Both used to carry their
-#      own `schedule:` blocks and lost them for the same reason this one did.
+#   1. Fans out to the scheduled workflows that are due. Every one used to carry
+#      its own `schedule:` block and lost it for the same reason this one did.
+#      Which workflows, and when, is the `HEARTBEAT_SCHEDULE` repo variable,
+#      edited from `/settings/cron` (scripts/ci/heartbeat-schedule.mjs).
 #      Due-ness is decided by asking GitHub when each last ran, not by wall-clock
 #      arithmetic on this run's start time — a tick that arrives late must not
 #      skip a day, and a re-run must not double-fire.
@@ -126,110 +128,58 @@ jobs:
       - name: Dispatch due workflows
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          DECIDER_OUTCOME: ${{ steps.decider.outcome }}
+          # WHAT runs WHEN is data, not code: a JSON job list in this repo
+          # variable, edited from the ERP's "AI agent control" page
+          # (/settings/cron). Unset or unreadable means the built-in schedule
+          # in scripts/ci/heartbeat-schedule.mjs — the list that used to be a
+          # hardcoded DUE_SPEC here. That file documents the job shape, and why
+          # every job's inputs (the hunter's `dry_run=false`) must be explicit.
+          HEARTBEAT_SCHEDULE: ${{ vars.HEARTBEAT_SCHEDULE }}
+          AGENT_FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
         run: |
           set -uo pipefail
 
-          # <workflow file>:<minimum minutes between runs, OR slot=<start>-<end>>:<extra gh flags>
-          #   erp-fleet-warmup.yml — was `30 * * * *` (hourly). Stays an ordinary
-          #                          FLOOR: at a 15-minute tick it lands within 15
-          #                          min of the hour, never minute-accurate on
-          #                          GitHub's scheduler either.
-          #   erp-hunter.yml       — a fixed nightly SLOT, not a floor:
-          #                          `slot=1830-2300` (UTC "HHMM", no colon — this
-          #                          line is colon-delimited) = 01:30–06:00 ICT.
-          #                          A floor drifts to wherever the last run
-          #                          landed, however it was started (manual
-          #                          dispatch, the hunter's own recall, the
-          #                          ambulance) — that is issue #4360, the sweep
-          #                          drifting into the Vietnam afternoon. The slot
-          #                          instead only counts a run at or after 18:30
-          #                          UTC; a daytime run never moves it.
-          #
-          # WHY erp-hunter.yml NEEDS `dry_run=false` SPELLED OUT. Under a
-          # `schedule` trigger `inputs.dry_run` is NULL, which is falsy, so the
-          # daily run took the `--apply` branch (erp-hunter.yml says exactly this
-          # at its `Hunt` step). Under `workflow_dispatch` GitHub substitutes the
-          # input's DECLARED DEFAULT instead — and that default is `true`.
-          # Dispatching it bare would therefore turn the hunter into a permanent
-          # no-op: green every day, scanning, reporting, never opening a PR.
-          # Passing the value explicitly is what keeps the behaviour it had on a
-          # schedule. Any future workflow added here needs the same check.
-          DUE_SPEC='erp-fleet-warmup.yml:60:
-          erp-hunter.yml:slot=1830-2300:-f dry_run=false'
+          # No decider, no fan-out. The schedule and the due decision both live
+          # in scripts/ci; without the checkout there is nothing safe to run,
+          # and guessing is how the hunter drifted (issue #4360). The tick still
+          # completes, so the agent loop is unaffected; the next tick retries.
+          if [ "$DECIDER_OUTCOME" != success ]; then
+            echo "::warning::scripts/ci checkout failed — skipping the fan-out this tick"
+            exit 0
+          fi
 
-          while IFS=: read -r WF MIN_GAP EXTRA; do
-            WF=$(printf '%s' "$WF" | tr -d '[:blank:]')
-            MIN_GAP=$(printf '%s' "$MIN_GAP" | tr -d '[:blank:]')
-            # EXTRA keeps its spaces — it is a flag list, not a single token.
-            EXTRA=$(printf '%s' "${EXTRA:-}" | sed 's/^[[:blank:]]*//; s/[[:blank:]]*$//')
+          # repo<TAB>workflow<TAB>ref<TAB>heartbeat-due args<TAB>gh flags, one
+          # per ENABLED job. Bad jobs are dropped with a ::warning:: on stderr.
+          JOBS=$(node scripts/ci/heartbeat-schedule.mjs) || {
+            echo "::warning::could not read the schedule — skipping the fan-out this tick"
+            exit 0
+          }
+
+          while IFS=$'\t' read -r REPO WF REF DUE_ARGS FLAGS; do
             [ -n "$WF" ] || continue
 
             # Due-ness reads the run's CONCLUSION, not just its age — see
             # scripts/ci/heartbeat-due.mjs. An age-only rule counted a run that
-            # DIED as a run that happened: the hunter is capped at 45 minutes
-            # and can be cancelled or killed by a GitHub limit, and its
-            # `created_at` is then minutes old, so the next tick said "not due"
-            # and the fleet lost a whole day's sweep without a word. A dead run
-            # is retried on a short floor instead, bounded so something broken
-            # at its first step cannot be re-run around the clock.
-            #
-            # Several runs, not one: the retry budget is the count of
-            # CONSECUTIVE dead runs at the head of the history, which means the
-            # history is the state and nothing has to be stored.
-            RUNS_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WF}/runs?per_page=10" \
+            # DIED as a run that happened, and the fleet lost a whole day's
+            # sweep without a word. Several runs, not one: the retry budget is
+            # the count of CONSECUTIVE dead runs at the head of the history, so
+            # the history is the state and nothing has to be stored.
+            RUNS_JSON=$(gh api "repos/${REPO}/actions/workflows/${WF}/runs?per_page=10" \
                           --jq '.workflow_runs' 2>/dev/null) || RUNS_JSON='[]'
-            case "$MIN_GAP" in
-              slot=*)
-                SLOT_SPEC=${MIN_GAP#slot=}
-                SLOT_START=${SLOT_SPEC%%-*}
-                WINDOW_END=${SLOT_SPEC##*-}
-                VERDICT=$(printf '%s' "$RUNS_JSON" \
-                            | node scripts/ci/heartbeat-due.mjs --slot "$SLOT_START" --window-end "$WINDOW_END" 2>/dev/null) || VERDICT=''
-                ;;
-              *)
-                VERDICT=$(printf '%s' "$RUNS_JSON" \
-                            | node scripts/ci/heartbeat-due.mjs --min-gap "$MIN_GAP" 2>/dev/null) || VERDICT=''
-                ;;
-            esac
+            # shellcheck disable=SC2086 — DUE_ARGS is a flag LIST and must word-split.
+            VERDICT=$(printf '%s' "$RUNS_JSON" | node scripts/ci/heartbeat-due.mjs $DUE_ARGS 2>/dev/null) || VERDICT=''
             if [ -z "$VERDICT" ]; then
-              # The decider could not run (checkout blipped, node missing).
-              case "$MIN_GAP" in
-                slot=*)
-                  # A slot job's fallback REFUSES to dispatch rather than
-                  # reimplement the window arithmetic in bash: age-only can
-                  # only approximate a fixed window, and getting it wrong here
-                  # is exactly the drift issue #4360 exists to remove. The
-                  # 15-minute tick tries again; a genuinely broken decider
-                  # costs this job one missed night, not a reintroduced drift.
-                  echo "::warning::$WF — due check unavailable, refusing to dispatch a slot job rather than risk drift"
-                  continue
-                  ;;
-                *)
-                  # Fall back to the OLD age-only rule rather than dispatching
-                  # blind: "always dispatch" would fire the 45-minute hunter
-                  # sweep on every 15-minute tick, which is far worse than the
-                  # missed retry this change exists to fix.
-                  echo "::warning::$WF — due check unavailable, falling back to the age-only rule"
-                  LAST=$(printf '%s' "$RUNS_JSON" | jq -r '.[0].created_at // empty' 2>/dev/null || true)
-                  if [ -n "$LAST" ]; then
-                    LAST_EPOCH=$(date -u -d "$LAST" +%s 2>/dev/null || echo 0)
-                    AGE_MIN=$(( ($(date -u +%s) - LAST_EPOCH) / 60 ))
-                    if [ "$AGE_MIN" -lt "$MIN_GAP" ]; then
-                      echo "$WF — last run ${AGE_MIN}m ago (< ${MIN_GAP}m), not due"
-                      continue
-                    fi
-                  fi
-                  ;;
-              esac
-            else
-              DUE=${VERDICT%%	*}
-              WHY=${VERDICT#*	}
-              if [ "$DUE" != due ]; then
-                echo "$WF — $WHY, not due"
-                continue
-              fi
-              echo "$WF — $WHY, dispatching"
+              echo "::warning::$WF — due check failed ($DUE_ARGS), not dispatching"
+              continue
             fi
+            DUE=${VERDICT%%	*}
+            WHY=${VERDICT#*	}
+            if [ "$DUE" != due ]; then
+              echo "$WF — $WHY, not due"
+              continue
+            fi
+            echo "$WF — $WHY, dispatching"
 
             # `-R` is load-bearing. Without it gh resolves the repo from the git
             # remote in the working directory, which after the decider checkout
@@ -237,13 +187,13 @@ jobs:
             # dispatch then 404'd ("workflow erp-hunter.yml not found on the
             # default branch") as a ::warning:: on a green run, so the hunter and
             # the fleet warmup went unrun for days without anyone noticing.
-            # shellcheck disable=SC2086 — EXTRA is a flag LIST and must word-split.
-            if gh workflow run "$WF" -R "$GITHUB_REPOSITORY" --ref main $EXTRA; then
-              echo "  ✓ dispatched $WF"
+            # shellcheck disable=SC2086 — FLAGS is a flag LIST and must word-split.
+            if gh workflow run "$WF" -R "$REPO" --ref "$REF" $FLAGS; then
+              echo "  ✓ dispatched $WF on $REPO"
             else
-              echo "::warning::failed to dispatch $WF — the next tick retries in 15 minutes"
+              echo "::warning::failed to dispatch $WF on $REPO — the next tick retries in 15 minutes"
             fi
-          done <<< "$DUE_SPEC"
+          done <<< "$JOBS"
 
       # The agent loop's actual signal. erp-agent-loop.yml triggers on this
       # workflow's `workflow_run: [completed]`, so reaching this step at all is
