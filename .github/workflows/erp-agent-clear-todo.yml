@@ -256,6 +256,28 @@ jobs:
           BARE_REF_MINUTES: ${{ vars.BARE_REF_MINUTES || '15' }}
         run: node scripts/agent/board/claim/todo.mjs
 
+      # Right after the item is known — scripted claim OR a manual `item:`
+      # dispatch — publish it as a `lane-item-*` artifact so the ERP status
+      # board can show which issue/PR/docs-ba slug this lane is on instead of
+      # "claiming…" (issue #4540 Decision 1 / #4581). The board reads
+      # `GET …/runs/{id}/artifacts` and parses the NAME only — it never
+      # downloads the content, so this is a near-empty file.
+      - name: Compute lane item name
+        id: laneitem
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        env:
+          CLAIM_ISSUE: ${{ steps.claim.outputs.issue }}
+        run: node scripts/agent/board/claim/lane-item.mjs
+
+      - name: Publish lane item
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.laneitem.outputs.name }}
+          path: ${{ runner.temp }}/agent-state/lane-item.txt
+          retention-days: 1
+          if-no-files-found: warn
+
       # ── Pool gate: after the claim, BEFORE the heavy bootstrap ────────────
       # The CLI install moved up here because the probe below needs `claude` in
       # PATH. It is cheap (a curl + one --version) next to what it now guards,
