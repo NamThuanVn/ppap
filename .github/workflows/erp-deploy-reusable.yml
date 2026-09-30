@@ -1013,9 +1013,14 @@ jobs:
           fi
 
       # ── Tier order ────────────────────────────────────────────────────────
+      # Migration runs BEFORE the wrangler deploy but monitor still deploys
+      # BEFORE the leaves tier (its D1 is its own — see #4545 — the migration
+      # here does not reorder monitor relative to any other worker).
       - name: Deploy monitor (tail logs)
         if: ${{ contains(fromJSON(needs.changes.outputs.workers), 'monitor') }}
-        run: pnpm --filter @namthuanvn/monitor exec wrangler deploy dist/index.js --no-bundle --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
+        run: |
+          pnpm --filter @namthuanvn/monitor --if-present db:migrate:remote
+          pnpm --filter @namthuanvn/monitor exec wrangler deploy dist/index.js --no-bundle --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
 
       # Leaves (tier 1) — independent of one another, so deploy concurrently.
       # Each: apply its D1 migrations (needs resolved binding + remote DB), then
