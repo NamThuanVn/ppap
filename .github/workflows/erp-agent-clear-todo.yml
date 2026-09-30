@@ -673,6 +673,20 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: node scripts/agent/board/claim/reconcile-parents.mjs
 
+      # A closed issue is always Done — whatever moved its Status off Done.
+      # GitHub's built-in project workflows and this harness both write Status,
+      # and they raced on 2026-09-30: the (now-disabled) "Pull request linked
+      # to issue" workflow pulled three already-closed, already-Done issues
+      # back to In Progress two hours later (issue #4605). One of the three has
+      # no identified trigger, so this sweep does not depend on the cause.
+      # Best-effort, idempotent, never reds the job — see
+      # scripts/agent/board/claim/closed-not-done.mjs.
+      - name: Closed issues are always Done
+        if: always()
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node scripts/agent/board/claim/sweep-closed-not-done.mjs
+
       # Last thing the run does: sweep every finished BA item out of the active
       # tree into docs/ba/archive/. An IDEMPOTENT sweep, not a move of "the item
       # this run cleared" — a crashed or parked run leaves nothing behind,
