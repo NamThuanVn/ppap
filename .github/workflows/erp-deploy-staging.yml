@@ -35,10 +35,11 @@ jobs:
       domain: namthuan.org
       api_url: https://namthuan.org/api
       checkout_ref: ${{ github.event.client_payload.sha || inputs.ref || 'main' }}
-      # Build & deploy only the workers/zones changed since the previous main
-      # tip (base_sha). A cross-cutting/shared change, a missing base_sha, or a
-      # manual workflow_dispatch falls back to a full deploy — see
-      # scripts/ci/deploy-targets.sh. Production stays full (its
+      # Build & deploy only the workers/zones changed since the last SUCCESSFUL
+      # staging deploy (the reusable's "Resolve baseline"; base_sha is only the
+      # fallback when there is none). A cross-cutting/shared change falls back
+      # to a full deploy — see scripts/ci/deploy-targets.sh. A manual
+      # workflow_dispatch diffs from that same baseline, so it is not full. Production stays full (its
       # wrapper omits both → the reusable defaults deploy everything).
       deploy_only_changed: true
       base_sha: ${{ github.event.client_payload.base_sha }}

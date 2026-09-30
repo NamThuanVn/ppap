@@ -102,7 +102,7 @@ on:
         required: false
         default: false
       base_sha:
-        description: 'Previous main tip (github.event.before) to diff against when deploy_only_changed is true. Empty (manual dispatch) → full deploy.'
+        description: 'Previous main tip (github.event.before). Only a fallback: when deploy_only_changed is true the diff base is the last SUCCESSFUL deploy (Resolve baseline); this is used only when there is none, and empty then → full deploy.'
         type: string
         required: false
         default: ''
