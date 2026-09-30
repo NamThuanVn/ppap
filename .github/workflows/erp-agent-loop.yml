@@ -203,8 +203,30 @@ jobs:
           fi
           exit 0
 
+      # Moved ahead of "Resolve cap" (issue #4543): that step now needs
+      # scripts/ci/crazy-expiry.mjs to apply the crazy-mode effective-cap rule
+      # before anything below reads its output. Board hygiene further down
+      # still runs unconditionally, exactly as the comments there describe —
+      # only the checkout itself moved earlier.
+      - name: Checkout board scripts (sparse)
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 1
+          # The whole `scripts` tree: this job runs scripts/ci/crazy-expiry.mjs
+          # ("Resolve cap"), scripts/ci/ppap/pat-pool.sh ("Resolve PAT pool
+          # logins") AND scripts/agent/board/*.mjs, and the board scripts
+          # import a sibling lib/api.mjs.
+          sparse-checkout: scripts
+          persist-credentials: false
+
       - name: Resolve cap
         id: cap
+        env:
+          AGENT_CRAZY_UNTIL: ${{ vars.AGENT_CRAZY_UNTIL }}
+          AGENT_CRAZY_RESTORE_CAP: ${{ vars.AGENT_CRAZY_RESTORE_CAP }}
         run: |
           set -euo pipefail
           CAP="${CAP_VAR:-6}"
@@ -213,6 +235,24 @@ jobs:
             echo "::error::cap '$CAP' is not a non-negative integer (AGENT_MAX_PARALLEL)"
             exit 1
           fi
+
+          # Crazy mode's expiry is enforced here too, not only by the
+          # heartbeat's restore step (issue #4538 Part B / #4543): an expired
+          # AGENT_CRAZY_UNTIL must hold THIS run to the restore cap even
+          # before the heartbeat's next tick (up to 15 minutes later) writes
+          # AGENT_MAX_PARALLEL back down — otherwise a stale
+          # AGENT_MAX_PARALLEL=12 lets the loop dispatch 12 lanes off a window
+          # that already closed.
+          VERDICT=$(node scripts/ci/crazy-expiry.mjs \
+            --crazy-until "$AGENT_CRAZY_UNTIL" --restore-cap "$AGENT_CRAZY_RESTORE_CAP")
+          STATE=$(printf '%s' "$VERDICT" | cut -f1)
+          RESTORE_CAP=$(printf '%s' "$VERDICT" | cut -f2)
+          REASON=$(printf '%s' "$VERDICT" | cut -f3-)
+          if [ "$STATE" = expired ]; then
+            echo "::notice::$REASON — using the restore cap for this run"
+            CAP="$RESTORE_CAP"
+          fi
+
           if [ "$CAP" -eq 0 ]; then
             echo "::notice::cap is 0 (kill switch) — dispatching nothing"
             echo "proceed=false" >> "$GITHUB_OUTPUT"
@@ -238,19 +278,7 @@ jobs:
       # kill switch (AGENT_MAX_PARALLEL=0) holds dispatch at zero — otherwise a
       # switch flip while a lane was mid-item leaves that item assigned + In
       # Progress with nothing left to release it.
-      - name: Checkout board scripts (sparse)
-        uses: actions/checkout@v7
-        with:
-          repository: NamThuanVn/erp-namthuan
-          ref: main
-          token: ${{ env.RESOLVED_PAT }}
-          fetch-depth: 1
-          # The whole `scripts` tree: this job runs scripts/ci/ppap/pat-pool.sh
-          # ("Resolve PAT pool logins") AND scripts/agent/board/*.mjs, and the
-          # board scripts import a sibling lib/api.mjs.
-          sparse-checkout: scripts
-          persist-credentials: false
-
+      #
       # Stranded-claim sweep — release items whose backing run is provably dead
       # (assigned to us + In Progress/Todo + last claimed > STRANDED_HOURS ago,
       # which must exceed erp-agent-clear-todo.yml's timeout-minutes). A hosted-

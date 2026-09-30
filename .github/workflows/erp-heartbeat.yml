@@ -195,6 +195,51 @@ jobs:
             fi
           done <<< "$JOBS"
 
+      # Crazy mode's expiry lives on GitHub now (issue #4538 Part B / #4543):
+      # `AGENT_CRAZY_UNTIL` / `AGENT_CRAZY_RESTORE_CAP` are ppap repo variables
+      # (the ERP's Start/Stop crazy mode writes them). This is the restore
+      # side — runs every tick regardless of what the fan-out above dispatched,
+      # because crazy mode is a fleet-wide cap, not a per-workflow setting.
+      # erp-agent-loop.yml's own "Resolve cap" step covers the gap between an
+      # expiry and the next tick landing here (up to 15 minutes).
+      - name: Restore cap after crazy mode expires
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          DECIDER_OUTCOME: ${{ steps.decider.outcome }}
+          AGENT_CRAZY_UNTIL: ${{ vars.AGENT_CRAZY_UNTIL }}
+          AGENT_CRAZY_RESTORE_CAP: ${{ vars.AGENT_CRAZY_RESTORE_CAP }}
+        run: |
+          set -uo pipefail
+
+          # Same fallback as the dispatch step above: no scripts/ci checkout,
+          # nothing safe to run. Crazy mode simply stays active until the next
+          # tick retries — it is never lost, only delayed.
+          if [ "$DECIDER_OUTCOME" != success ]; then
+            echo "::warning::scripts/ci checkout failed — skipping the crazy-mode check this tick"
+            exit 0
+          fi
+
+          VERDICT=$(node scripts/ci/crazy-expiry.mjs \
+            --crazy-until "$AGENT_CRAZY_UNTIL" --restore-cap "$AGENT_CRAZY_RESTORE_CAP") || {
+            echo "::warning::crazy-expiry check failed — skipping this tick"
+            exit 0
+          }
+          STATE=$(printf '%s' "$VERDICT" | cut -f1)
+          CAP=$(printf '%s' "$VERDICT" | cut -f2)
+          REASON=$(printf '%s' "$VERDICT" | cut -f3-)
+
+          if [ "$STATE" != expired ]; then
+            echo "crazy mode: $REASON"
+            exit 0
+          fi
+
+          echo "crazy mode: $REASON — restoring AGENT_MAX_PARALLEL and clearing the pair"
+          gh variable set AGENT_MAX_PARALLEL -R NamThuanVn/ppap --body "$CAP" \
+            || echo "::warning::failed to restore AGENT_MAX_PARALLEL=$CAP — the next tick retries"
+          gh variable delete AGENT_CRAZY_UNTIL -R NamThuanVn/ppap 2>/dev/null || true
+          gh variable delete AGENT_CRAZY_RESTORE_CAP -R NamThuanVn/ppap 2>/dev/null || true
+          echo "✓ crazy mode expired — AGENT_MAX_PARALLEL=$CAP, AGENT_CRAZY_UNTIL/AGENT_CRAZY_RESTORE_CAP cleared"
+
       # The agent loop's actual signal. erp-agent-loop.yml triggers on this
       # workflow's `workflow_run: [completed]`, so reaching this step at all is
       # what re-arms the controller — there is no dispatch call on this side.
