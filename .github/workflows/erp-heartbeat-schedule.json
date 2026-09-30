@@ -1,0 +1,47 @@
+{
+  "jobs": [
+    {
+      "id": "fleet-warmup",
+      "workflow": "erp-fleet-warmup.yml",
+      "enabled": true,
+      "mode": "interval",
+      "everyMin": 60,
+      "inputs": {}
+    },
+    {
+      "id": "hunter",
+      "workflow": "erp-hunter.yml",
+      "enabled": true,
+      "mode": "slot",
+      "start": "1830",
+      "end": "2300",
+      "inputs": { "dry_run": "false" }
+    },
+    {
+      "id": "local-stack",
+      "workflow": "erp-local-stack-matrix.yml",
+      "enabled": true,
+      "mode": "slot",
+      "start": "0600",
+      "end": "0900",
+      "days": ["mon"],
+      "inputs": {}
+    },
+    {
+      "id": "prune-branches",
+      "workflow": "prune-stale-branches.yml",
+      "repo": "@fork",
+      "enabled": true,
+      "mode": "slot",
+      "start": "0315",
+      "end": "0600",
+      "inputs": { "dry_run": "false", "stale_days": "30" }
+    }
+  ],
+  "claudeWorkflows": [
+    { "workflow": "erp-agent-clear-todo.yml", "kind": "lane" },
+    { "workflow": "erp-hunter.yml", "kind": "hunter" },
+    { "workflow": "erp-agent-ambulance.yml", "kind": "ambulance" },
+    { "workflow": "erp-agent-rel-plan.yml", "kind": "rel-plan" }
+  ]
+}

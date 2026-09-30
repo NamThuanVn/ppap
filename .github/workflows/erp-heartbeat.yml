@@ -109,10 +109,11 @@ jobs:
       # (CLAUDE.md: every executable is in scripts/), and this job otherwise
       # touches no repo at all. A few KB, non-cone, and no `pnpm install`: the
       # script imports only node builtins. Same pattern as erp-ci-pr.yml's
-      # digest checkout.
+      # digest checkout. Its own `path:` so the catalogue checkout below (a
+      # DIFFERENT repo — this one) does not wipe it.
       #
-      # `continue-on-error`: if it blips, the dispatch step below falls back to
-      # the age-only rule rather than losing the tick.
+      # `continue-on-error`: if it blips, the dispatch step below skips the
+      # fan-out this tick rather than dispatching off a stale in-memory copy.
       - name: Check out the due decider
         id: decider
         continue-on-error: true
@@ -123,35 +124,59 @@ jobs:
           token: ${{ env.RESOLVED_PAT }}
           sparse-checkout: scripts/ci
           sparse-checkout-cone-mode: false
+          path: decider
+          persist-credentials: false
+
+      # The job catalogue itself (issue #4538): this workflow only ever runs
+      # AFTER being mirrored to NamThuanVn/ppap, so the implicit repo here
+      # (no `repository:`) IS ppap, where sync-workflows-to-ppap.yml just
+      # deposited this same file. Own `path:`, for the same reason as above.
+      - name: Check out the schedule catalogue
+        id: catalogue
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/workflows/erp-heartbeat-schedule.json
+          sparse-checkout-cone-mode: false
+          path: catalogue
           persist-credentials: false
 
       - name: Dispatch due workflows
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}
+          CATALOGUE_OUTCOME: ${{ steps.catalogue.outcome }}
+          CATALOGUE_FILE: catalogue/.github/workflows/erp-heartbeat-schedule.json
           # WHAT runs WHEN is data, not code: a JSON job list in this repo
           # variable, edited from the ERP's "AI agent control" page
-          # (/settings/cron). Unset or unreadable means the built-in schedule
-          # in scripts/ci/heartbeat-schedule.mjs — the list that used to be a
-          # hardcoded DUE_SPEC here. That file documents the job shape, and why
-          # every job's inputs (the hunter's `dry_run=false`) must be explicit.
+          # (/settings/cron). Unset or unreadable means the catalogue as-is —
+          # every job at its default `enabled` + timing. That file documents
+          # the job shape, and why every job's inputs (the hunter's
+          # `dry_run=false`) must be explicit.
           HEARTBEAT_SCHEDULE: ${{ vars.HEARTBEAT_SCHEDULE }}
           AGENT_FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
         run: |
           set -uo pipefail
 
-          # No decider, no fan-out. The schedule and the due decision both live
-          # in scripts/ci; without the checkout there is nothing safe to run,
-          # and guessing is how the hunter drifted (issue #4360). The tick still
-          # completes, so the agent loop is unaffected; the next tick retries.
+          # No decider, no fan-out. The due decision lives in scripts/ci;
+          # without the checkout there is nothing safe to run, and guessing is
+          # how the hunter drifted (issue #4360). The tick still completes, so
+          # the agent loop is unaffected; the next tick retries.
           if [ "$DECIDER_OUTCOME" != success ]; then
             echo "::warning::scripts/ci checkout failed — skipping the fan-out this tick"
+            exit 0
+          fi
+          # No catalogue, no fan-out — never a hardcoded fallback list (issue
+          # #4538). The script itself also treats a missing/unreadable file
+          # this way; this covers the checkout failing outright.
+          if [ "$CATALOGUE_OUTCOME" != success ]; then
+            echo "::warning::schedule catalogue checkout failed — skipping the fan-out this tick"
             exit 0
           fi
 
           # repo<TAB>workflow<TAB>ref<TAB>heartbeat-due args<TAB>gh flags, one
           # per ENABLED job. Bad jobs are dropped with a ::warning:: on stderr.
-          JOBS=$(node scripts/ci/heartbeat-schedule.mjs) || {
+          JOBS=$(node decider/scripts/ci/heartbeat-schedule.mjs) || {
             echo "::warning::could not read the schedule — skipping the fan-out this tick"
             exit 0
           }
@@ -168,7 +193,7 @@ jobs:
             RUNS_JSON=$(gh api "repos/${REPO}/actions/workflows/${WF}/runs?per_page=10" \
                           --jq '.workflow_runs' 2>/dev/null) || RUNS_JSON='[]'
             # shellcheck disable=SC2086 — DUE_ARGS is a flag LIST and must word-split.
-            VERDICT=$(printf '%s' "$RUNS_JSON" | node scripts/ci/heartbeat-due.mjs $DUE_ARGS 2>/dev/null) || VERDICT=''
+            VERDICT=$(printf '%s' "$RUNS_JSON" | node decider/scripts/ci/heartbeat-due.mjs $DUE_ARGS 2>/dev/null) || VERDICT=''
             if [ -z "$VERDICT" ]; then
               echo "::warning::$WF — due check failed ($DUE_ARGS), not dispatching"
               continue
@@ -181,9 +206,10 @@ jobs:
             fi
             echo "$WF — $WHY, dispatching"
 
-            # `-R` is load-bearing. Without it gh resolves the repo from the git
-            # remote in the working directory, which after the decider checkout
-            # above is NamThuanVn/erp-namthuan, not this ppap repo. Every
+            # `-R` is load-bearing. Both checkouts above use their own `path:`,
+            # so the workspace root has no git remote for gh to infer from —
+            # and before that fix, the decider checkout (no `path:` then) put
+            # NamThuanVn/erp-namthuan there instead of this ppap repo. Every
             # dispatch then 404'd ("workflow erp-hunter.yml not found on the
             # default branch") as a ::warning:: on a green run, so the hunter and
             # the fleet warmup went unrun for days without anyone noticing.
