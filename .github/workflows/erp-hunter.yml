@@ -98,6 +98,11 @@ on:
         description: 'Handoff round. A session that spends its budget with its PR still open re-calls the hunter to carry on, and each re-call increments this. Bounded by MAX_ROUNDS in the recall step so a PR that cannot be finished stops asking.'
         type: string
         default: '1'
+      model:
+        description: 'Optional --model override for the fixer session. Empty = the stored AGENT_MODELS setting (default opus).'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -821,6 +826,21 @@ jobs:
           curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/claude" --version
+
+      # Explicit `model` input > the stored AGENT_MODELS setting > opus
+      # (issue #4751). Same resolver + precedence every other Claude workflow
+      # uses (erp-agent-clear-todo.yml, erp-agent-ambulance.yml); hunter had
+      # no model plumbing at all before this. Mirrors the fixer's own `if:` —
+      # resolving a model nobody is going to spend is wasted work.
+      - name: Resolve model
+        if: ${{ inputs.smoke || needs.hunt-noise.outputs.open_pr != '' || needs.hunt-noise.outputs.sites != '0' }}
+        env:
+          EXPLICIT: ${{ inputs.model }}
+          AGENT_MODELS: ${{ vars.AGENT_MODELS }}
+        run: |
+          set -euo pipefail
+          MODEL=$(scripts/ci/ppap/resolve-model.sh hunter)
+          echo "CLAUDE_MODEL=$MODEL" >> "$GITHUB_ENV"
 
       # The flakes themselves. A codemod cannot do this — which of two
       # responsive branches owns a testid, whether a wait is racing a cache

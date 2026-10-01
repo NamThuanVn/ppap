@@ -68,7 +68,7 @@ on:
         default: '2.1.267'
         type: string
       model:
-        description: 'Optional --model override. Empty = the account default on attempt 1, and the escalated model from attempt 2 onward.'
+        description: 'Optional --model override. Empty = the stored AGENT_MODELS setting (default opus) on attempt 1, escalating to opus from attempt 2 when that setting is cheaper.'
         required: false
         default: ''
         type: string
@@ -205,23 +205,20 @@ jobs:
           echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
           echo "· repairing fingerprint $FP — died in \"$STEP\" (attempt ${ATTEMPT})"
 
-      # From attempt 2 the same approach has already failed once, so escalate the
-      # reasoning tier rather than re-running an identical session. An explicit
-      # `model` input always wins.
+      # Explicit > the stored AGENT_MODELS setting (default opus) > escalate to
+      # opus from attempt 2 when that resolved model is cheaper — the same
+      # approach already failed once, so the retry escalates the reasoning
+      # tier rather than re-running an identical session. All of this lives in
+      # scripts/ci/ppap/resolve-model.sh (issue #4751), same as clear-todo's
+      # own "Resolve model" step.
       - name: Resolve model
         env:
           EXPLICIT: ${{ github.event.client_payload.model || inputs.model || '' }}
+          AGENT_MODELS: ${{ vars.AGENT_MODELS }}
         run: |
           set -euo pipefail
-          if [ -n "${EXPLICIT:-}" ]; then
-            echo "CLAUDE_MODEL=$EXPLICIT" >> "$GITHUB_ENV"
-            echo "· model: $EXPLICIT (explicit)"
-          elif [ "${ATTEMPT}" -ge 2 ]; then
-            echo "CLAUDE_MODEL=claude-opus-5" >> "$GITHUB_ENV"
-            echo "· model: claude-opus-5 (escalated — attempt ${ATTEMPT})"
-          else
-            echo "· model: account default (attempt 1)"
-          fi
+          MODEL=$(scripts/ci/ppap/resolve-model.sh ambulance)
+          echo "CLAUDE_MODEL=$MODEL" >> "$GITHUB_ENV"
 
       # UPSTREAM checkout — the freshest main, which is what the fix must apply
       # to. The fork stays the push target, as it is for a solve lane.
