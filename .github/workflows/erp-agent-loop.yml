@@ -216,9 +216,9 @@ jobs:
           token: ${{ env.RESOLVED_PAT }}
           fetch-depth: 1
           # The whole `scripts` tree: this job runs scripts/ci/crazy-expiry.mjs
-          # ("Resolve cap"), scripts/ci/ppap/pat-pool.sh ("Resolve PAT pool
-          # logins") AND scripts/agent/board/*.mjs, and the board scripts
-          # import a sibling lib/api.mjs.
+          # and scripts/ci/god-expiry.mjs ("Resolve cap"), scripts/ci/ppap/pat-pool.sh
+          # ("Resolve PAT pool logins") AND scripts/agent/board/*.mjs, and the
+          # board scripts import a sibling lib/api.mjs.
           sparse-checkout: scripts
           persist-credentials: false
 
@@ -228,50 +228,78 @@ jobs:
           AGENT_CRAZY_UNTIL: ${{ vars.AGENT_CRAZY_UNTIL }}
           AGENT_CRAZY_RESTORE_CAP: ${{ vars.AGENT_CRAZY_RESTORE_CAP }}
           AGENT_CRAZY_MAX: ${{ vars.AGENT_CRAZY_MAX || '18' }}
+          AGENT_GOD_UNTIL: ${{ vars.AGENT_GOD_UNTIL }}
+          AGENT_GOD_LANES: ${{ vars.AGENT_GOD_LANES }}
         run: |
           set -euo pipefail
           CAP="${CAP_VAR:-6}"
+          MODE=normal
 
           if ! printf '%s' "$CAP" | grep -qE '^[0-9]+$'; then
             echo "::error::cap '$CAP' is not a non-negative integer (AGENT_MAX_PARALLEL)"
             exit 1
           fi
 
-          # The kill switch wins outright, crazy mode or not — checked on the
-          # RAW AGENT_MAX_PARALLEL value before any crazy-mode override below
-          # can raise it back up.
+          # The kill switch wins outright, god mode and crazy mode included —
+          # checked on the RAW AGENT_MAX_PARALLEL value before any override
+          # below can raise it back up (precedence: Pause > hold > exhausted
+          # pool > god > crazy > normal).
           if [ "$CAP" -eq 0 ]; then
             echo "::notice::cap is 0 (kill switch) — dispatching nothing"
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             echo "cap=0" >> "$GITHUB_OUTPUT"
+            echo "mode=normal" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Crazy mode's expiry is enforced here too, not only by the
-          # heartbeat's restore step (issue #4538 Part B / #4543): an expired
-          # AGENT_CRAZY_UNTIL must hold THIS run to the restore cap even
-          # before the heartbeat's next tick (up to 15 minutes later) writes
-          # AGENT_MAX_PARALLEL back down — otherwise a stale
-          # AGENT_MAX_PARALLEL=12 lets the loop dispatch 12 lanes off a window
-          # that already closed.
-          VERDICT=$(node scripts/ci/crazy-expiry.mjs \
-            --crazy-until "$AGENT_CRAZY_UNTIL" --restore-cap "$AGENT_CRAZY_RESTORE_CAP")
-          STATE=$(printf '%s' "$VERDICT" | cut -f1)
-          RESTORE_CAP=$(printf '%s' "$VERDICT" | cut -f2)
-          REASON=$(printf '%s' "$VERDICT" | cut -f3-)
-          if [ "$STATE" = expired ]; then
-            echo "::notice::$REASON — using the restore cap for this run"
-            CAP="$RESTORE_CAP"
-          elif [ -n "$AGENT_CRAZY_UNTIL" ]; then
-            # Crazy mode is genuinely active (not expired, and the variable is
-            # actually set — crazy-expiry.mjs also reports "not-expired" when
-            # it's unset). Crazy mode's whole point is burning whatever the
-            # remaining quota can fund, not a fixed number, so the effective
-            # dispatch cap becomes AGENT_CRAZY_MAX itself — AGENT_MAX_PARALLEL
-            # (today's AGENT_CRAZY_CAP write) no longer bounds it, same as
-            # laneBudget()'s per-account ceiling (#4690 Decision 2).
-            echo "::notice::crazy mode active until $AGENT_CRAZY_UNTIL — effective cap is AGENT_CRAZY_MAX ($AGENT_CRAZY_MAX), overriding AGENT_MAX_PARALLEL ($CAP)"
-            CAP="$AGENT_CRAZY_MAX"
+          # God mode outranks crazy mode (issue #4744, this slice #4789). It
+          # never writes AGENT_MAX_PARALLEL, so there is nothing to restore on
+          # expiry: an expired AGENT_GOD_UNTIL just stops applying and falls
+          # through to the crazy-mode check below, same as if it had never
+          # been set — the heartbeat's own "Clear god mode after it expires"
+          # step deletes the pair on its next tick.
+          GOD_VERDICT=$(node scripts/ci/god-expiry.mjs \
+            --god-until "$AGENT_GOD_UNTIL" --god-lanes "$AGENT_GOD_LANES")
+          GOD_STATE=$(printf '%s' "$GOD_VERDICT" | cut -f1)
+          GOD_LANES=$(printf '%s' "$GOD_VERDICT" | cut -f2)
+          GOD_REASON=$(printf '%s' "$GOD_VERDICT" | cut -f3-)
+
+          if [ "$GOD_STATE" = not-expired ] && [ -n "$AGENT_GOD_UNTIL" ]; then
+            echo "::notice::god mode active until $AGENT_GOD_UNTIL — effective cap is $GOD_LANES lane(s), ignoring AGENT_MAX_PARALLEL ($CAP) and crazy mode"
+            MODE=god
+            CAP="$GOD_LANES"
+          else
+            if [ "$GOD_STATE" = expired ]; then
+              echo "::notice::$GOD_REASON — god mode no longer applies this tick"
+            fi
+
+            # Crazy mode's expiry is enforced here too, not only by the
+            # heartbeat's restore step (issue #4538 Part B / #4543): an expired
+            # AGENT_CRAZY_UNTIL must hold THIS run to the restore cap even
+            # before the heartbeat's next tick (up to 15 minutes later) writes
+            # AGENT_MAX_PARALLEL back down — otherwise a stale
+            # AGENT_MAX_PARALLEL=12 lets the loop dispatch 12 lanes off a window
+            # that already closed.
+            VERDICT=$(node scripts/ci/crazy-expiry.mjs \
+              --crazy-until "$AGENT_CRAZY_UNTIL" --restore-cap "$AGENT_CRAZY_RESTORE_CAP")
+            STATE=$(printf '%s' "$VERDICT" | cut -f1)
+            RESTORE_CAP=$(printf '%s' "$VERDICT" | cut -f2)
+            REASON=$(printf '%s' "$VERDICT" | cut -f3-)
+            if [ "$STATE" = expired ]; then
+              echo "::notice::$REASON — using the restore cap for this run"
+              CAP="$RESTORE_CAP"
+            elif [ -n "$AGENT_CRAZY_UNTIL" ]; then
+              # Crazy mode is genuinely active (not expired, and the variable is
+              # actually set — crazy-expiry.mjs also reports "not-expired" when
+              # it's unset). Crazy mode's whole point is burning whatever the
+              # remaining quota can fund, not a fixed number, so the effective
+              # dispatch cap becomes AGENT_CRAZY_MAX itself — AGENT_MAX_PARALLEL
+              # (today's AGENT_CRAZY_CAP write) no longer bounds it, same as
+              # laneBudget()'s per-account ceiling (#4690 Decision 2).
+              echo "::notice::crazy mode active until $AGENT_CRAZY_UNTIL — effective cap is AGENT_CRAZY_MAX ($AGENT_CRAZY_MAX), overriding AGENT_MAX_PARALLEL ($CAP)"
+              MODE=crazy
+              CAP="$AGENT_CRAZY_MAX"
+            fi
           fi
 
           if [ "$CAP" -eq 0 ]; then
@@ -282,6 +310,7 @@ jobs:
             echo "proceed=true" >> "$GITHUB_OUTPUT"
           fi
           echo "cap=$CAP" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
 
       # The claim script's own eligibility sweep runs the probe (COUNT_ONLY):
       # leaf marker + board Todo + unassigned + no open blockers — the SAME

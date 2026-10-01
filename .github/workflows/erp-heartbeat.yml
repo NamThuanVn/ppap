@@ -266,6 +266,48 @@ jobs:
           gh variable delete AGENT_CRAZY_RESTORE_CAP -R NamThuanVn/ppap 2>/dev/null || true
           echo "✓ crazy mode expired — AGENT_MAX_PARALLEL=$CAP, AGENT_CRAZY_UNTIL/AGENT_CRAZY_RESTORE_CAP cleared"
 
+      # God mode's expiry (issue #4744, this slice #4789) mirrors the crazy-mode
+      # step above, minus the restore: god mode never writes AGENT_MAX_PARALLEL
+      # (it only replaces the effective cap for one loop run — see
+      # erp-agent-loop.yml's "Resolve cap"), so there is nothing to restore when
+      # it expires, only the pair to clear. erp-agent-loop.yml's own "Resolve
+      # cap" step covers the gap between an expiry and the next tick landing
+      # here (up to 15 minutes).
+      - name: Clear god mode after it expires
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          DECIDER_OUTCOME: ${{ steps.decider.outcome }}
+          AGENT_GOD_UNTIL: ${{ vars.AGENT_GOD_UNTIL }}
+          AGENT_GOD_LANES: ${{ vars.AGENT_GOD_LANES }}
+        run: |
+          set -uo pipefail
+
+          # Same fallback as the crazy-mode step above: no scripts/ci checkout,
+          # nothing safe to run. God mode simply stays active until the next
+          # tick retries — it is never lost, only delayed.
+          if [ "$DECIDER_OUTCOME" != success ]; then
+            echo "::warning::scripts/ci checkout failed — skipping the god-mode check this tick"
+            exit 0
+          fi
+
+          VERDICT=$(node decider/scripts/ci/god-expiry.mjs \
+            --god-until "$AGENT_GOD_UNTIL" --god-lanes "$AGENT_GOD_LANES") || {
+            echo "::warning::god-expiry check failed — skipping this tick"
+            exit 0
+          }
+          STATE=$(printf '%s' "$VERDICT" | cut -f1)
+          REASON=$(printf '%s' "$VERDICT" | cut -f3-)
+
+          if [ "$STATE" != expired ]; then
+            echo "god mode: $REASON"
+            exit 0
+          fi
+
+          echo "god mode: $REASON — clearing AGENT_GOD_UNTIL/AGENT_GOD_LANES (nothing to restore)"
+          gh variable delete AGENT_GOD_UNTIL -R NamThuanVn/ppap 2>/dev/null || true
+          gh variable delete AGENT_GOD_LANES -R NamThuanVn/ppap 2>/dev/null || true
+          echo "✓ god mode expired — AGENT_GOD_UNTIL/AGENT_GOD_LANES cleared"
+
       # The agent loop's actual signal. erp-agent-loop.yml triggers on this
       # workflow's `workflow_run: [completed]`, so reaching this step at all is
       # what re-arms the controller — there is no dispatch call on this side.
