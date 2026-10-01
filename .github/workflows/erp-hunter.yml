@@ -809,8 +809,11 @@ jobs:
 
       # Not in smoke: AGENT_SMOKE exits before the CLI is ever invoked, and
       # installing it would add ~30s to a path whose whole point is speed.
+      # Otherwise this MUST mirror the fixer's `if:` — an adopting round with
+      # zero new sites still runs the session, and run 36784061721 died there
+      # with `claude: command not found` (rc=127).
       - name: Install Claude Code CLI
-        if: ${{ !inputs.smoke && needs.hunt-noise.outputs.sites != '0' }}
+        if: ${{ !inputs.smoke && (needs.hunt-noise.outputs.open_pr != '' || needs.hunt-noise.outputs.sites != '0') }}
         env:
           CLAUDE_VERSION: '2.1.267'
         run: |
@@ -986,6 +989,10 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           AGENT_STATE_DIR: ${{ runner.temp }}
           JOB_STATUS: ${{ job.status }}
+          # The fixer is `continue-on-error`, so JOB_STATUS alone reads
+          # `success` over a session that never started (run 36784061721).
+          FIXER_OUTCOME: ${{ steps.fixer.outcome }}
+          ADOPTED: ${{ needs.hunt-noise.outputs.open_pr != '' }}
           FAILED_STEP: ${{ steps.fixer.outcome == 'failure' && 'Fix the flaky sites and ship the PR' || '' }}
         run: |
           set -uo pipefail
@@ -1001,8 +1008,10 @@ jobs:
           node scripts/agent/board/recover/hunter-hold.mjs raise \
             --step "${FAILED_STEP:-Fix the flaky sites and ship the PR}" \
             --job-conclusion "${JOB_STATUS}" \
+            --fixer-outcome "${FIXER_OUTCOME:-}" \
             --exit-reason "$REASON" \
             --pr-opened "$PR_OPENED" \
+            --adopted "${ADOPTED:-false}" \
             --error "$(printf '%s' "${REASON:-}" | head -c 200)"
           exit 0
 
