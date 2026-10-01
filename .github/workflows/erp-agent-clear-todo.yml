@@ -306,6 +306,22 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/claude" --version
 
+      # Loop-spawned lanes dispatch with no `model` at all (issue #4751), so
+      # CLAUDE_MODEL above is empty for the bulk of the fleet's spend unless
+      # resolved here — the stored AGENT_MODELS setting must be read INSIDE
+      # clear-todo, not only at the UI/dispatch layer. `vars.AGENT_MODELS`
+      # resolves directly from this workflow's own repo, no API call needed
+      # (same pattern as `vars.AGENT_FORK_REPO` above).
+      - name: Resolve model
+        if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
+        env:
+          EXPLICIT: ${{ env.CLAUDE_MODEL }}
+          AGENT_MODELS: ${{ vars.AGENT_MODELS }}
+        run: |
+          set -euo pipefail
+          MODEL=$(scripts/ci/ppap/resolve-model.sh lane)
+          echo "CLAUDE_MODEL=$MODEL" >> "$GITHUB_ENV"
+
       # Classify the Claude token pool before spending anything on it.
       #
       # This probe used to live INSIDE "Run agent", i.e. after the claim AND
