@@ -122,6 +122,22 @@ jobs:
       # setup-token today). `gh variable set AGENT_BLIND_LANES_PER_ACCOUNT --body 1`
       # restores one lane per usable account.
       AGENT_BLIND_LANES_PER_ACCOUNT: ${{ vars.AGENT_BLIND_LANES_PER_ACCOUNT || '2' }}
+      # The rest of the pace-to-reset formula's tuning vars (laneBudget() in
+      # scripts/agent/run/usage.mjs) — defaults here MUST agree with that
+      # file's DEFAULT_* constants and claude.sh's own fallbacks. Without these
+      # this job's own "Probe Claude pool" step (below) publishes a normal-mode
+      # AGENT_POOL_STATE that never reflects crazy mode, which the controller's
+      # next tick then reads as if crazy mode were off.
+      AGENT_MAX_5H_PCT: ${{ vars.AGENT_MAX_5H_PCT || '90' }}
+      AGENT_MAX_7D_PCT: ${{ vars.AGENT_MAX_7D_PCT || '95' }}
+      AGENT_WARN_5H_PCT: ${{ vars.AGENT_WARN_5H_PCT || '75' }}
+      AGENT_WARN_7D_PCT: ${{ vars.AGENT_WARN_7D_PCT || '85' }}
+      AGENT_LANE_RATE_5H_PCT: ${{ vars.AGENT_LANE_RATE_5H_PCT || '10' }}
+      AGENT_LANE_RATE_7D_PCT: ${{ vars.AGENT_LANE_RATE_7D_PCT || '1.1' }}
+      AGENT_LANE_HOURS: ${{ vars.AGENT_LANE_HOURS || '5.5' }}
+      AGENT_MAX_LANES_PER_ACCOUNT: ${{ vars.AGENT_MAX_LANES_PER_ACCOUNT || '4' }}
+      AGENT_CRAZY_MAX: ${{ vars.AGENT_CRAZY_MAX || '18' }}
+      AGENT_CRAZY_UNTIL: ${{ vars.AGENT_CRAZY_UNTIL }}
     steps:
       # AGENT_STATE_DIR must be set HERE, not in the job-level `env:` block.
       # `runner` is not an available context for `jobs.<id>.env` — only from

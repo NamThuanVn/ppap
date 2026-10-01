@@ -227,6 +227,7 @@ jobs:
         env:
           AGENT_CRAZY_UNTIL: ${{ vars.AGENT_CRAZY_UNTIL }}
           AGENT_CRAZY_RESTORE_CAP: ${{ vars.AGENT_CRAZY_RESTORE_CAP }}
+          AGENT_CRAZY_MAX: ${{ vars.AGENT_CRAZY_MAX || '18' }}
         run: |
           set -euo pipefail
           CAP="${CAP_VAR:-6}"
@@ -234,6 +235,16 @@ jobs:
           if ! printf '%s' "$CAP" | grep -qE '^[0-9]+$'; then
             echo "::error::cap '$CAP' is not a non-negative integer (AGENT_MAX_PARALLEL)"
             exit 1
+          fi
+
+          # The kill switch wins outright, crazy mode or not — checked on the
+          # RAW AGENT_MAX_PARALLEL value before any crazy-mode override below
+          # can raise it back up.
+          if [ "$CAP" -eq 0 ]; then
+            echo "::notice::cap is 0 (kill switch) — dispatching nothing"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "cap=0" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           # Crazy mode's expiry is enforced here too, not only by the
@@ -251,10 +262,20 @@ jobs:
           if [ "$STATE" = expired ]; then
             echo "::notice::$REASON — using the restore cap for this run"
             CAP="$RESTORE_CAP"
+          elif [ -n "$AGENT_CRAZY_UNTIL" ]; then
+            # Crazy mode is genuinely active (not expired, and the variable is
+            # actually set — crazy-expiry.mjs also reports "not-expired" when
+            # it's unset). Crazy mode's whole point is burning whatever the
+            # remaining quota can fund, not a fixed number, so the effective
+            # dispatch cap becomes AGENT_CRAZY_MAX itself — AGENT_MAX_PARALLEL
+            # (today's AGENT_CRAZY_CAP write) no longer bounds it, same as
+            # laneBudget()'s per-account ceiling (#4690 Decision 2).
+            echo "::notice::crazy mode active until $AGENT_CRAZY_UNTIL — effective cap is AGENT_CRAZY_MAX ($AGENT_CRAZY_MAX), overriding AGENT_MAX_PARALLEL ($CAP)"
+            CAP="$AGENT_CRAZY_MAX"
           fi
 
           if [ "$CAP" -eq 0 ]; then
-            echo "::notice::cap is 0 (kill switch) — dispatching nothing"
+            echo "::notice::cap is 0 — dispatching nothing"
             echo "proceed=false" >> "$GITHUB_OUTPUT"
           else
             echo "cap=$CAP — proceeding"
@@ -434,6 +455,20 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           AGENT_USAGE_PROBE: ${{ vars.AGENT_USAGE_PROBE || '1' }}
           AGENT_BLIND_LANES_PER_ACCOUNT: ${{ vars.AGENT_BLIND_LANES_PER_ACCOUNT || '2' }}
+          # The rest of the pace-to-reset formula's tuning vars (laneBudget() in
+          # scripts/agent/run/usage.mjs) — defaults here MUST agree with that
+          # file's DEFAULT_* constants and claude.sh's own fallbacks, and with
+          # erp-agent-clear-todo.yml's job-level env (same vars, same defaults).
+          AGENT_MAX_5H_PCT: ${{ vars.AGENT_MAX_5H_PCT || '90' }}
+          AGENT_MAX_7D_PCT: ${{ vars.AGENT_MAX_7D_PCT || '95' }}
+          AGENT_WARN_5H_PCT: ${{ vars.AGENT_WARN_5H_PCT || '75' }}
+          AGENT_WARN_7D_PCT: ${{ vars.AGENT_WARN_7D_PCT || '85' }}
+          AGENT_LANE_RATE_5H_PCT: ${{ vars.AGENT_LANE_RATE_5H_PCT || '10' }}
+          AGENT_LANE_RATE_7D_PCT: ${{ vars.AGENT_LANE_RATE_7D_PCT || '1.1' }}
+          AGENT_LANE_HOURS: ${{ vars.AGENT_LANE_HOURS || '5.5' }}
+          AGENT_MAX_LANES_PER_ACCOUNT: ${{ vars.AGENT_MAX_LANES_PER_ACCOUNT || '4' }}
+          AGENT_CRAZY_MAX: ${{ vars.AGENT_CRAZY_MAX || '18' }}
+          AGENT_CRAZY_UNTIL: ${{ vars.AGENT_CRAZY_UNTIL }}
           PROBE_ONLY: '1'
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           # Keep in step with erp-agent-clear-todo.yml's default claude_version.
