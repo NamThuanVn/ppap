@@ -43,7 +43,7 @@ on:
   # schedule EVENT at its own scheduler and dropped ticks it could not place.
   # erp-heartbeat.yml now dispatches this workflow when its last run is over an
   # hour old, driven by a Cloudflare cron on the ERP's service-utilities worker.
-  # See erp-heartbeat.yml's header, and `/settings/cron` in the ERP for the
+  # See erp-heartbeat.yml's header, and `/settings/agent-control` in the ERP for the
   # on/off switch.
   workflow_dispatch:
     inputs:

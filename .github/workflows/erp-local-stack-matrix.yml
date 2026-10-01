@@ -84,7 +84,7 @@ on:
           - windows-latest
   # No `schedule:` (ppap workflows never carry one — ppap-secrets.md). The
   # weekly Monday run is the `local-stack` job in the heartbeat's
-  # HEARTBEAT_SCHEDULE, edited from the ERP's /settings/cron page.
+  # HEARTBEAT_SCHEDULE, edited from the ERP's /settings/agent-control page.
 
 permissions:
   contents: read

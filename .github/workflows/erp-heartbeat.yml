@@ -14,14 +14,14 @@ name: ERP · Heartbeat
 # The clock is now a Cloudflare cron trigger on the ERP's `service-utilities`
 # worker (`apis/utilities/wrangler.jsonc`), which POSTs `workflow_dispatch` here
 # every 15 minutes using a PAT. To turn it on or off, or to see whether it is
-# actually ticking, use `/settings/cron` in the ERP — NOT the Actions UI.
+# actually ticking, use `/settings/agent-control` in the ERP — NOT the Actions UI.
 #
 # WHAT IT DOES. Two things, in this order:
 #
 #   1. Fans out to the scheduled workflows that are due. Every one used to carry
 #      its own `schedule:` block and lost it for the same reason this one did.
 #      Which workflows, and when, is the `HEARTBEAT_SCHEDULE` repo variable,
-#      edited from `/settings/cron` (scripts/ci/heartbeat-schedule.mjs).
+#      edited from `/settings/agent-control` (scripts/ci/heartbeat-schedule.mjs).
 #      Due-ness is decided by asking GitHub when each last ran, not by wall-clock
 #      arithmetic on this run's start time — a tick that arrives late must not
 #      skip a day, and a re-run must not double-fire.
@@ -149,7 +149,7 @@ jobs:
           CATALOGUE_FILE: catalogue/.github/workflows/erp-heartbeat-schedule.json
           # WHAT runs WHEN is data, not code: a JSON job list in this repo
           # variable, edited from the ERP's "AI agent control" page
-          # (/settings/cron). Unset or unreadable means the catalogue as-is —
+          # (/settings/agent-control). Unset or unreadable means the catalogue as-is —
           # every job at its default `enabled` + timing. That file documents
           # the job shape, and why every job's inputs (the hunter's
           # `dry_run=false`) must be explicit.
