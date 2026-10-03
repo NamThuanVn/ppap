@@ -1,0 +1,135 @@
+name: ERP · Agent · wake
+
+# Timed wake-up for a pool-exhausted hold (issue #4744, this slice #4791).
+#
+# scripts/agent/board/loop/publish-pool.mjs dispatches this `workflow_dispatch`
+# with `at` = the pool-exhausted hold's `until` + 60s, the moment it WRITES a
+# brand-new hold — never on the "already stands" branch.
+# scripts/agent/board/lib/hold.mjs `setHold`'s `wrote` flag IS the dedupe:
+# several lanes racing onto the same exhausted window all try to set the same
+# `pool-exhausted-${until}`-fingerprinted hold, and only the one that actually
+# wrote gets here.
+#
+# This sleeps until `at`, then fires the loop's own
+# `repository_dispatch[agent-loop]` (erp-agent-loop.yml) — so dispatch resumes
+# within ~2 minutes of the window reopening, in EVERY mode (normal, crazy,
+# god), instead of waiting for the next 15-minute `ERP · Heartbeat` tick.
+#
+# CHUNKED SLEEP. A GitHub-hosted runner hard-caps a single job at 6h of
+# execution, but a weekly (7-day) usage-window reset can be days away
+# (`bindingReset` in scripts/agent/run/usage.mjs returns the LATER of a 5h and
+# a 7d reset when an account is over both). scripts/ci/wake-chunk.mjs decides
+# the per-hop sleep; past one ~5h50m chunk this RE-DISPATCHES ITSELF with the
+# same `at` instead of trying — and failing — to sleep the whole gap in one
+# job. The common case, a 5-hour usage window, finishes in a single hop.
+
+on:
+  workflow_dispatch:
+    inputs:
+      at:
+        description: "ISO timestamp to wake at (a pool-exhausted hold's `until` + 60s)"
+        required: true
+        type: string
+
+permissions: read-all
+
+# One in-flight wake per target instant. There should only ever be one dispatch
+# per `at` — publish-pool.mjs's `wrote` gate already dedupes that — but a
+# self-chained re-dispatch past the 6h chunk lands on this same group too, so a
+# stray duplicate queues behind the original instead of racing it.
+concurrency:
+  group: agent-wake-${{ inputs.at }}
+  cancel-in-progress: false
+
+jobs:
+  wake:
+    name: Sleep until the window reopens, then re-arm the loop
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      # Same inlined PAT pool as every other ppap workflow. scripts/ci/ppap/pat-pool.sh
+      # is the canonical copy — scripts/gate/ci/pat-pool-drift.mjs fails the build
+      # if these diverge.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      # The chunking decision lives in scripts/ci (CLAUDE.md: every executable
+      # is in scripts/), in the private repo — same sparse-checkout pattern as
+      # erp-heartbeat.yml's "Check out the due decider".
+      - name: Check out scripts/ci
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          sparse-checkout: scripts/ci
+          sparse-checkout-cone-mode: false
+          path: decider
+          persist-credentials: false
+
+      - name: Sleep until $AT (chunked — re-dispatches itself past 6h)
+        id: sleep
+        env:
+          AT: ${{ inputs.at }}
+        run: |
+          set -uo pipefail
+          VERDICT=$(node decider/scripts/ci/wake-chunk.mjs --at "$AT")
+          STATE=$(printf '%s' "$VERDICT" | cut -f1)
+          SLEEP_S=$(printf '%s' "$VERDICT" | cut -f2)
+          RECHAIN=$(printf '%s' "$VERDICT" | cut -f3)
+          REASON=$(printf '%s' "$VERDICT" | cut -f4-)
+          echo "$REASON"
+          if [ "$STATE" != ok ]; then
+            echo "::error::$REASON"
+            exit 1
+          fi
+          [ "$SLEEP_S" -gt 0 ] && sleep "$SLEEP_S"
+          echo "rechain=$RECHAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Re-dispatch past the 6h chunk
+        if: steps.sleep.outputs.rechain == 'true'
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          AT: ${{ inputs.at }}
+        run: |
+          set -uo pipefail
+          gh workflow run erp-agent-wake.yml -R "${{ github.repository }}" --ref main -f "at=$AT"
+          echo "✓ re-dispatched erp-agent-wake.yml for the remaining wait to $AT"
+
+      - name: Fire the loop
+        if: steps.sleep.outputs.rechain != 'true'
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          gh api "repos/${{ github.repository }}/dispatches" \
+            -f event_type=agent-loop \
+            -f client_payload[triggered_by]=erp-agent-wake
+          echo "✓ fired repository_dispatch[agent-loop] — the pool-exhausted window has reopened"
