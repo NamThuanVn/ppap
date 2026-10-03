@@ -606,6 +606,7 @@ jobs:
           # trigger workflows).
           POOL_PAT: ${{ env.RESOLVED_PAT }}
           CAP: ${{ steps.cap.outputs.cap }}
+          MODE: ${{ steps.cap.outputs.mode }}
           CANDIDATES: ${{ steps.probe.outputs.candidates }}
           # How many Claude accounts the last pool probe found usable. Empty when
           # no probe is fresh enough to trust, in which case K is not capped by it.
@@ -646,36 +647,25 @@ jobs:
             esac
           done
           echo "· live agent runs: $ACTIVE"
-          K=$(( CAP - ACTIVE ))
-          [ "$K" -gt "$CANDIDATES" ] && K="$CANDIDATES"
-          # Third term: the POOL BUDGET — how many lanes the Claude accounts can
-          # fund IN TOTAL, running ones included. Preferred source is `capacity`
-          # (real 5h/7d headroom ÷ one lane's cost); the account count is the
-          # fallback when a probe carried no capacity. Either way it is a TOTAL,
-          # so the lanes already running come off it: comparing it against this
-          # tick's new lanes alone let every tick add `capacity` more on top,
-          # until the hard cap (6 lanes on one account).
-          #
-          # No fresh probe at all → ONE lane total. "Unknown" used to mean
-          # "uncapped": controller 36113823869 saw a 79-min-old probe, dispatched
-          # 6 lanes onto one account, and all 6 died on its usage limit. The
-          # "Probe Claude pool" step above normally refreshes a stale probe, so
-          # this floor only bites when that probe itself failed — and the one
-          # lane it lets through re-probes and publishes on its own.
-          if [ -n "${CAPACITY:-}" ]; then
-            BUDGET="$CAPACITY"; BUDGET_SRC="pool headroom"
-          elif [ -n "${USABLE_ACCOUNTS:-}" ]; then
-            BUDGET="$USABLE_ACCOUNTS"; BUDGET_SRC="usable Claude account(s)"
+          # K arithmetic lives in scripts/ci/dispatch-k.mjs (issue #4744, this
+          # slice #4790) — a pure function the tests can drive, instead of
+          # untested inline bash. Three terms: CAP − ACTIVE capped by
+          # CANDIDATES; the POOL BUDGET (skipped entirely in god mode — that's
+          # the whole point of god mode, a fixed lane count with quota
+          # ignored); then clamp to ≥ 0 always, regardless of mode.
+          VERDICT=$(node scripts/ci/dispatch-k.mjs \
+            --cap "$CAP" --active "$ACTIVE" --candidates "$CANDIDATES" \
+            --capacity "${CAPACITY:-}" --usable-accounts "${USABLE_ACCOUNTS:-}" \
+            --mode "${MODE:-normal}")
+          K=$(printf '%s' "$VERDICT" | cut -f1)
+          BUDGET=$(printf '%s' "$VERDICT" | cut -f2)
+          NOTE=$(printf '%s' "$VERDICT" | cut -f4-)
+          [ -n "$NOTE" ] && echo "· $NOTE"
+          if [ "${MODE:-normal}" = god ]; then
+            echo "cap=$CAP · active=$ACTIVE · candidates=$CANDIDATES → dispatching $K run(s) (pool budget ignored)"
           else
-            BUDGET=1; BUDGET_SRC="no fresh pool probe — one lane"
+            echo "cap=$CAP · active=$ACTIVE · candidates=$CANDIDATES · usable-accounts=${USABLE_ACCOUNTS:-unknown} · capacity=${CAPACITY:-unknown} · budget=$BUDGET → dispatching $K run(s)"
           fi
-          ROOM=$(( BUDGET - ACTIVE ))
-          if [ "$K" -gt "$ROOM" ]; then
-            echo "· capping K at $ROOM: budget $BUDGET ($BUDGET_SRC) − $ACTIVE running (was $K)"
-            K="$ROOM"
-          fi
-          [ "$K" -lt 0 ] && K=0
-          echo "cap=$CAP · active=$ACTIVE · candidates=$CANDIDATES · usable-accounts=${USABLE_ACCOUNTS:-unknown} · capacity=${CAPACITY:-unknown} · budget=$BUDGET → dispatching $K run(s)"
           if [ "$K" -eq 0 ]; then
             echo "::notice::pool already at capacity (or no headroom) — nothing dispatched"
             exit 0
