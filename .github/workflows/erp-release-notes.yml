@@ -1,0 +1,190 @@
+name: ERP · Release notes
+
+# Dispatches the weekly release-notes job (issue #4571): finds the build live
+# in production now and the one live at the previous run, collects the
+# user-visible PRs merged between them, has the `write-release-notes` skill
+# draft a warm Vietnamese + English post, and sends it to the ERP to publish
+# at 08:30 Vietnam time. All of that logic lives in one place —
+# `scripts/ci/release-notes.mjs` — built incrementally across #4571's sibling
+# slices (see that file's own header comment); this workflow only dispatches
+# it with the right inputs, secrets and failure alert.
+#
+# `target` selects three things together (#4571 §E): the public API base, the
+# Deployments `environment` the script reads, and which
+# `RELEASE_NOTES_CLIENT_*` secret pair it gets. Ships as `staging`; the
+# heartbeat entry flips to `production` only after staging sign-off (Decision 7).
+#
+# LIGHT bootstrap, same reasoning as erp-agent-rel-plan.yml: the script is pure
+# Node built-ins (no package.json deps — see its own imports), so there is no
+# `pnpm install` here, just the PAT pool, a full-history checkout (`git log`
+# needs it) and the Claude CLI the script shells out to for the skill call.
+#
+# Filename is deliberately NOT erp-ci-*.yml → the sync mirrors it to
+# NamThuanVn/ppap only, never to the CI fleet.
+
+run-name: >-
+  ERP · Release notes · ${{ inputs.target }}${{ inputs.dry_run && ' (dry run)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'staging or production — selects the API base, Deployments environment, and OAuth client secret pair'
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+      dry_run:
+        description: 'Preview the drafted post (both languages + resolved tags) and send nothing'
+        type: boolean
+        default: true
+      from:
+        description: 'Optional override: start of window (a deploy sha/tag). Must be given together with to.'
+        required: false
+        default: ''
+        type: string
+      to:
+        description: 'Optional override: end of window (a deploy sha/tag). Must be given together with from.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+# One dispatch per target at a time — a second overlapping run for the same
+# target could race the no-repeat/already-posted check against the first
+# one's still-in-flight publish.
+concurrency:
+  group: release-notes-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  release-notes:
+    name: Draft + publish
+    runs-on: ubuntu-latest
+    # A full week's worth of deploys/commits/PRs plus a 20-turn skill call
+    # (SKILL_TIMEOUT_MS in the script is 10 minutes on its own). Generous but
+    # finite — a hang here should fail loud, not bill six hours of silence.
+    timeout-minutes: 30
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. Inlined
+      # rather than calling scripts/ci/ppap/pat-pool.sh (the canonical copy —
+      # keep the two in step) because the private-repo checkout itself needs a
+      # token, so the pool cannot live behind it. GET /rate_limit does not count
+      # against the limit, so probing every token is free.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      # fetch-depth: 0 — `git log from..to` (the commit filter, #4571 §B.2)
+      # needs the full history, not just the tip.
+      - name: Checkout upstream main
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Claude Code CLI
+        env:
+          CLAUDE_VERSION: '2.1.267'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version
+
+      # Same precedence every other Claude workflow uses (issue #4751):
+      # explicit > the stored AGENT_MODELS setting for this kind > the kind's
+      # built-in default (sonnet). No dispatch-time override here — this job
+      # has no `model` input, unlike the agent-session workflows — so it's
+      # always stored-setting-or-default.
+      - name: Resolve model
+        env:
+          AGENT_MODELS: ${{ vars.AGENT_MODELS }}
+        run: |
+          set -euo pipefail
+          MODEL=$(scripts/ci/ppap/resolve-model.sh release-notes)
+          echo "CLAUDE_MODEL=$MODEL" >> "$GITHUB_ENV"
+
+      - name: Run the release-notes job
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          RELEASE_NOTES_CLIENT_ID_STAGING: ${{ secrets.RELEASE_NOTES_CLIENT_ID_STAGING }}
+          RELEASE_NOTES_CLIENT_SECRET_STAGING: ${{ secrets.RELEASE_NOTES_CLIENT_SECRET_STAGING }}
+          RELEASE_NOTES_CLIENT_ID_PRODUCTION: ${{ secrets.RELEASE_NOTES_CLIENT_ID_PRODUCTION }}
+          RELEASE_NOTES_CLIENT_SECRET_PRODUCTION: ${{ secrets.RELEASE_NOTES_CLIENT_SECRET_PRODUCTION }}
+          TARGET: ${{ inputs.target }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          FROM: ${{ inputs.from }}
+          TO: ${{ inputs.to }}
+        run: |
+          set -euo pipefail
+          ARGS=(--target "$TARGET")
+          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ -n "$FROM" ] && [ -n "$TO" ]; then ARGS+=(--from "$FROM" --to "$TO"); fi
+          node scripts/ci/release-notes.mjs "${ARGS[@]}"
+
+      # A dead job here is silent-by-default: nobody reads the fleet's actions
+      # tab on a Tuesday morning, so without this a failed draft/publish would
+      # just mean no post went out and no one would know why. Same
+      # failure-only Telegram pattern as the other ppap report jobs
+      # (erp-db-snapshot.yml).
+      - name: Notify Telegram on failure
+        if: failure() && !cancelled()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured — skipping notify."
+            exit 0
+          fi
+          TEXT=$(printf '🚨 <b>Weekly release notes failed</b> (target: %s)\nNo post was drafted/published this run — someone should check the log before next Tuesday.\n<a href="%s">View run</a>' "$TARGET" "$RUN_URL")
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" \
+            -d parse_mode=HTML \
+            -d disable_web_page_preview=true; then
+            echo "✓ Telegram failure alert sent."
+          else
+            echo "::warning::Telegram notify failed."
+          fi

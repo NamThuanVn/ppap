@@ -36,12 +36,23 @@
       "start": "0315",
       "end": "0600",
       "inputs": { "dry_run": "false", "stale_days": "30" }
+    },
+    {
+      "id": "release-notes",
+      "workflow": "erp-release-notes.yml",
+      "enabled": true,
+      "mode": "slot",
+      "start": "2000",
+      "end": "2300",
+      "days": ["mon"],
+      "inputs": { "target": "staging", "dry_run": "false" }
     }
   ],
   "claudeWorkflows": [
     { "workflow": "erp-agent-clear-todo.yml", "kind": "lane" },
     { "workflow": "erp-hunter.yml", "kind": "hunter" },
     { "workflow": "erp-agent-ambulance.yml", "kind": "ambulance" },
-    { "workflow": "erp-agent-rel-plan.yml", "kind": "rel-plan" }
+    { "workflow": "erp-agent-rel-plan.yml", "kind": "rel-plan" },
+    { "workflow": "erp-release-notes.yml", "kind": "release-notes" }
   ]
 }
