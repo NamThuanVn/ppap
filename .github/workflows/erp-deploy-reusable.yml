@@ -1124,6 +1124,29 @@ jobs:
         if: ${{ needs.changes.outputs.deploy_dispatcher == 'true' }}
         run: pnpm --filter @namthuanvn/dispatcher run deploy${{ inputs.deploy_script_suffix }} -- --var "SENTRY_DSN:${{ steps.sentry.outputs.dsn }}" --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
 
+      # Inbound mail probe (#5043). "MX correct" is not "mail accepted": staging
+      # passed email-dns.sh while Cloudflare's edge rejected every outside message
+      # because the catch-all was off. Runs only when Terraform manages Email
+      # Routing for this environment (output email_routing_managed), after the
+      # workers are uploaded. Never sends DATA. Exit 1 = rejected → fails the job
+      # (the message names the HCP variable). Exit 3 = port 25 unreachable from
+      # this runner (GitHub-hosted runners often block it) → a loud warning,
+      # NOT a pass: run `bash scripts/gate/data/email-inbound.sh ${{ inputs.domain }}`
+      # from a host that can reach port 25.
+      - name: Probe inbound mail acceptance
+        run: |
+          if [ "$(jq -r '.email_routing_managed.value // false' /tmp/tf-outputs.json)" != "true" ]; then
+            echo "email routing not Terraform-managed in this environment — probe not applicable"
+            exit 0
+          fi
+          rc=0
+          bash scripts/gate/data/email-inbound.sh '${{ inputs.domain }}' || rc=$?
+          if [ "$rc" = 3 ]; then
+            echo "::warning::inbound mail probe could not reach port 25 from this runner — NOT verified; run scripts/gate/data/email-inbound.sh ${{ inputs.domain }} from a host that can"
+            exit 0
+          fi
+          exit "$rc"
+
   # ───────────────────────────────────────────────────────────────────────────
   # 5. Pingback. The dispatcher in the private repo created a *pending*
   #    GitHub Deployment; we close it out here with success/failure so
