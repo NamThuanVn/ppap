@@ -45,7 +45,7 @@
       "start": "2000",
       "end": "2300",
       "days": ["mon"],
-      "inputs": { "target": "staging", "dry_run": "false" }
+      "inputs": { "target": "production", "dry_run": "false" }
     }
   ],
   "claudeWorkflows": [
