@@ -500,8 +500,8 @@ jobs:
           AGENT_CRAZY_UNTIL: ${{ vars.AGENT_CRAZY_UNTIL }}
           PROBE_ONLY: '1'
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          # Keep in step with erp-agent-clear-todo.yml's default claude_version.
-          CLAUDE_VERSION: '2.1.267'
+          # Always the newest release, like every other agent workflow.
+          CLAUDE_VERSION: 'latest'
         run: |
           set -uo pipefail
           # Only the per-account fallback probe needs the CLI; a failed install

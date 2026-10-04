@@ -820,7 +820,7 @@ jobs:
       - name: Install Claude Code CLI
         if: ${{ !inputs.smoke && (needs.hunt-noise.outputs.open_pr != '' || needs.hunt-noise.outputs.sites != '0') }}
         env:
-          CLAUDE_VERSION: '2.1.267'
+          CLAUDE_VERSION: 'latest'
         run: |
           set -euo pipefail
           curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"

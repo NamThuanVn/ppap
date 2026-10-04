@@ -37,9 +37,9 @@ on:
   workflow_dispatch:
     inputs:
       claude_version:
-        description: 'Claude Code CLI version to install (pin; bump deliberately).'
+        description: 'Claude Code CLI version to install — latest by default; pass a version (e.g. 2.1.267) to pin one run.'
         required: false
-        default: '2.1.267'
+        default: 'latest'
         type: string
       model:
         description: 'Optional --model override for the planning session (empty = account default).'
@@ -75,7 +75,7 @@ jobs:
     timeout-minutes: 30
     env:
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
-      CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || '2.1.267' }}
+      CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || 'latest' }}
     steps:
       # AGENT_STATE_DIR must be set HERE, not in the job-level `env:` block.
       # `runner` is not an available context for `jobs.<id>.env` — only from
