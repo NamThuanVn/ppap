@@ -138,6 +138,7 @@ jobs:
           echo "CLAUDE_MODEL=$MODEL" >> "$GITHUB_ENV"
 
       - name: Run the release-notes job
+        id: run
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
@@ -169,13 +170,16 @@ jobs:
           THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TARGET: ${{ inputs.target }}
+          SKIP_REASON: ${{ steps.run.outputs.skip_reason }}
         run: |
           set -euo pipefail
           if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
             echo "Telegram not configured — skipping notify."
             exit 0
           fi
-          TEXT=$(printf '🚨 <b>Weekly release notes failed</b> (target: %s)\nNo post was drafted/published this run — someone should check the log before next Tuesday.\n<a href="%s">View run</a>' "$TARGET" "$RUN_URL")
+          DETAIL="No post was drafted/published this run — someone should check the log before next Tuesday."
+          if [ -n "${SKIP_REASON:-}" ]; then DETAIL="Skipped: ${SKIP_REASON}"; fi
+          TEXT=$(printf '🚨 <b>Weekly release notes failed</b> (target: %s)\n%s\n<a href="%s">View run</a>' "$TARGET" "$DETAIL" "$RUN_URL")
           THREAD_ARGS=()
           if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
           if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
