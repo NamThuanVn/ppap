@@ -11,6 +11,7 @@
     {
       "id": "hunter",
       "workflow": "erp-hunter.yml",
+      "repo": "@fleet",
       "enabled": true,
       "mode": "slot",
       "start": "1830",

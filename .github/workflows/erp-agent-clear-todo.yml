@@ -44,17 +44,24 @@ name: ERP · Agent · clear-todo-issue
 # the `Resolve PAT from pool` step picked — NOT a fixed account; the log line
 # `PAT pool -> @<login>` names it, and it is stable for the whole run so a lane
 # claims, works and releases as one identity. The checkout targets the UPSTREAM
-# repo (freshest main), while the SHARED fork (vars.AGENT_FORK_REPO) stays the
+# repo (freshest main), while the SHARED fork (AGENT_FORK_REPO) stays the
 # push target and the claim-lock namespace — shared because the claim ref there
 # is the atomic cross-lane lock, so it must not be split per account. Claims are
 # therefore atomic among all CI agents; human sessions on OTHER forks are covered
 # by the open-PR backstop.
 #
 # Dispatched by erp-agent-loop.yml (repository_dispatch[agent-todo]);
-# workflow_dispatch is the manual/smoke-test entry. Filename is deliberately
-# NOT erp-ci-*.yml → the sync mirrors it to NamThuanVn/ppap only, never to the CI
-# fleet. NOTE the transcript + session artifacts and logs are PUBLIC (accepted
-# trade-off — see docs/engineering/platform/ppap-agent-runs.md § Agent runs).
+# workflow_dispatch is the manual/smoke-test entry. It runs on the CONTROL repo
+# (NamThuanVn/ppap) AND on every CI-fleet repo — sync-workflows-to-ppap.yml
+# mirrors it to both, and the controller places each lane (AGENT_LANE_HOSTS,
+# scripts/agent/board/lib/hosts.mjs). A fleet repo holds no secrets but
+# PAT_TOKEN_POOL and none of the control repo's variables, so the dispatch
+# carries them SEALED (client_payload.bundle, scripts/agent/run/secret-bundle.mjs)
+# plus client_payload.controller_repo, and "Load lane config" below unpacks them.
+# Never read `vars.*` or a Claude/Telegram `secrets.*` directly in this file: on a
+# fleet repo they are empty. NOTE the transcript + session artifacts and logs are
+# PUBLIC (accepted trade-off — see docs/engineering/platform/ppap-agent-runs.md
+# § Agent runs).
 
 run-name: 'ERP · Agent · todo'
 
@@ -78,6 +85,19 @@ on:
         required: false
         default: ''
         type: string
+      # Set by erp-agent-loop.yml's manual-lane job when it places a one-shot
+      # lane on a CI-fleet repo — the same two values a loop lane gets in its
+      # client_payload. Sealed, so showing it in the run UI publishes nothing.
+      bundle:
+        description: 'Internal: the sealed lane bundle (scripts/agent/run/secret-bundle.mjs). Leave empty.'
+        required: false
+        default: ''
+        type: string
+      controller_repo:
+        description: 'Internal: the control repo that dispatched this lane. Leave empty.'
+        required: false
+        default: ''
+        type: string
 
 permissions: read-all
 
@@ -88,16 +108,14 @@ permissions: read-all
 
 env:
   PRIVATE_REPO: NamThuanVn/erp-namthuan
-  # the agent account's own fork — push works without a cross-account grant. Must
-  # exist before the first run (gh repo fork NamThuanVn/erp-namthuan
-  # The agent fork — ONE shared namespace on purpose, and not because any one
-  # account is special. `scripts/agent/board/claim/todo.mjs` creates the claim ref here
-  # (`repos/<fork>/git/refs`) and that ref IS the atomic cross-lane lock: split
-  # it per account and two lanes could claim the same issue. Which account owns
-  # the fork is arbitrary, so it lives in ONE place — the ppap repo variable
-  # `AGENT_FORK_REPO` — instead of being baked into four files. Every pooled
-  # account needs write on it (see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL).
-  FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+  # The agent fork (FORK_REPO) — ONE shared namespace on purpose, and not because
+  # any one account is special. `scripts/agent/board/claim/todo.mjs` creates the
+  # claim ref here (`repos/<fork>/git/refs`) and that ref IS the atomic cross-lane
+  # lock: split it per account and two lanes could claim the same issue. Which
+  # account owns the fork is arbitrary, so it lives in ONE place — the control
+  # repo's variable `AGENT_FORK_REPO` — and reaches this job through "Load lane
+  # config" (never `vars.` here: a fleet repo has none). Every pooled account
+  # needs write on it (see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL).
 
 jobs:
   agent:
@@ -112,32 +130,16 @@ jobs:
       ITEM_ARG: ${{ github.event.client_payload.item || inputs.item || '' }}
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || 'latest' }}
-      # Read each account's REAL 5h/7d quota (scripts/agent/run/usage.mjs) instead
-      # of the blind haiku ping. Without it every usable account counts as exactly
-      # one lane, so a fresh account and one at 89% used look the same and the
-      # controller can neither use the fresh one's headroom nor spare the thin
-      # one. `gh variable set AGENT_USAGE_PROBE --body 0` reverts to the ping.
-      AGENT_USAGE_PROBE: ${{ vars.AGENT_USAGE_PROBE || '1' }}
-      # Lanes a clean account funds when its quota could not be read (every
-      # setup-token today). `gh variable set AGENT_BLIND_LANES_PER_ACCOUNT --body 1`
-      # restores one lane per usable account.
-      AGENT_BLIND_LANES_PER_ACCOUNT: ${{ vars.AGENT_BLIND_LANES_PER_ACCOUNT || '2' }}
-      # The rest of the pace-to-reset formula's tuning vars (laneBudget() in
-      # scripts/agent/run/usage.mjs) — defaults here MUST agree with that
-      # file's DEFAULT_* constants and claude.sh's own fallbacks. Without these
-      # this job's own "Probe Claude pool" step (below) publishes a normal-mode
-      # AGENT_POOL_STATE that never reflects crazy mode, which the controller's
-      # next tick then reads as if crazy mode were off.
-      AGENT_MAX_5H_PCT: ${{ vars.AGENT_MAX_5H_PCT || '90' }}
-      AGENT_MAX_7D_PCT: ${{ vars.AGENT_MAX_7D_PCT || '95' }}
-      AGENT_WARN_5H_PCT: ${{ vars.AGENT_WARN_5H_PCT || '75' }}
-      AGENT_WARN_7D_PCT: ${{ vars.AGENT_WARN_7D_PCT || '85' }}
-      AGENT_LANE_RATE_5H_PCT: ${{ vars.AGENT_LANE_RATE_5H_PCT || '10' }}
-      AGENT_LANE_RATE_7D_PCT: ${{ vars.AGENT_LANE_RATE_7D_PCT || '1.1' }}
-      AGENT_LANE_HOURS: ${{ vars.AGENT_LANE_HOURS || '5.5' }}
-      AGENT_MAX_LANES_PER_ACCOUNT: ${{ vars.AGENT_MAX_LANES_PER_ACCOUNT || '4' }}
-      AGENT_CRAZY_MAX: ${{ vars.AGENT_CRAZY_MAX || '18' }}
-      AGENT_CRAZY_UNTIL: ${{ vars.AGENT_CRAZY_UNTIL }}
+      # The pool-probe and pace-to-reset tuning vars (AGENT_USAGE_PROBE,
+      # AGENT_BLIND_LANES_PER_ACCOUNT, AGENT_MAX_/WARN_/LANE_RATE_*,
+      # AGENT_LANE_HOURS, AGENT_MAX_LANES_PER_ACCOUNT, AGENT_CRAZY_*) used to be
+      # declared here as `vars.X || 'default'`. They now come from "Load lane
+      # config", and they CANNOT stay here as well: a job-level `env:` key
+      # outranks $GITHUB_ENV, so on a fleet repo (no vars) the defaults would
+      # silently override the control repo's real settings — crazy mode included.
+      # Their defaults live in scripts/agent/run/secret-bundle.mjs VAR_DEFAULTS and
+      # MUST agree with laneBudget()'s DEFAULT_* constants in
+      # scripts/agent/run/usage.mjs and claude.sh's own fallbacks.
     steps:
       # AGENT_STATE_DIR must be set HERE, not in the job-level `env:` block.
       # `runner` is not an available context for `jobs.<id>.env` — only from
@@ -217,6 +219,24 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Everything this job needs from the CONTROL repo, wherever it runs. A
+      # fleet lane gets it from the sealed bundle the controller forwarded —
+      # masks every secret before anything else prints, exports the settings
+      # (FORK_REPO, AGENT_MODELS, the tuning vars, AGENT_CONTROL_REPO) to
+      # $GITHUB_ENV, and writes the secrets to a 0600 file named by LANE_SECRETS
+      # that only the three steps needing them source. A control-repo run (no
+      # bundle) takes this repo's own vars and keeps its `secrets.*` step env —
+      # the old behaviour exactly. A bundle that will not open (the pool rotated
+      # since it was sealed, or it expired) fails HERE, before any claim, and the
+      # controller's next dispatch seals a fresh one.
+      - name: Load lane config
+        env:
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          BUNDLE: ${{ github.event.client_payload.bundle || inputs.bundle || '' }}
+          CONTROLLER_REPO: ${{ github.event.client_payload.controller_repo || inputs.controller_repo || '' }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: node scripts/agent/run/secret-bundle.mjs open
+
       # Rewire into the fork layout (rename checkout's origin → upstream; add
       # the fork as origin), freshen the fork (the claim lock creates refs at
       # upstream's tip — the fork must hold those objects; sync-agent-fork.yml
@@ -268,8 +288,7 @@ jobs:
         if: env.ITEM_ARG == ''
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          STALE_REF_HOURS: ${{ vars.STALE_REF_HOURS || '3.5' }}
-          BARE_REF_MINUTES: ${{ vars.BARE_REF_MINUTES || '15' }}
+          # STALE_REF_HOURS / BARE_REF_MINUTES come from "Load lane config".
         run: node scripts/agent/board/claim/todo.mjs
 
       # Right after the item is known — scripted claim OR a manual `item:`
@@ -309,14 +328,13 @@ jobs:
       # Loop-spawned lanes dispatch with no `model` at all (issue #4751), so
       # CLAUDE_MODEL above is empty for the bulk of the fleet's spend unless
       # resolved here — the stored AGENT_MODELS setting must be read INSIDE
-      # clear-todo, not only at the UI/dispatch layer. `vars.AGENT_MODELS`
-      # resolves directly from this workflow's own repo, no API call needed
-      # (same pattern as `vars.AGENT_FORK_REPO` above).
+      # clear-todo, not only at the UI/dispatch layer. AGENT_MODELS is already in
+      # the job env from "Load lane config" (the control repo's variable, wherever
+      # this lane runs).
       - name: Resolve model
         if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         env:
           EXPLICIT: ${{ env.CLAUDE_MODEL }}
-          AGENT_MODELS: ${{ vars.AGENT_MODELS }}
         run: |
           set -euo pipefail
           MODEL=$(scripts/ci/ppap/resolve-model.sh lane)
@@ -342,11 +360,14 @@ jobs:
         id: pool
         if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         env:
+          # Fallback for a control-repo run; a fleet lane's pool is in LANE_SECRETS.
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           PROBE_ONLY: '1'
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: |
           set -uo pipefail
+          # shellcheck source=/dev/null — written by "Load lane config"
+          if [ -n "${LANE_SECRETS:-}" ]; then . "$LANE_SECRETS"; fi
           RC=0
           bash scripts/agent/run/claude.sh || RC=$?
           # Publishes AGENT_POOL_STATE, and sets a timed pool-exhausted hold when
@@ -370,6 +391,7 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           SALVAGE_RUN_ID: ${{ steps.claim.outputs.salvage_run_id }}
+          SALVAGE_RUN_REPO: ${{ steps.claim.outputs.salvage_run_repo }}
           ARTIFACT: ${{ steps.claim.outputs.session_artifact }}
           SESSION_ID: ${{ steps.claim.outputs.session_id }}
         run: |
@@ -377,7 +399,10 @@ jobs:
           # Unpacked under AGENT_STATE_DIR, not the checkout: the agent runs
           # after this step and sweeps untracked paths it doesn't recognise.
           RESTORE="${AGENT_STATE_DIR}/claude-session-restore"
-          gh run download "$SALVAGE_RUN_ID" --repo "${GITHUB_REPOSITORY}" \
+          # The salvaging run may have been on any fleet repo; a pointer written
+          # before lanes left the control repo names no repo, and those runs all
+          # lived on the control repo.
+          gh run download "$SALVAGE_RUN_ID" --repo "${SALVAGE_RUN_REPO:-${AGENT_CONTROL_REPO:-$GITHUB_REPOSITORY}}" \
             -n "$ARTIFACT" -D "$RESTORE"
           if [ ! -s "${RESTORE}/${SESSION_ID}.jsonl" ]; then
             echo "::notice::session artifact unavailable/expired — fresh start from the salvage branch"
@@ -565,9 +590,13 @@ jobs:
         id: run
         if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         env:
+          # Fallback for a control-repo run; a fleet lane's pool is in LANE_SECRETS.
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: bash scripts/agent/run/claude.sh
+        run: |
+          # shellcheck source=/dev/null — written by "Load lane config"
+          if [ -n "${LANE_SECRETS:-}" ]; then . "$LANE_SECRETS"; fi
+          exec bash scripts/agent/run/claude.sh
 
       # ── Typed verdict pipeline (claim-mode runs only) ─────────────────────
       # Parse never fails: no/invalid/mismatched verdict → verdict=NONE, which
@@ -686,7 +715,7 @@ jobs:
           VERDICT: ${{ steps.outcome.outputs.verdict || 'NONE' }}
           EXECUTOR_FAILED: ${{ steps.finalize.outcome == 'failure' || steps.park.outcome == 'failure' || steps.split.outcome == 'failure' || steps.abandoned.outcome == 'failure' || steps.blocked.outcome == 'failure' }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          STALE_REF_HOURS: ${{ vars.STALE_REF_HOURS || '3.5' }}
+          # STALE_REF_HOURS comes from "Load lane config".
         run: node scripts/agent/board/recover/salvage-or-revert.mjs
 
       # Board hygiene, EVERY run (backlog-empty and wrapper runs included): a
@@ -897,6 +926,14 @@ jobs:
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          # A fleet lane has no Telegram secrets of its own — they came forwarded.
+          if [ -n "${LANE_SECRETS:-}" ]; then
+            # shellcheck source=/dev/null — written by "Load lane config"
+            . "$LANE_SECRETS"
+            BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-$BOT_TOKEN}"
+            CHAT_ID="${TELEGRAM_CHAT_ID:-$CHAT_ID}"
+            THREAD_ID="${TELEGRAM_BUILD_THREAD_ID:-$THREAD_ID}"
+          fi
           # Suppress false alarms: if the claimed item already SHIPPED (issue
           # closed = its PR merged — e.g. an async auto-merge that landed after
           # the agent's turn, or a premature-verdict finalize refusal), the run
@@ -941,6 +978,7 @@ jobs:
       # `client_payload.loop == 'true'` is a STRING compare — payload values
       # arrive as strings; never switch the producer to -F booleans.
       - name: Continue loop
+        id: continue
         if: >-
           always() &&
           github.event.client_payload.loop == 'true' &&
@@ -957,11 +995,44 @@ jobs:
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
         run: |
           set +e
-          if gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
+          # The controller lives on the CONTROL repo, wherever this lane ran.
+          if gh api "repos/${AGENT_CONTROL_REPO:-$GITHUB_REPOSITORY}/dispatches" \
             -f event_type=agent-loop \
             -f client_payload[triggered_by]="${TRIGGERED_BY}"; then
             echo "✓ chained agent-loop"
           else
             echo "::warning::agent-loop chain dispatch failed — this lane ends; restart via 'gh workflow run erp-agent-loop.yml -R NamThuanVn/ppap' or the next BA-docs merge"
+          fi
+          exit 0
+
+      # The controller's `workflow_run` trigger re-probes on EVERY lane
+      # loop-lane completion — but `workflow_run` never crosses repos, so a lane
+      # on a CI-fleet host is invisible to it. This stands in for that event: any
+      # loop-dispatched fleet lane that did not already chain above wakes the
+      # controller once on its way out, exactly what its completion would have
+      # done on the control repo. It cannot make the loop spin — the controller
+      # still stops when its probe counts zero claimable leaves (see
+      # erp-agent-loop.yml § "Why the loop terminates"). Skipped on the control
+      # repo, where workflow_run already fires.
+      - name: Wake controller (fleet lane)
+        if: >-
+          always() &&
+          github.event_name == 'repository_dispatch' &&
+          github.event.client_payload.loop == 'true' &&
+          github.event.client_payload.controller_repo != '' &&
+          github.event.client_payload.controller_repo != github.repository &&
+          steps.continue.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          CONTROLLER_REPO: ${{ github.event.client_payload.controller_repo }}
+          TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
+        run: |
+          set +e
+          if gh api "repos/${CONTROLLER_REPO}/dispatches" \
+            -f event_type=agent-loop \
+            -f client_payload[triggered_by]="${TRIGGERED_BY}"; then
+            echo "✓ woke the controller on ${CONTROLLER_REPO}"
+          else
+            echo "::warning::could not wake the controller on ${CONTROLLER_REPO} — the 15-min heartbeat re-probes"
           fi
           exit 0

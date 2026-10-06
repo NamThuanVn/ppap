@@ -110,6 +110,27 @@ on:
   repository_dispatch:
     types: [agent-loop]
   workflow_dispatch:
+    # A non-empty `item` is a ONE-SHOT manual lane (the "Start lane" dialog on
+    # /settings/agent-control): the `manual-lane` job below places it on a host
+    # and seals the bundle for it, and the loop's controller does not run. It
+    # comes through here rather than straight to erp-agent-clear-todo.yml
+    # because only this repo holds the secrets a fleet lane must be handed.
+    inputs:
+      item:
+        description: 'Optional: issue URL/number, PR number, or docs/ba folder path → ONE manual lane on that item. Empty = an ordinary controller tick.'
+        required: false
+        default: ''
+        type: string
+      model:
+        description: 'Manual lane only: --model override for the session.'
+        required: false
+        default: ''
+        type: string
+      claude_version:
+        description: 'Manual lane only: Claude Code CLI version to install.'
+        required: false
+        default: ''
+        type: string
 
 permissions: read-all
 
@@ -117,8 +138,12 @@ permissions: read-all
 # arrival replaces the queued one. Nothing is lost — whichever run executes
 # recounts everything from live state. cancel-in-progress stays false: an
 # in-flight dispatch burst must never be killed halfway.
+#
+# A manual lane gets a group of its own: queued behind `agent-loop`, the next
+# controller tick would REPLACE it and the requested item would silently never
+# start.
 concurrency:
-  group: agent-loop
+  group: ${{ (inputs.item || '') != '' && format('agent-lane-manual-{0}', github.run_id) || 'agent-loop' }}
   cancel-in-progress: false
 
 env:
@@ -134,10 +159,13 @@ jobs:
     # manual agent-clear-todo (workflow_dispatch — a human debugging a single
     # item) must NOT auto-start the loop. Non-workflow_run triggers
     # (repository_dispatch, workflow_dispatch on THIS workflow) always proceed.
+    # A manual lane (`item` set) is the `manual-lane` job's, never a tick.
     if: >-
-      github.event_name != 'workflow_run' ||
-      github.event.workflow_run.name == 'ERP · Heartbeat' ||
-      github.event.workflow_run.event == 'repository_dispatch'
+      (inputs.item || '') == '' && (
+        github.event_name != 'workflow_run' ||
+        github.event.workflow_run.name == 'ERP · Heartbeat' ||
+        github.event.workflow_run.event == 'repository_dispatch'
+      )
     runs-on: ubuntu-latest
     # A hung API call must not wedge the loop's concurrency slot for the
     # default 360 min — the job is a sparse checkout + the eligibility sweep
@@ -597,14 +625,40 @@ jobs:
             echo "proceed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # The sealed bundle a FLEET lane opens in its "Load lane config" step: this
+      # repo's Claude pool + Telegram secrets + the AGENT_* settings, encrypted
+      # with a key derived from PAT_TOKEN_POOL (identical on every fleet repo), so
+      # no fleet repo ever has to hold them. Sealed only when lanes go to the
+      # fleet: with AGENT_LANE_HOSTS unset the lanes run here and read this
+      # repo's secrets directly, exactly as before — rollback is one variable.
+      # See scripts/agent/run/secret-bundle.mjs for why the payload must be sealed.
+      - name: Seal lane bundle
+        if: steps.relplan.outputs.proceed == 'true' && vars.AGENT_LANE_HOSTS == 'fleet'
+        env:
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          set -euo pipefail
+          B=$(node scripts/agent/run/secret-bundle.mjs build)
+          echo "LANE_BUNDLE=$B" >> "$GITHUB_ENV"
+          echo "✓ lane bundle sealed (${#B} chars)"
+
+      # Count live lanes on EVERY host (this repo + the CI fleet), compute K
+      # (scripts/ci/dispatch-k.mjs, unchanged), place each new lane on a host and
+      # dispatch it — scripts/agent/board/loop/dispatch-lanes.mjs owns all four;
+      # its header says why lanes left this repo. AGENT_LANE_HOSTS=fleet places
+      # on the fleet at AGENT_LANES_PER_HOST (default 2) per host; unset places
+      # here, the old behaviour.
       - name: Count active runs + dispatch top-up
         if: steps.relplan.outputs.proceed == 'true'
         env:
-          # Same-repo Actions reads: GITHUB_TOKEN suffices (read-all).
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Dispatch writes MUST use a pooled PAT (GITHUB_TOKEN events don't
-          # trigger workflows).
-          POOL_PAT: ${{ env.RESOLVED_PAT }}
+          # Reads now cross repos, so the pooled PAT does both reads and writes
+          # (GITHUB_TOKEN events don't trigger workflows anyway).
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           CAP: ${{ steps.cap.outputs.cap }}
           MODE: ${{ steps.cap.outputs.mode }}
           CANDIDATES: ${{ steps.probe.outputs.candidates }}
@@ -617,94 +671,12 @@ jobs:
           # when the probe predates this field (or is stale), in which case K is
           # not capped by it and the loop behaves exactly as it did before.
           CAPACITY: ${{ steps.pool.outputs.capacity || steps.hold.outputs.capacity }}
+          AGENT_LANE_HOSTS: ${{ vars.AGENT_LANE_HOSTS }}
+          AGENT_LANES_PER_HOST: ${{ vars.AGENT_LANES_PER_HOST || '2' }}
+          BUNDLE: ${{ env.LANE_BUNDLE }}
         run: |
           set -euo pipefail
-          # The runs-list `status` param is single-valued → two calls. The list
-          # index is EVENTUALLY CONSISTENT: a just-completed run can stay
-          # listed as in_progress for several seconds after it finished —
-          # observed live (controller 29755617192 counted active=2 with one
-          # real agent → K=0 → a lane died with 4 candidates on the board). So
-          # never trust the list alone: collect the candidate run IDS, then
-          # fresh-verify EACH with a direct GET (strongly consistent) and
-          # count only genuine queued/in_progress survivors. A failed per-id
-          # GET counts as active (conservative — never overshoots the cap;
-          # active runs ≤ cap, so per_page=100 needs no pagination).
-          IDS=$(for S in queued in_progress; do
-            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${AGENT_WORKFLOW}/runs?status=${S}&per_page=100" \
-              --jq '.workflow_runs[].id'
-          done | sort -u)
-          ACTIVE=0
-          for ID in $IDS; do
-            ST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ID}" --jq '.status' 2>/dev/null || echo "unknown")
-            case "$ST" in
-              queued|in_progress|unknown)
-                ACTIVE=$(( ACTIVE + 1 ))
-                echo "· run $ID: $ST (counted)"
-                ;;
-              *)
-                echo "· run $ID: $ST — stale list entry, not counted"
-                ;;
-            esac
-          done
-          echo "· live agent runs: $ACTIVE"
-          # K arithmetic lives in scripts/ci/dispatch-k.mjs (issue #4744, this
-          # slice #4790) — a pure function the tests can drive, instead of
-          # untested inline bash. Three terms: CAP − ACTIVE capped by
-          # CANDIDATES; the POOL BUDGET (skipped entirely in god mode — that's
-          # the whole point of god mode, a fixed lane count with quota
-          # ignored); then clamp to ≥ 0 always, regardless of mode.
-          VERDICT=$(node scripts/ci/dispatch-k.mjs \
-            --cap "$CAP" --active "$ACTIVE" --candidates "$CANDIDATES" \
-            --capacity "${CAPACITY:-}" --usable-accounts "${USABLE_ACCOUNTS:-}" \
-            --mode "${MODE:-normal}")
-          K=$(printf '%s' "$VERDICT" | cut -f1)
-          BUDGET=$(printf '%s' "$VERDICT" | cut -f2)
-          NOTE=$(printf '%s' "$VERDICT" | cut -f4-)
-          [ -n "$NOTE" ] && echo "· $NOTE"
-          if [ "${MODE:-normal}" = god ]; then
-            echo "cap=$CAP · active=$ACTIVE · candidates=$CANDIDATES → dispatching $K run(s) (pool budget ignored)"
-          else
-            echo "cap=$CAP · active=$ACTIVE · candidates=$CANDIDATES · usable-accounts=${USABLE_ACCOUNTS:-unknown} · capacity=${CAPACITY:-unknown} · budget=$BUDGET → dispatching $K run(s)"
-          fi
-          if [ "$K" -eq 0 ]; then
-            echo "::notice::pool already at capacity (or no headroom) — nothing dispatched"
-            exit 0
-          fi
-          for I in $(seq 1 "$K"); do
-            # -f = string values, ALWAYS ('true' the string). Never switch to
-            # -F: it would send a real JSON boolean and the consumer's
-            # `client_payload.loop == 'true'` gate would silently stop
-            # matching.
-            #
-            # The pooled PAT is shared with every concurrently-running lane
-            # (each resolves its own "best" token the same way, so several can
-            # converge on the same account), and its 5,000/hr core budget can
-            # run out mid-job even though "Resolve PAT from pool" saw headroom
-            # at job start (observed: 5000 remaining, then rate-limited 12s
-            # later — ppap run 34333799888). That is weather, not a defect: no
-            # lane and no ambulance can fix an hourly quota. Failing the whole
-            # job here used to make sweep-dead-lanes.mjs misclassify it as
-            # `harness-broken` and spend a repair-attempt budget on it, so a
-            # rate-limited dispatch stops the loop for THIS tick only — the
-            # next lane completion or the 15-min heartbeat re-probes with
-            # (likely) a fresh "best" token.
-            if ! OUT=$(GH_TOKEN="$POOL_PAT" gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
-              -f event_type=agent-todo \
-              -f client_payload[item]="" \
-              -f client_payload[loop]="true" \
-              -f client_payload[triggered_by]="${TRIGGERED_BY}" 2>&1); then
-              if printf '%s' "$OUT" | grep -qi "API rate limit exceeded"; then
-                echo "::warning::pooled PAT rate-limited after dispatching $((I - 1))/$K — stopping this tick rather than failing the job; the next trigger re-probes"
-                break
-              fi
-              echo "$OUT" >&2
-              exit 1
-            fi
-            echo "✓ dispatched agent run $I/$K"
-            # 1s, GitHub's guidance between writes: back-to-back dispatches from
-            # one account are what trips its per-account secondary rate limit.
-            sleep 1
-          done
+          node scripts/agent/board/loop/dispatch-lanes.mjs
           # Hold the concurrency slot while the just-created runs become
           # visible to the Actions API — the NEXT queued controller then
           # counts them and can't over-provision past the cap.
@@ -743,3 +715,86 @@ jobs:
             && echo "✓ Telegram controller-failure alert sent." \
             || echo "::warning::Telegram notify failed."
           exit 0
+
+  # ONE lane on a named item, from the "Start lane" dialog on
+  # /settings/agent-control — outside the loop's cap, gates and backlog, exactly
+  # as the dialog always behaved when it dispatched erp-agent-clear-todo.yml
+  # directly. It routes through here now because a lane may run on a CI-fleet
+  # repo, and only this repo can seal the bundle such a lane needs. Placement is
+  # the controller's (scripts/agent/board/loop/dispatch-lanes.mjs with ITEM set):
+  # K is exactly 1, `loop` is false, so the lane never chains.
+  manual-lane:
+    name: Start a manual lane
+    if: github.event_name == 'workflow_dispatch' && inputs.item != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Same resolver as the controller's (the canonical copy is
+      # scripts/ci/ppap/pat-pool.sh) — inlined because the checkout below
+      # needs the token.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Checkout board scripts (sparse)
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 1
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Seal lane bundle
+        if: vars.AGENT_LANE_HOSTS == 'fleet'
+        env:
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          set -euo pipefail
+          B=$(node scripts/agent/run/secret-bundle.mjs build)
+          echo "LANE_BUNDLE=$B" >> "$GITHUB_ENV"
+          echo "✓ lane bundle sealed (${#B} chars)"
+
+      - name: Place + dispatch the lane
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          ITEM: ${{ inputs.item }}
+          MODEL: ${{ inputs.model }}
+          CLAUDE_VERSION: ${{ inputs.claude_version }}
+          TRIGGERED_BY: ${{ github.actor }}
+          AGENT_LANE_HOSTS: ${{ vars.AGENT_LANE_HOSTS }}
+          AGENT_LANES_PER_HOST: ${{ vars.AGENT_LANES_PER_HOST || '2' }}
+          BUNDLE: ${{ env.LANE_BUNDLE }}
+        run: node scripts/agent/board/loop/dispatch-lanes.mjs

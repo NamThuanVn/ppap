@@ -103,17 +103,32 @@ on:
         required: false
         default: ''
         type: string
+      # Set by erp-heartbeat.yml when it places the hunter on a CI-fleet repo
+      # (`"repo": "@fleet"` in erp-heartbeat-schedule.json), and carried forward
+      # by the hunter's own recall / re-entry. Sealed, so showing it in the run
+      # UI publishes nothing — scripts/agent/run/secret-bundle.mjs.
+      bundle:
+        description: 'Internal: the sealed secrets bundle (scripts/agent/run/secret-bundle.mjs). Leave empty.'
+        required: false
+        default: ''
+        type: string
+      controller_repo:
+        description: 'Internal: the control repo that dispatched this run. Leave empty.'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
 
-env:
-  # The shared agent fork the kill job's session pushes through — the same
-  # repo variable every agent lane reads, and shared on purpose so a hunter
-  # branch cannot collide with a lane's. Unset means the session has nowhere
-  # to push, which the kill job refuses loudly rather than discovering at
-  # `git push` time.
-  FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+# FORK_REPO — the shared agent fork the kill job's session pushes through, the
+# same variable every agent lane reads, and shared on purpose so a hunter branch
+# cannot collide with a lane's — is NOT declared here any more. This workflow
+# runs on the control repo OR a CI-fleet repo (the heartbeat places it), and a
+# fleet repo has no variables, so every job takes it from its "Load hunter
+# config" step instead. It must not be re-added at workflow level: a workflow
+# `env:` key outranks $GITHUB_ENV and would blank it on the fleet. Unset still
+# means the session has nowhere to push, which the kill job refuses loudly.
 
 concurrency:
   group: hunter
@@ -178,6 +193,18 @@ jobs:
           token: ${{ env.RESOLVED_PAT }}
           fetch-depth: 1
           persist-credentials: false
+
+      # Settings + secrets from the CONTROL repo, wherever this job runs: the
+      # sealed bundle the heartbeat forwarded on a fleet repo, this repo's own
+      # vars on the control repo. Same step as the agent lane's — see its
+      # comment in erp-agent-clear-todo.yml and scripts/agent/run/secret-bundle.mjs.
+      - name: Load hunter config
+        env:
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          BUNDLE: ${{ inputs.bundle || '' }}
+          CONTROLLER_REPO: ${{ inputs.controller_repo || '' }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: node scripts/agent/run/secret-bundle.mjs open
 
       # Never stack two batches. The previous PR's e2e run is the ONLY evidence
       # that the codemod's judgement holds on real specs, so opening tomorrow's
@@ -355,6 +382,18 @@ jobs:
           token: ${{ env.RESOLVED_PAT }}
           fetch-depth: 1
           persist-credentials: false
+
+      # Settings + secrets from the CONTROL repo, wherever this job runs: the
+      # sealed bundle the heartbeat forwarded on a fleet repo, this repo's own
+      # vars on the control repo. Same step as the agent lane's — see its
+      # comment in erp-agent-clear-todo.yml and scripts/agent/run/secret-bundle.mjs.
+      - name: Load hunter config
+        env:
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          BUNDLE: ${{ inputs.bundle || '' }}
+          CONTROLLER_REPO: ${{ inputs.controller_repo || '' }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: node scripts/agent/run/secret-bundle.mjs open
 
       # ── THE GAP THIS CLOSES ───────────────────────────────────────────────
       #
@@ -662,6 +701,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Settings + secrets from the CONTROL repo, wherever this job runs: the
+      # sealed bundle the heartbeat forwarded on a fleet repo, this repo's own
+      # vars on the control repo. Same step as the agent lane's — see its
+      # comment in erp-agent-clear-todo.yml and scripts/agent/run/secret-bundle.mjs.
+      - name: Load hunter config
+        env:
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          BUNDLE: ${{ inputs.bundle || '' }}
+          CONTROLLER_REPO: ${{ inputs.controller_repo || '' }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: node scripts/agent/run/secret-bundle.mjs open
+
       # The sweep's own output, not a second scan. Re-deriving it here would
       # cost another ~1.5k REST calls and — worse — could disagree with the
       # batch the gate above was evaluated on, so the job would fix a
@@ -836,7 +887,7 @@ jobs:
         if: ${{ inputs.smoke || needs.hunt-noise.outputs.open_pr != '' || needs.hunt-noise.outputs.sites != '0' }}
         env:
           EXPLICIT: ${{ inputs.model }}
-          AGENT_MODELS: ${{ vars.AGENT_MODELS }}
+          # AGENT_MODELS is in the job env from "Load hunter config".
         run: |
           set -euo pipefail
           MODEL=$(scripts/ci/ppap/resolve-model.sh hunter)
@@ -873,7 +924,11 @@ jobs:
           # resolution, then stops. That is where both of the expensive
           # env faults lived, and it costs a second instead of a session.
           AGENT_SMOKE: ${{ inputs.smoke && '1' || '' }}
-        run: bash scripts/agent/run/claude.sh
+        run: |
+          # On a fleet repo the Claude pool came forwarded (see "Load hunter config").
+          # shellcheck source=/dev/null
+          if [ -n "${LANE_SECRETS:-}" ]; then . "$LANE_SECRETS"; fi
+          exec bash scripts/agent/run/claude.sh
 
       # `continue-on-error` above keeps a half-finished session's edits, which
       # is right — but it also reports a session that never started as a green
@@ -1040,6 +1095,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           ROUND: ${{ inputs.round || '1' }}
           DAYS: ${{ inputs.days || '7' }}
         run: |
@@ -1062,8 +1118,17 @@ jobs:
             exit 0
           fi
           NEXT=$((ROUND + 1))
+          # On a fleet repo the next run gets no secrets but the ones handed to
+          # it: re-seal what this run was given (a fresh expiry) and pass it on.
+          FWD=()
+          if [ -n "${LANE_SECRETS:-}" ]; then
+            # shellcheck source=/dev/null
+            . "$LANE_SECRETS"
+            B=$(node scripts/agent/run/secret-bundle.mjs build) || B=''
+            if [ -n "$B" ]; then FWD=(-f bundle="$B" -f controller_repo="${AGENT_CONTROL_REPO:-}"); fi
+          fi
           if gh workflow run erp-hunter.yml -R "${GITHUB_REPOSITORY}" \
-               -f dry_run=false -f days="$DAYS" -f fresh_hunt=false -f round="$NEXT"; then
+               -f dry_run=false -f days="$DAYS" -f fresh_hunt=false -f round="$NEXT" "${FWD[@]}"; then
             echo "::notice::recalled the hunter (round $NEXT of $MAX_ROUNDS) to adopt PR #$1 and carry on"
           else
             echo "::warning::could not recall the hunter — PR #$1 stays open and tonight's sweep will adopt it"
@@ -1245,6 +1310,18 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      # Settings + secrets from the CONTROL repo, wherever this job runs: the
+      # sealed bundle the heartbeat forwarded on a fleet repo, this repo's own
+      # vars on the control repo. Same step as the agent lane's — see its
+      # comment in erp-agent-clear-todo.yml and scripts/agent/run/secret-bundle.mjs.
+      - name: Load hunter config
+        env:
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          BUNDLE: ${{ inputs.bundle || '' }}
+          CONTROLLER_REPO: ${{ inputs.controller_repo || '' }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: node scripts/agent/run/secret-bundle.mjs open
+
       # Capacity-gated inside the script: it borrows only repos with nothing
       # in flight, and only floor(idle / 5) of them, because one CI run
       # occupies roughly five repos (its coordinator plus the e2e workers it
@@ -1271,10 +1348,20 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
         run: |
           set -uo pipefail
+          # On a fleet repo the next run gets no secrets but the ones handed to
+          # it: re-seal what this run was given (a fresh expiry) and pass it on.
+          FWD=()
+          if [ -n "${LANE_SECRETS:-}" ]; then
+            # shellcheck source=/dev/null
+            . "$LANE_SECRETS"
+            B=$(node scripts/agent/run/secret-bundle.mjs build) || B=''
+            if [ -n "$B" ]; then FWD=(-f bundle="$B" -f controller_repo="${AGENT_CONTROL_REPO:-}"); fi
+          fi
           if gh workflow run erp-hunter.yml -R "${GITHUB_REPOSITORY}" \
-               -f dry_run=false -f days=1 -f fresh_hunt=false; then
+               -f dry_run=false -f days=1 -f fresh_hunt=false "${FWD[@]}"; then
             echo "✓ re-entered the hunter over a 1-day window (fresh_hunt=false — this cannot chain again)"
           else
             echo "::warning::could not re-enter the hunter — the sampling runs are in the fleet's logs and tonight's sweep will pool them anyway, a day later than intended"
