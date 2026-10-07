@@ -41,10 +41,13 @@ name: ERP · Fleet · Warm-up scheduler
 on:
   # No `schedule:`. The hourly clock moved OUT of GitHub — it delayed the
   # schedule EVENT at its own scheduler and dropped ticks it could not place.
-  # erp-heartbeat.yml now dispatches this workflow when its last run is over an
-  # hour old, driven by a Cloudflare cron on the ERP's service-utilities worker.
-  # See erp-heartbeat.yml's header, and `/settings/agent-control` in the ERP for the
-  # on/off switch.
+  # erp-heartbeat.yml dispatches the WRAPPER erp-new-org-warmup.yml (catalogue id
+  # `new-org-warmup`) when its last run is over an hour old, driven by a
+  # Cloudflare cron on the ERP's service-utilities worker. The whole-fleet
+  # catalogue job was retired once every PPAP_CI_REPOS org measured 20, so this
+  # workflow_dispatch trigger is now manual-only — dispatch it by hand to re-probe
+  # the live fleet. See erp-heartbeat.yml's header, and `/settings/agent-control`
+  # in the ERP for the on/off switch.
   workflow_dispatch:
     inputs:
       target:

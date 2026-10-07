@@ -47,6 +47,11 @@ on:
         required: false
         default: '20'
         type: string
+      slots:
+        description: 'Parallel jobs to request this probe (1–20; default 20). The scheduler sends ceiling+1.'
+        required: false
+        default: '20'
+        type: string
 
 permissions: read-all
 
@@ -57,22 +62,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Ask for `target` jobs at once and let GitHub decide how many actually start.
+  # Turns `slots` into the [1..N] list the probe matrix needs. A matrix cannot be
+  # built from a number. This job finishes before any probe starts, so it never
+  # counts toward the overlap `record` measures.
+  #
+  # WHY N AND NOT ALWAYS 20. erp-fleet-warmup.yml sends N = the org's proven
+  # ceiling + 1 (scripts/ci/lib/warmup.mjs probeSlots). Handing a ~5-slot new org
+  # 20 parallel jobs in one burst is the pattern GitHub's anti-abuse flags:
+  # NamThuanPsi was flagged during its first warm-up on 2026-10-08. One step
+  # above what the org already ran climbs the ceiling without ever bursting past
+  # it. A manual dispatch with no `slots` keeps the old 20.
+  plan:
+    name: 0 · Plan the probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          SLOTS: ${{ inputs.slots || '20' }}
+        run: |
+          set -euo pipefail
+          case "$SLOTS" in ''|*[!0-9]*) SLOTS=20 ;; esac
+          [ "$SLOTS" -ge 1 ] || SLOTS=1
+          [ "$SLOTS" -le 20 ] || SLOTS=20
+          echo "matrix=$(jq -cn --argjson n "$SLOTS" '[range(1; $n + 1)]')" >> "$GITHUB_OUTPUT"
+          echo "▶ probing with $SLOTS parallel job(s)"
+
+  # Ask for N jobs at once and let GitHub decide how many actually start.
   # Each one just sleeps: the point is to OCCUPY a slot long enough that the
   # overlap is unambiguous, not to compute anything. ~3 min is comfortably longer
   # than the runner acquisition spread, so a job that starts late was queued by
   # the org limit rather than by a slow pickup.
   burn:
     name: 1 · Probe (${{ matrix.slot }})
+    needs: [plan]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
       fail-fast: false
-      # 1..20. Written out because a matrix cannot be built from a range, and
-      # `fromJSON` of a computed list would need another job just to emit it.
       matrix:
-        slot:
-          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        slot: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Hold a slot
         run: |

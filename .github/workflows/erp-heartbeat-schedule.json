@@ -1,14 +1,6 @@
 {
   "jobs": [
     {
-      "id": "fleet-warmup",
-      "workflow": "erp-fleet-warmup.yml",
-      "enabled": true,
-      "mode": "interval",
-      "everyMin": 60,
-      "inputs": {}
-    },
-    {
       "id": "new-org-warmup",
       "workflow": "erp-new-org-warmup.yml",
       "enabled": false,
