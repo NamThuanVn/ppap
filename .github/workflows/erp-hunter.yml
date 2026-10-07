@@ -451,12 +451,16 @@ jobs:
         id: batch
         if: ${{ steps.scan.conclusion == 'success' }}
         env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           DAYS: ${{ inputs.days || '7' }}
         run: |
           set -uo pipefail
+          # --repo: drop a site whose spec changed on main after its last
+          # sighting (a fix is already in; the sweep keeps watching it).
           BATCH=$(node scripts/ci/noise-fix.mjs plan \
                     --report noise/ci-noise-fleet.json \
+                    --repo NamThuanVn/erp-namthuan \
                     --brief noise/fix-brief.md \
                     --run-url "$RUN_URL" --days "$DAYS") || BATCH=''
           if [ -z "$BATCH" ]; then
