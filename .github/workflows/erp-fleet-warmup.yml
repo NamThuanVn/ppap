@@ -62,13 +62,36 @@ on:
         required: false
         default: false
         type: boolean
+  # erp-new-org-warmup.yml calls this with list_var=PPAP_WARMUP_REPOS — new orgs
+  # warmed BEFORE they join PPAP_CI_REPOS, so routing, fan-out and agent lanes
+  # never hand real work to a 5-slot org. Same decision, a different list.
+  workflow_call:
+    inputs:
+      list_var:
+        description: 'erp-namthuan repo variable holding the host list.'
+        required: false
+        default: 'PPAP_CI_REPOS'
+        type: string
+      target:
+        required: false
+        default: '20'
+        type: string
+      max_hosts:
+        required: false
+        default: '4'
+        type: string
+      dry_run:
+        required: false
+        default: false
+        type: boolean
 
 permissions: read-all
 
 concurrency:
   # Two schedulers would each read the fleet before either dispatched, and both
-  # would pick the same weakest hosts.
-  group: fleet-warmup
+  # would pick the same weakest hosts. Keyed by list: the fleet and the new-org
+  # lists share no host, so neither run should queue behind the other.
+  group: fleet-warmup-${{ inputs.list_var || 'PPAP_CI_REPOS' }}
   cancel-in-progress: false
 
 jobs:
@@ -133,15 +156,21 @@ jobs:
           TARGET: ${{ inputs.target || '20' }}
           MAX_HOSTS: ${{ inputs.max_hosts || '4' }}
           DRY_RUN: ${{ inputs.dry_run == true && '1' || '0' }}
+          WARMUP_LIST_VAR: ${{ inputs.list_var || 'PPAP_CI_REPOS' }}
         run: |
           set -uo pipefail
           # The fleet list is read from the repo VARIABLE, never inlined here:
           # PPAP_CI_REPOS grew from 3 repos to 16, and a stale literal would
           # probe a fraction of the fleet while reporting it proven. The script
           # itself refuses an empty list rather than reporting success.
-          REPOS="$(gh api repos/NamThuanVn/erp-namthuan/actions/variables/PPAP_CI_REPOS --jq .value 2>/dev/null || true)"
+          case "$WARMUP_LIST_VAR" in
+            PPAP_CI_REPOS|PPAP_WARMUP_REPOS) ;;
+            *) echo "::error::list_var must be PPAP_CI_REPOS or PPAP_WARMUP_REPOS, got '$WARMUP_LIST_VAR'"; exit 1 ;;
+          esac
+          REPOS="$(gh api "repos/NamThuanVn/erp-namthuan/actions/variables/$WARMUP_LIST_VAR" --jq .value 2>/dev/null || true)"
           if [ -z "$REPOS" ]; then
-            echo "::error::PPAP_CI_REPOS is unset on NamThuanVn/erp-namthuan — there is no fleet to warm up"
+            echo "::error::$WARMUP_LIST_VAR is unset on NamThuanVn/erp-namthuan — there is no fleet to warm up"
             exit 1
           fi
-          PPAP_CI_REPOS="$REPOS" node scripts/ci/warmup-fleet.mjs
+          export "$WARMUP_LIST_VAR=$REPOS"
+          node scripts/ci/warmup-fleet.mjs

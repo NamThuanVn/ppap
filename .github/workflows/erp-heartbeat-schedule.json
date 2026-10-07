@@ -9,6 +9,14 @@
       "inputs": {}
     },
     {
+      "id": "new-org-warmup",
+      "workflow": "erp-new-org-warmup.yml",
+      "enabled": false,
+      "mode": "interval",
+      "everyMin": 60,
+      "inputs": {}
+    },
+    {
       "id": "hunter",
       "workflow": "erp-hunter.yml",
       "repo": "@fleet",

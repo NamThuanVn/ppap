@@ -1,0 +1,50 @@
+name: ERP · Fleet · Warm-up scheduler (new orgs)
+
+# The same hourly warm-up as erp-fleet-warmup.yml, aimed at PPAP_WARMUP_REPOS
+# instead of PPAP_CI_REPOS.
+#
+# WHY A SECOND LIST. A new free org starts near 5 concurrent jobs and its
+# ceiling only climbs with Actions usage (ppap-ci-fleet.md § CI fan-out). Listing
+# it in PPAP_CI_REPOS straight away makes it a PR-routing target, an e2e fan-out
+# host and an agent-lane host while it can run 5 jobs. So a new org waits in
+# PPAP_WARMUP_REPOS — synced, holding the pool secret, invisible to all real work
+# — while this job burns its ceiling up, and a person moves it into
+# PPAP_CI_REPOS once its E2E_HOST_CEILING reaches the target.
+#
+# Dispatched by erp-heartbeat.yml (catalogue id `new-org-warmup`, off by
+# default — switch it on at /settings/agent-control). The decision, the
+# busy/unproven guards and the per-run budget all live in the called workflow
+# and scripts/ci/lib/warmup.mjs; this file only picks the list.
+#
+# Filename is deliberately NOT erp-ci-*.yml → it stays on the deploy repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Ceiling to prove (default 20 = the documented GitHub Free ceiling).'
+        required: false
+        default: '20'
+        type: string
+      max_hosts:
+        description: 'How many hosts may be probed in this run.'
+        required: false
+        default: '4'
+        type: string
+      dry_run:
+        description: 'Plan and report which hosts WOULD be probed, dispatch nothing.'
+        required: false
+        default: false
+        type: boolean
+
+permissions: read-all
+
+jobs:
+  warmup:
+    uses: ./.github/workflows/erp-fleet-warmup.yml
+    with:
+      list_var: PPAP_WARMUP_REPOS
+      target: ${{ inputs.target || '20' }}
+      max_hosts: ${{ inputs.max_hosts || '4' }}
+      dry_run: ${{ inputs.dry_run == true }}
+    secrets: inherit
