@@ -297,7 +297,7 @@ jobs:
             exit 0
           fi
 
-          VERDICT=$(node scripts/ci/crazy-expiry.mjs \
+          VERDICT=$(node decider/scripts/ci/crazy-expiry.mjs \
             --crazy-until "$AGENT_CRAZY_UNTIL" --restore-cap "$AGENT_CRAZY_RESTORE_CAP") || {
             echo "::warning::crazy-expiry check failed — skipping this tick"
             exit 0
