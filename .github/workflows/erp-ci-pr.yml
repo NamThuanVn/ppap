@@ -288,11 +288,26 @@ jobs:
       - name: Checkout ppap (for scripts/ci)
         uses: actions/checkout@v5
 
+      # Same race as the report job's: the PR can merge mid-run and take
+      # refs/pull/N/merge with it. Fall back to main rather than fail the watcher.
+      - name: Pick the scripts ref
+        id: scripts_ref
+        env:
+          PR: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
+          PAT: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          REF=main
+          if [ -n "${PR:-}" ] && git ls-remote "https://x-access-token:${PAT}@github.com/${PRIVATE_REPO}.git" "refs/pull/${PR}/merge" | grep -q .; then
+            REF="refs/pull/${PR}/merge"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
       - name: Check out erp-namthuan scripts
         uses: actions/checkout@v5
         with:
           repository: ${{ env.PRIVATE_REPO }}
-          ref: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('refs/pull/{0}/merge', github.event.client_payload.pr_number || inputs.pr_number) || 'main' }}
+          ref: ${{ steps.scripts_ref.outputs.ref }}
           token: ${{ env.RESOLVED_PAT }}
           path: erp
           # scripts/agent/board/lib: the fleet hub client progress.mjs reads in `on` mode.
@@ -407,13 +422,36 @@ jobs:
       # sticky comment. If the checkout blips the digest degrades to absent and
       # the report still posts — it must never be why a green PR misses its
       # auto-merge.
+      # A PR can merge while its own CI is still reporting (auto-merge, or a
+      # human), and GitHub deletes refs/pull/N/merge the moment it does — so a
+      # checkout of it failed, report.mjs never arrived, and the run went red with
+      # six annotations over a PR that had just landed fine. Check the ref first
+      # (git protocol, no REST call) and take main, which carries the same
+      # scripts/ci, when it is gone.
+      - name: Pick the digest script ref
+        id: digest_ref
+        env:
+          PR: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
+          PAT: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          REF=main
+          if [ -n "${PR:-}" ]; then
+            if git ls-remote "https://x-access-token:${PAT}@github.com/${PRIVATE_REPO}.git" "refs/pull/${PR}/merge" | grep -q .; then
+              REF="refs/pull/${PR}/merge"
+            else
+              echo "· refs/pull/${PR}/merge is gone (the PR merged or closed during this run) — reporting from main's scripts"
+            fi
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
       - name: Check out the digest script
         continue-on-error: true
         uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ env.RESOLVED_PAT }}
-          ref: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('refs/pull/{0}/merge', github.event.client_payload.pr_number || inputs.pr_number) || 'main' }}
+          ref: ${{ steps.digest_ref.outputs.ref }}
           sparse-checkout: scripts/ci
           sparse-checkout-cone-mode: false
           persist-credentials: false
