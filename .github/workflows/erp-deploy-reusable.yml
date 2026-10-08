@@ -248,27 +248,54 @@ jobs:
         if: inputs.deploy_only_changed
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           PRIVATE_REPO: ${{ env.PRIVATE_REPO }}
           ENVIRONMENT: ${{ inputs.environment }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           # Deployments list is newest-first. The current run's own Deployment is
           # still `pending`, and a cancelled/failed prior deploy's latest status
           # is not `success`, so both are skipped. GitHub auto-inactivates OLDER
           # successes only once a NEWER success lands, so the first success we hit
           # walking newest-first is the true last-good deploy.
+          #
+          # A refusal must not fail the deploy. On 2026-10-08 GitHub's
+          # anti-scraping limit refused one pooled account from the runners while
+          # it still had 3,000+ calls left, and three staging deploys in a row
+          # died here before building anything. So the walk is retried on the
+          # other pooled accounts. If every account is refused the baseline is
+          # unknown, so the deploy goes FULL (an all-zeros base): falling back to
+          # the push's own base_sha would skip whatever the failed deploys before
+          # it never shipped.
+          last_good() {
+            local ids id state
+            ids=$(GH_TOKEN="$1" gh api "repos/$PRIVATE_REPO/deployments?environment=$ENVIRONMENT&per_page=30" --jq '.[].id') || return 1
+            for id in $ids; do
+              state=$(GH_TOKEN="$1" gh api "repos/$PRIVATE_REPO/deployments/$id/statuses?per_page=1" --jq '.[0].state // empty') || return 1
+              if [ "$state" = "success" ]; then
+                GH_TOKEN="$1" gh api "repos/$PRIVATE_REPO/deployments/$id" --jq '.sha' || return 1
+                return 0
+              fi
+            done
+            return 0
+          }
           BASE=""
-          for id in $(gh api "repos/$PRIVATE_REPO/deployments?environment=$ENVIRONMENT&per_page=30" --jq '.[].id'); do
-            state=$(gh api "repos/$PRIVATE_REPO/deployments/$id/statuses?per_page=1" --jq '.[0].state // empty')
-            if [ "$state" = "success" ]; then
-              BASE=$(gh api "repos/$PRIVATE_REPO/deployments/$id" --jq '.sha')
+          WALKED=""
+          for t in "$GH_TOKEN" $(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$' | grep -vxF "$GH_TOKEN"); do
+            echo "::add-mask::$t"
+            if BASE=$(last_good "$t"); then
+              WALKED=1
               break
             fi
+            echo "::warning::deployments walk refused for one pooled account — trying the next"
           done
           if [ -n "$BASE" ]; then
             echo "✓ baseline = last successful $ENVIRONMENT deploy: $BASE"
-          else
+          elif [ -n "$WALKED" ]; then
             echo "no prior successful $ENVIRONMENT deploy — falling back to base_sha / full deploy"
+          else
+            echo "::warning::every pooled account was refused reading deployments — deploying everything"
+            BASE=0000000000000000000000000000000000000000
           fi
           echo "base_sha=$BASE" >> "$GITHUB_OUTPUT"
 
