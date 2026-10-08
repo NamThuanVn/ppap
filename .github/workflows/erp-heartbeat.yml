@@ -360,6 +360,23 @@ jobs:
           gh variable delete AGENT_GOD_LANES -R NamThuanVn/ppap 2>/dev/null || true
           echo "✓ god mode expired — AGENT_GOD_UNTIL/AGENT_GOD_LANES cleared"
 
+      # The fleet's GitHub API budget, measured: one GET /user per pooled
+      # account, its real X-RateLimit-* headers posted to the ERP fleet hub
+      # (docs/engineering/services/utilities/fleet-hub.md § Measuring). Never
+      # fails the tick — the script warns and exits 0 on a dead token or a hub
+      # outage, and `continue-on-error` covers anything else.
+      - name: Record pool usage
+        if: steps.decider.outcome == 'success'
+        continue-on-error: true
+        env:
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
+        run: node decider/scripts/ci/ppap/pool-usage.mjs report
+
       # The agent loop's actual signal. erp-agent-loop.yml triggers on this
       # workflow's `workflow_run: [completed]`, so reaching this step at all is
       # what re-arms the controller — there is no dispatch call on this side.

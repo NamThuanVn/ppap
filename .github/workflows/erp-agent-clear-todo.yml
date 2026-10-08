@@ -749,6 +749,10 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: node scripts/agent/board/claim/reconcile-parents.mjs
 
       # A closed issue is always Done — whatever moved its Status off Done.
