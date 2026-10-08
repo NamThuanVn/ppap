@@ -250,6 +250,9 @@ jobs:
         if: ${{ steps.dispatch.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          # Same no-wait account failover as the dispatch step (fanout.mjs gh()):
+          # collect polls every host it dispatched to, on one pooled token.
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           SUITE: checks
           FANOUT: ${{ steps.dispatch.outputs.fanout }}
           TIMEOUT_S: '2400'
@@ -871,6 +874,9 @@ jobs:
         if: ${{ steps.gate.outputs.proceed == 'true' && steps.dispatch.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          # Same no-wait account failover as the dispatch step (fanout.mjs gh()):
+          # collect polls every host it dispatched to, on one pooled token.
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           FANOUT: ${{ steps.dispatch.outputs.fanout }}
           TIMEOUT_S: '2400'
         run: node scripts/ci/fanout.mjs collect
