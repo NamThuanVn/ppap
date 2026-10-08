@@ -612,29 +612,18 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: node scripts/agent/board/loop/unplanned.mjs
 
+      # A rate-limited dispatch skips the tick instead of failing the controller
+      # (ppap run 37741799957) — see the script's header.
       - name: Rel-planning gate
         id: relplan
         if: steps.probe.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
           UNPLANNED: ${{ steps.relsweep.outputs.unplanned }}
           READABLE: ${{ steps.relsweep.outputs.readable }}
-        run: |
-          set -euo pipefail
-          if [ "$READABLE" != "true" ]; then
-            echo "::notice::the backlog could not be read in full this tick — dispatching nothing rather than assuming every leaf is planned. The next tick re-asks."
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-          elif [ "$UNPLANNED" -gt 0 ]; then
-            echo "::notice::$UNPLANNED unplanned leaf/leaves — dispatching agent-rel-plan, deferring lane dispatch to its chain"
-            gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
-              -f event_type=agent-rel-plan \
-              -f client_payload[triggered_by]="${TRIGGERED_BY}"
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "✓ every open leaf is rel-planned"
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          fi
+        run: node scripts/agent/board/loop/relplan-gate.mjs
 
       # The sealed bundle a FLEET lane opens in its "Load lane config" step: this
       # repo's Claude pool + Telegram secrets + the AGENT_* settings, encrypted
