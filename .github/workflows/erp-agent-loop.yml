@@ -467,6 +467,13 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
+          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: node scripts/agent/board/recover/reap-merged-heads.mjs
 
       # ── Loop hold: the FIRST question, before the backlog matters ─────────
@@ -510,6 +517,10 @@ jobs:
         timeout-minutes: 5
         env:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
           AGENT_USAGE_PROBE: ${{ vars.AGENT_USAGE_PROBE || '1' }}
           AGENT_BLIND_LANES_PER_ACCOUNT: ${{ vars.AGENT_BLIND_LANES_PER_ACCOUNT || '2' }}
           # The rest of the pace-to-reset formula's tuning vars (laneBudget() in
@@ -637,6 +648,10 @@ jobs:
         env:
           PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
@@ -674,6 +689,13 @@ jobs:
           AGENT_LANE_HOSTS: ${{ vars.AGENT_LANE_HOSTS }}
           AGENT_LANES_PER_HOST: ${{ vars.AGENT_LANES_PER_HOST || '2' }}
           BUNDLE: ${{ env.LANE_BUNDLE }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
+          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: |
           set -euo pipefail
           node scripts/agent/board/loop/dispatch-lanes.mjs
@@ -777,6 +799,10 @@ jobs:
         env:
           PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
@@ -797,4 +823,11 @@ jobs:
           AGENT_LANE_HOSTS: ${{ vars.AGENT_LANE_HOSTS }}
           AGENT_LANES_PER_HOST: ${{ vars.AGENT_LANES_PER_HOST || '2' }}
           BUNDLE: ${{ env.LANE_BUNDLE }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
+          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: node scripts/agent/board/loop/dispatch-lanes.mjs
