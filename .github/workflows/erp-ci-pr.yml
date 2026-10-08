@@ -277,8 +277,10 @@ jobs:
           ref: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('refs/pull/{0}/merge', github.event.client_payload.pr_number || inputs.pr_number) || 'main' }}
           token: ${{ env.RESOLVED_PAT }}
           path: erp
+          # scripts/agent/board/lib: the fleet hub client progress.mjs reads in `on` mode.
           sparse-checkout: |
             scripts/ci
+            scripts/agent/board/lib
           sparse-checkout-cone-mode: false
 
       - name: Watch jobs and publish parts
@@ -290,6 +292,13 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           SELF_TOKEN: ${{ github.token }}
           PRIVATE_REPO: ${{ env.PRIVATE_REPO }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
+          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: |
           node erp/scripts/ci/progress.mjs \
             --pr "${{ github.event.client_payload.pr_number || inputs.pr_number }}" \
