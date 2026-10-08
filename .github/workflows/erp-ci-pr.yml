@@ -77,17 +77,26 @@ jobs:
           # which is the concentration the pool exists to prevent. Jobs shuffle
           # independently, so a fan-out spreads instead of stampeding onto one token.
           POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
-          BEST=''; BEST_REM=-1
+          # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+          # also names the account), never from /rate_limit: for these accounts that
+          # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+          # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+          # one account until GitHub refused it. Stop at the first account with GOOD calls
+          # left — still about one call per job, and the login comes with it.
+          GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
           while IFS= read -r T; do
             [ -n "$T" ] || continue
             echo "::add-mask::$T"
-            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
-                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+            R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
             case "$R" in ''|*[!0-9]*) continue ;; esac
-            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+            L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+            [ -n "$L" ] || continue
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+            [ "$R" -ge "$GOOD" ] && break
           done <<< "$POOL"
+          rm -f "$BODY"
           [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
-          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
           if [ "$BEST_REM" -lt 500 ]; then
@@ -249,17 +258,26 @@ jobs:
           # which is the concentration the pool exists to prevent. Jobs shuffle
           # independently, so a fan-out spreads instead of stampeding onto one token.
           POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
-          BEST=''; BEST_REM=-1
+          # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+          # also names the account), never from /rate_limit: for these accounts that
+          # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+          # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+          # one account until GitHub refused it. Stop at the first account with GOOD calls
+          # left — still about one call per job, and the login comes with it.
+          GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
           while IFS= read -r T; do
             [ -n "$T" ] || continue
             echo "::add-mask::$T"
-            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
-                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+            R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
             case "$R" in ''|*[!0-9]*) continue ;; esac
-            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+            L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+            [ -n "$L" ] || continue
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+            [ "$R" -ge "$GOOD" ] && break
           done <<< "$POOL"
+          rm -f "$BODY"
           [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
-          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
           if [ "$BEST_REM" -lt 500 ]; then
@@ -351,17 +369,26 @@ jobs:
           # which is the concentration the pool exists to prevent. Jobs shuffle
           # independently, so a fan-out spreads instead of stampeding onto one token.
           POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
-          BEST=''; BEST_REM=-1
+          # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+          # also names the account), never from /rate_limit: for these accounts that
+          # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+          # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+          # one account until GitHub refused it. Stop at the first account with GOOD calls
+          # left — still about one call per job, and the login comes with it.
+          GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
           while IFS= read -r T; do
             [ -n "$T" ] || continue
             echo "::add-mask::$T"
-            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
-                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+            R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
             case "$R" in ''|*[!0-9]*) continue ;; esac
-            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+            L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+            [ -n "$L" ] || continue
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+            [ "$R" -ge "$GOOD" ] && break
           done <<< "$POOL"
+          rm -f "$BODY"
           [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
-          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
           { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
           echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
           if [ "$BEST_REM" -lt 500 ]; then
