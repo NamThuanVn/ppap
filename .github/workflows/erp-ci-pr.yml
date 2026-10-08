@@ -452,7 +452,10 @@ jobs:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ env.RESOLVED_PAT }}
           ref: ${{ steps.digest_ref.outputs.ref }}
-          sparse-checkout: scripts/ci
+          # scripts/agent/board/lib: the fleet hub client `parts.mjs clear` reads in `on` mode.
+          sparse-checkout: |
+            scripts/ci
+            scripts/agent/board/lib
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -745,6 +748,13 @@ jobs:
           R_TEST: ${{ needs.checks.outputs.test }}
           R_E2E: ${{ needs.checks.outputs.e2e }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): in `on` the parts clear there.
+          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: |
           set +e -o pipefail
           [ -n "${PR_NUMBER:-}" ] || { echo "No PR number (manual dispatch?) — skipping PR report."; exit 0; }
@@ -998,6 +1008,8 @@ jobs:
           # served their purpose — remove them and leave the PR with exactly one
           # CI comment, as it looked before progressive reporting existed.
           # Best-effort by construction: a part we cannot delete is cosmetic.
+          # In hub `on` mode the parts live on the hub, not in comments, and this
+          # clears them there.
           node scripts/ci/parts.mjs clear --pr "$PR_NUMBER" --repo "$REPO" 2>/dev/null || true
           echo "▶ $MERGE_LINE"
           exit 0
