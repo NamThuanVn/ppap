@@ -251,6 +251,9 @@ jobs:
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           PRIVATE_REPO: ${{ env.PRIVATE_REPO }}
           ENVIRONMENT: ${{ inputs.environment }}
+          # Written once by "Record the deployed commit" after each successful
+          # deploy, so the normal path reads the baseline at no API cost.
+          LAST_DEPLOYED_SHA: ${{ inputs.environment == 'production' && vars.PRODUCTION_LAST_DEPLOYED_SHA || vars.STAGING_LAST_DEPLOYED_SHA }}
         run: |
           set -uo pipefail
           # Deployments list is newest-first. The current run's own Deployment is
@@ -281,14 +284,28 @@ jobs:
           }
           BASE=""
           WALKED=""
-          for t in "$GH_TOKEN" $(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$' | grep -vxF "$GH_TOKEN"); do
-            echo "::add-mask::$t"
-            if BASE=$(last_good "$t"); then
+          # Free read first. Trusted only if the commit is in this checkout (full
+          # history); an empty or unreachable value (first run, cleared, rewritten
+          # history) falls through to the walk below.
+          if [ -n "$LAST_DEPLOYED_SHA" ]; then
+            if git cat-file -e "$LAST_DEPLOYED_SHA^{commit}" 2>/dev/null; then
+              BASE="$LAST_DEPLOYED_SHA"
               WALKED=1
-              break
+              echo "✓ baseline = ${ENVIRONMENT^^}_LAST_DEPLOYED_SHA variable: $BASE (no Deployments API calls)"
+            else
+              echo "::warning::${ENVIRONMENT^^}_LAST_DEPLOYED_SHA=$LAST_DEPLOYED_SHA is not in this checkout — walking Deployments instead"
             fi
-            echo "::warning::deployments walk refused for one pooled account — trying the next"
-          done
+          fi
+          if [ -z "$BASE" ]; then
+            for t in "$GH_TOKEN" $(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$' | grep -vxF "$GH_TOKEN"); do
+              echo "::add-mask::$t"
+              if BASE=$(last_good "$t"); then
+                WALKED=1
+                break
+              fi
+              echo "::warning::deployments walk refused for one pooled account — trying the next"
+            done
+          fi
           if [ -n "$BASE" ]; then
             echo "✓ baseline = last successful $ENVIRONMENT deploy: $BASE"
           elif [ -n "$WALKED" ]; then
@@ -1218,6 +1235,23 @@ jobs:
             exit 0
           fi
           exit "$rc"
+
+      # The baseline for the next change-scoped deploy. Last step of the job, so it
+      # runs only if every tier above succeeded — a failed or cancelled deploy never
+      # moves it. Writes the head THIS run built and deployed (the checkout's HEAD),
+      # not main's tip now. One call. A failed write must not fail a deploy that
+      # shipped: the variable stays at its old (older, so safe) value and the next
+      # run just diffs a wider window.
+      - name: Record the deployed commit
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          VAR_NAME: ${{ inputs.environment == 'production' && 'PRODUCTION_LAST_DEPLOYED_SHA' || 'STAGING_LAST_DEPLOYED_SHA' }}
+          SHA: ${{ steps.sha.outputs.value }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh variable set "$VAR_NAME" --body "$SHA" -R "$REPO"
+          echo "✓ $VAR_NAME = $SHA"
 
   # ───────────────────────────────────────────────────────────────────────────
   # 5. Pingback. The dispatcher in the private repo created a *pending*
