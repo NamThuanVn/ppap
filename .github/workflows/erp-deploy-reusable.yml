@@ -123,6 +123,18 @@ on:
         required: false
       TELEGRAM_BUILD_THREAD_ID:
         required: false
+      # The ERP fleet hub's client credentials, forwarded to the ci-gate's
+      # erp-ci-checks.yml. With AGENT_HUB_MODE=on, `fanout.mjs collect` finds the
+      # fanned-out batch runs ONLY through the hub — without these it never sees
+      # one and fails closed after TIMEOUT_S (release v1.0.58, ppap run 37871578234).
+      ERP_HUB_CLIENT_ID_STAGING:
+        required: false
+      ERP_HUB_CLIENT_SECRET_STAGING:
+        required: false
+      ERP_HUB_CLIENT_ID_PRODUCTION:
+        required: false
+      ERP_HUB_CLIENT_SECRET_PRODUCTION:
+        required: false
 
 permissions: read-all
 
@@ -398,6 +410,10 @@ jobs:
       fleet: ${{ inputs.fleet }}
     secrets:
       PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+      ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+      ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+      ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+      ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
 
   # ───────────────────────────────────────────────────────────────────────────
   # 1. Read the CURRENT Terraform outputs (no apply — that happens as the first
