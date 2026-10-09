@@ -210,7 +210,13 @@ jobs:
           # can own the PR-CI wait on it (REPAIR_BRANCH → open_pr_for_claim,
           # for the turn that ends with no verdict at all; a turn that emitted
           # REPAIRED is waited out on the PR the verdict itself named).
-          echo "REPAIR_BRANCH=fix/ambulance-${FP}-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+          REPAIR_BRANCH=fix/ambulance-${FP}-${GITHUB_RUN_ID}
+          # Same-repo mode (FORK_REPO is upstream itself, ppap-github-app.md):
+          # under agent/, the only prefix any sweep may delete from upstream.
+          if [ "$(printf '%s' "$FORK_REPO" | tr '[:upper:]' '[:lower:]')" = 'namthuanvn/erp-namthuan' ]; then
+            REPAIR_BRANCH=agent/${REPAIR_BRANCH}
+          fi
+          echo "REPAIR_BRANCH=${REPAIR_BRANCH}" >> "$GITHUB_ENV"
           echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
           echo "· repairing fingerprint $FP — died in \"$STEP\" (attempt ${ATTEMPT})"
 

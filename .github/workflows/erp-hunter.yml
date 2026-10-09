@@ -269,7 +269,9 @@ jobs:
           REMAINING: ${{ steps.hunt.outputs.remaining }}
         run: |
           set -euo pipefail
-          BRANCH="chore/strip-timeouts-$(date -u +%Y%m%d)"
+          # Pushed straight into upstream, so under agent/ — the only prefix the
+          # merged-head delete and the sweeps take from upstream (ppap-github-app.md).
+          BRANCH="agent/chore/strip-timeouts-$(date -u +%Y%m%d)"
           git config user.name  'timeout-hunter'
           git config user.email 'noreply@github.com'
           git checkout -b "$BRANCH"
@@ -536,7 +538,7 @@ jobs:
           set -uo pipefail
           OPEN=$(gh pr list --repo NamThuanVn/erp-namthuan --state open \
                    --json number,headRefName,updatedAt \
-                   --jq '[.[] | select(.headRefName | startswith("chore/ci-noise"))]
+                   --jq '[.[] | select(.headRefName | startswith("chore/ci-noise") or startswith("agent/chore/ci-noise"))]
                          | sort_by(.updatedAt) | reverse' 2>/dev/null || echo '[]')
           N=$(printf '%s' "$OPEN" | jq 'length' 2>/dev/null || echo 0)
           if [ "${N:-0}" -eq 0 ]; then
@@ -826,10 +828,21 @@ jobs:
           # adopt guard and the 5-way sampling rule both key on, so a scratch
           # branch wearing it would be adopted by the next real run and
           # sampled five ways. `smoke/` is outside every one of those rules.
+          #
           if [ "${SMOKE:-}" = "true" ]; then
             BRANCH="smoke/hunter-${GITHUB_RUN_ID}"
           else
             BRANCH="${OPEN_BRANCH:-chore/ci-noise-$(date -u +%Y%m%d-%H%M)}"
+          fi
+          # Same-repo mode (FORK_REPO is upstream itself, ppap-github-app.md):
+          # every branch goes under agent/, the only prefix any sweep may delete
+          # from upstream. The adopt guard and the routing rule accept both
+          # forms; the literals above stay bare so parallel-rule.mjs reads them.
+          if [ "$(printf '%s' "$FORK_REPO" | tr '[:upper:]' '[:lower:]')" = 'namthuanvn/erp-namthuan' ]; then
+            case "$BRANCH" in
+              agent/*) ;;
+              *) BRANCH=agent/${BRANCH} ;;
+            esac
           fi
           git remote rename origin upstream
           git remote add origin "https://github.com/${FORK_REPO}.git"
@@ -1065,7 +1078,7 @@ jobs:
         run: |
           set -uo pipefail
           case "${BRANCH:-}" in
-            smoke/*) ;;
+            smoke/* | agent/smoke/*) ;;
             *) echo "::warning::refusing to delete '${BRANCH:-}' — smoke only ever deletes a smoke/ branch"; exit 0 ;;
           esac
           gh api -X DELETE "repos/${FORK_REPO}/git/refs/heads/${BRANCH}" >/dev/null 2>&1 \
