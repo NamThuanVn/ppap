@@ -89,6 +89,12 @@ on:
       # system to one account's quota and looked healthy doing it.
       PAT_TOKEN_POOL:
         required: true
+      # The fleet's GitHub App (ppap-github-app.md) — used only when the repo
+      # variable FLEET_AUTH_MODE is `app`; optional so the pool keeps working without them.
+      FLEET_APP_ID:
+        required: false
+      FLEET_APP_PRIVATE_KEY:
+        required: false
       # The ERP fleet hub's client credentials (scripts/agent/board/lib/hub.mjs),
       # read by `fanout.mjs collect` when AGENT_HUB_MODE is shadow or on. Optional:
       # unset simply leaves the hub off for this run.
@@ -165,39 +171,68 @@ jobs:
       - name: Resolve PAT from pool
         env:
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
         run: |
           set -uo pipefail
-          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
-          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
-          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
-          # account reads 5000 — so one account served every job while the rest idled,
-          # which is the concentration the pool exists to prevent. Jobs shuffle
-          # independently, so a fan-out spreads instead of stampeding onto one token.
-          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
-          # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
-          # also names the account), never from /rate_limit: for these accounts that
-          # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
-          # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
-          # one account until GitHub refused it. Stop at the first account with GOOD calls
-          # left — still about one call per job, and the login comes with it.
-          GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
-          while IFS= read -r T; do
-            [ -n "$T" ] || continue
-            echo "::add-mask::$T"
-            H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
-            R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
-            case "$R" in ''|*[!0-9]*) continue ;; esac
-            L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
-            [ -n "$L" ] || continue
-            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
-            [ "$R" -ge "$GOOD" ] && break
-          done <<< "$POOL"
-          rm -f "$BODY"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
-          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
-          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
-          if [ "$BEST_REM" -lt 500 ]; then
-            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
           fi
           exit 0
 
@@ -356,39 +391,68 @@ jobs:
       - name: Resolve PAT from pool
         env:
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
         run: |
           set -uo pipefail
-          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
-          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
-          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
-          # account reads 5000 — so one account served every job while the rest idled,
-          # which is the concentration the pool exists to prevent. Jobs shuffle
-          # independently, so a fan-out spreads instead of stampeding onto one token.
-          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
-          # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
-          # also names the account), never from /rate_limit: for these accounts that
-          # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
-          # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
-          # one account until GitHub refused it. Stop at the first account with GOOD calls
-          # left — still about one call per job, and the login comes with it.
-          GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
-          while IFS= read -r T; do
-            [ -n "$T" ] || continue
-            echo "::add-mask::$T"
-            H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
-            R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
-            case "$R" in ''|*[!0-9]*) continue ;; esac
-            L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
-            [ -n "$L" ] || continue
-            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
-            [ "$R" -ge "$GOOD" ] && break
-          done <<< "$POOL"
-          rm -f "$BODY"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
-          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
-          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
-          if [ "$BEST_REM" -lt 500 ]; then
-            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
           fi
           exit 0
 
@@ -524,39 +588,68 @@ jobs:
       - name: Resolve PAT from pool
         env:
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
         run: |
           set -uo pipefail
-          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
-          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
-          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
-          # account reads 5000 — so one account served every job while the rest idled,
-          # which is the concentration the pool exists to prevent. Jobs shuffle
-          # independently, so a fan-out spreads instead of stampeding onto one token.
-          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
-          # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
-          # also names the account), never from /rate_limit: for these accounts that
-          # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
-          # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
-          # one account until GitHub refused it. Stop at the first account with GOOD calls
-          # left — still about one call per job, and the login comes with it.
-          GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
-          while IFS= read -r T; do
-            [ -n "$T" ] || continue
-            echo "::add-mask::$T"
-            H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
-            R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
-            case "$R" in ''|*[!0-9]*) continue ;; esac
-            L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
-            [ -n "$L" ] || continue
-            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
-            [ "$R" -ge "$GOOD" ] && break
-          done <<< "$POOL"
-          rm -f "$BODY"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
-          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
-          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
-          if [ "$BEST_REM" -lt 500 ]; then
-            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
           fi
           exit 0
 
@@ -697,39 +790,68 @@ jobs:
       - name: Resolve PAT from pool
         env:
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
         run: |
           set -uo pipefail
-          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
-          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
-          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
-          # account reads 5000 — so one account served every job while the rest idled,
-          # which is the concentration the pool exists to prevent. Jobs shuffle
-          # independently, so a fan-out spreads instead of stampeding onto one token.
-          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
-          # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
-          # also names the account), never from /rate_limit: for these accounts that
-          # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
-          # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
-          # one account until GitHub refused it. Stop at the first account with GOOD calls
-          # left — still about one call per job, and the login comes with it.
-          GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
-          while IFS= read -r T; do
-            [ -n "$T" ] || continue
-            echo "::add-mask::$T"
-            H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
-            R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
-            case "$R" in ''|*[!0-9]*) continue ;; esac
-            L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
-            [ -n "$L" ] || continue
-            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
-            [ "$R" -ge "$GOOD" ] && break
-          done <<< "$POOL"
-          rm -f "$BODY"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
-          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
-          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
-          if [ "$BEST_REM" -lt 500 ]; then
-            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
           fi
           exit 0
 
@@ -806,39 +928,68 @@ jobs:
       - name: Resolve PAT from pool
         env:
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
         run: |
           set -uo pipefail
-          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
-          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
-          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
-          # account reads 5000 — so one account served every job while the rest idled,
-          # which is the concentration the pool exists to prevent. Jobs shuffle
-          # independently, so a fan-out spreads instead of stampeding onto one token.
-          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
-          # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
-          # also names the account), never from /rate_limit: for these accounts that
-          # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
-          # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
-          # one account until GitHub refused it. Stop at the first account with GOOD calls
-          # left — still about one call per job, and the login comes with it.
-          GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
-          while IFS= read -r T; do
-            [ -n "$T" ] || continue
-            echo "::add-mask::$T"
-            H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
-            R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
-            case "$R" in ''|*[!0-9]*) continue ;; esac
-            L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
-            [ -n "$L" ] || continue
-            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
-            [ "$R" -ge "$GOOD" ] && break
-          done <<< "$POOL"
-          rm -f "$BODY"
-          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
-          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
-          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
-          if [ "$BEST_REM" -lt 500 ]; then
-            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
           fi
           exit 0
 
