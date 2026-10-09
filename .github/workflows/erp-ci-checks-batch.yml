@@ -297,4 +297,13 @@ jobs:
         env:
           SUITE: ${{ matrix.unit.suite }}
           SHARD: ${{ matrix.unit.shard }}
+          # The token step exports these for the job (GitHub App mode,
+          # ppap-github-app.md). The suites under test must run in pool mode
+          # whatever the job authenticates as, and the PR's own test harness
+          # may predate the scrub in scripts/tests/_helpers (its merge ref is
+          # built lazily) — so clear them HERE, in a file that always comes
+          # from main. ppap run 37887832980: a stale merge ref, red on
+          # pat-pool.test.sh and execute-blocked.test.mjs.
+          FLEET_AUTH_MODE: ''
+          FLEET_APP_DIR: ''
         run: bash ./scripts/ci/checks/run-shard.sh "$SUITE" "$SHARD"
