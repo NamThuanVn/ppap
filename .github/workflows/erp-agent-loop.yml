@@ -606,6 +606,9 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           COUNT_ONLY: '1'
+          # The probe and the claim walk must see the same cap, or the probe counts
+          # items the lanes refuse (claimable.mjs header). Unset → todo.mjs default.
+          AGENT_SIBLING_CAP: ${{ vars.AGENT_SIBLING_CAP }}
           # In scope even though COUNT_ONLY never touches the fork: every step
           # that runs a board script passes it, so nothing depends on which code
           # path happens to avoid it. scripts/gate/ci/agent-board-env.mjs enforces.
