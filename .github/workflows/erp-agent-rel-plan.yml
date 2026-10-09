@@ -284,12 +284,16 @@ jobs:
 
       # Deterministic enforcement: any leaf still unplanned → red job → no
       # chain (loop stalls safely; Telegram fires). Never label-backfill here —
-      # a rel-planned mark must mean a real assessment happened.
+      # a rel-planned mark must mean a real assessment happened. SCOPE limits
+      # the recount to the leaves the session was handed: one filed mid-session
+      # is not the planner's failure (it held the fleet on 2026-10-09) — the
+      # loop gate finds it next tick and re-dispatches planning.
       - name: Re-sweep after planning
         id: recount
         if: steps.plangate.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          SCOPE: ${{ steps.sweep.outputs.numbers }}
         run: node scripts/agent/board/loop/unplanned.mjs
 
       - name: Verify plan coverage
