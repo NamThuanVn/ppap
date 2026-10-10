@@ -402,6 +402,7 @@ jobs:
           PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           FLEET_APP_ID: ${{ secrets.FLEET_APP_ID }}
           FLEET_APP_PRIVATE_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          PPAP_CI_REPOS: ${{ vars.PPAP_CI_REPOS }}
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
