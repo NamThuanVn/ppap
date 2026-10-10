@@ -1,6 +1,14 @@
 {
   "jobs": [
     {
+      "id": "sweep-conflicts",
+      "workflow": "erp-agent-sweep-conflicts.yml",
+      "enabled": true,
+      "mode": "interval",
+      "everyMin": 15,
+      "inputs": {}
+    },
+    {
       "id": "new-org-warmup",
       "workflow": "erp-new-org-warmup.yml",
       "enabled": false,
