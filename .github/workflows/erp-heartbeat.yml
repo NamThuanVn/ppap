@@ -400,13 +400,19 @@ jobs:
           PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           FLEET_APP_ID: ${{ secrets.FLEET_APP_ID }}
           FLEET_APP_PRIVATE_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
-          PPAP_CI_REPOS: ${{ vars.PPAP_CI_REPOS }}
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
           ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
-        run: node decider/scripts/ci/ppap/pool-usage.mjs report
+        # PPAP_CI_REPOS is an erp-namthuan variable; `vars.PPAP_CI_REPOS` is
+        # empty in this repo, so the hub never got the fleet list and the Jobs
+        # card stayed "inferred". Read it at run time, as erp-hunter.yml does.
+        run: |
+          PPAP_CI_REPOS="$(gh api repos/NamThuanVn/erp-namthuan/actions/variables/PPAP_CI_REPOS --jq .value 2>/dev/null || true)"
+          [ -n "$PPAP_CI_REPOS" ] || echo "::warning::could not read PPAP_CI_REPOS from NamThuanVn/erp-namthuan — the hub keeps its last fleet list"
+          export PPAP_CI_REPOS
+          node decider/scripts/ci/ppap/pool-usage.mjs report
 
       # The agent loop's actual signal. erp-agent-loop.yml triggers on this
       # workflow's `workflow_run: [completed]`, so reaching this step at all is
