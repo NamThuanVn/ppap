@@ -1,19 +1,19 @@
-name: ERP · Agent · loop
+name: ERP · Pit wall
 
 # Top-up controller for the self-perpetuating /clear-todo agent loop.
 # Level-triggered: EVERY invocation recomputes K = min(candidates, cap − active)
-# from live API state and fires K repository_dispatch[agent-todo] events at its
-# own repo (erp-agent-clear-todo.yml). It never carries state between invocations,
+# from live API state and fires K repository_dispatch[agent-car] events at its
+# own repo (erp-agent-car.yml). It never carries state between invocations,
 # so a lost or coalesced trigger is harmless — the next one recounts.
 #
 # Invoked several ways (all end up here):
 #   · manually — workflow_dispatch on this workflow (gh workflow run
-#     erp-agent-loop.yml -R NamThuanVn/ppap);
+#     erp-agent-pit-wall.yml -R NamThuanVn/ppap);
 #   · by ba-to-issues.yml in the private repo after a merged BA-docs PR minted
 #     at least one sweepable (`bug`/`task`) issue;
 #   · by each agent run that EXECUTED a solve-verdict (MERGED / PARK / SPLIT /
 #     ABANDONED / BLOCKED with green executor steps) — the "Continue loop" step in
-#     erp-agent-clear-todo.yml chains the next lane immediately (lowest latency);
+#     erp-agent-car.yml chains the next lane immediately (lowest latency);
 #   · by the `workflow_run` trigger on ANY agent-clear-todo / rel-plan
 #     completion — success, failure, cancelled, or spot-reclaimed. This is what
 #     catches a run that DIED (the "Continue loop" step never fired) and
@@ -22,10 +22,10 @@ name: ERP · Agent · loop
 #     so a one-shot manual run doesn't auto-start the loop. Termination still
 #     holds: when the backlog drains the probe dispatches 0, so no new run is
 #     created → no new completion → nothing re-triggers;
-#   · by erp-agent-rel-plan.yml after a successful planning pass — the
+#   · by erp-agent-qualifying.yml after a successful planning pass — the
 #     rel-planning gate below defers lane dispatch to that chain whenever any
 #     open BA leaf still lacks the `rel-planned` marker;
-#   · by the `workflow_run` completion of erp-heartbeat.yml (also in the
+#   · by the `workflow_run` completion of erp-race-clock.yml (also in the
 #     workflow_run list above) — a rare 15-min backstop for the
 #     controller-self-reclaim gap, kept in its own workflow so it can be toggled
 #     on/off from the Actions UI independently.
@@ -53,7 +53,7 @@ name: ERP · Agent · loop
 # heartbeat, or a chained dispatch), and GitHub attributes those to the
 # workflow's last committer — misleading. The native "triggered by <identity>"
 # line already shows the real dispatcher underneath.
-run-name: 'ERP · Agent · loop'
+run-name: 'ERP · Pit wall'
 
 on:
   # Primary recovery trigger: re-probe after EVERY agent-clear-todo / rel-plan
@@ -80,7 +80,7 @@ on:
   # lane completion is: an ambulance that dies without a verdict must still
   # re-arm the controller. That cannot loop, because the attempt is charged at
   # DISPATCH (scripts/agent/board/pit-wall/gate.mjs), not at verdict.
-  # "ERP · Heartbeat" is the 15-min tick, now driven by the ERP's own Cloudflare
+  # "ERP · Race clock" is the 15-min tick, now driven by the ERP's own Cloudflare
   # cron rather than a GitHub `schedule:` block (GitHub delayed and dropped those
   # — see that file's header). It fans out to the due scheduled workflows and
   # then completes; this workflow_run entry IS how its tick reaches the loop (no
@@ -101,19 +101,19 @@ on:
   workflow_run:
     workflows:
       [
-        'ERP · Agent · clear-todo-issue',
-        'ERP · Agent · rel-plan',
+        'ERP · Car',
+        'ERP · Qualifying',
         'ERP · Agent · ambulance',
-        'ERP · Heartbeat',
+        'ERP · Race clock',
       ]
     types: [completed]
   repository_dispatch:
-    types: [agent-loop]
+    types: [agent-pit-wall]
   workflow_dispatch:
     # A non-empty `item` is a ONE-SHOT manual lane (the "Start lane" dialog on
-    # /settings/agent-control): the `manual-lane` job below places it on a host
+    # /settings/agent-control): the `wildcard-car` job below places it on a host
     # and seals the bundle for it, and the loop's controller does not run. It
-    # comes through here rather than straight to erp-agent-clear-todo.yml
+    # comes through here rather than straight to erp-agent-car.yml
     # because only this repo holds the secrets a fleet lane must be handed.
     inputs:
       item:
@@ -139,16 +139,16 @@ permissions: read-all
 # recounts everything from live state. cancel-in-progress stays false: an
 # in-flight dispatch burst must never be killed halfway.
 #
-# A manual lane gets a group of its own: queued behind `agent-loop`, the next
+# A manual lane gets a group of its own: queued behind `pit-wall`, the next
 # controller tick would REPLACE it and the requested item would silently never
 # start.
 concurrency:
-  group: ${{ (inputs.item || '') != '' && format('agent-lane-manual-{0}', github.run_id) || 'agent-loop' }}
+  group: ${{ (inputs.item || '') != '' && format('wildcard-car-{0}', github.run_id) || 'pit-wall' }}
   cancel-in-progress: false
 
 env:
   PRIVATE_REPO: NamThuanVn/erp-namthuan
-  AGENT_WORKFLOW: erp-agent-clear-todo.yml
+  AGENT_WORKFLOW: erp-agent-car.yml
 
 jobs:
   controller:
@@ -159,11 +159,11 @@ jobs:
     # manual agent-clear-todo (workflow_dispatch — a human debugging a single
     # item) must NOT auto-start the loop. Non-workflow_run triggers
     # (repository_dispatch, workflow_dispatch on THIS workflow) always proceed.
-    # A manual lane (`item` set) is the `manual-lane` job's, never a tick.
+    # A manual lane (`item` set) is the `wildcard-car` job's, never a tick.
     if: >-
       (inputs.item || '') == '' && (
         github.event_name != 'workflow_run' ||
-        github.event.workflow_run.name == 'ERP · Heartbeat' ||
+        github.event.workflow_run.name == 'ERP · Race clock' ||
         github.event.workflow_run.event == 'repository_dispatch'
       )
     runs-on: ubuntu-latest
@@ -179,7 +179,7 @@ jobs:
       # from the dead-lane sweep to the stranded sweep through it). Set at STEP
       # level, never in `jobs.<id>.env`: `runner` is not a context there, and
       # GitHub rejects the whole workflow file rather than evaluating it to empty
-      # — see the same note in erp-agent-clear-todo.yml.
+      # — see the same note in erp-agent-car.yml.
       - name: Pin the harness state dir
         run: |
           set -euo pipefail
@@ -397,7 +397,7 @@ jobs:
       #
       # Stranded-claim sweep — release items whose backing run is provably dead
       # (assigned to us + In Progress/Todo + last claimed > STRANDED_HOURS ago,
-      # which must exceed erp-agent-clear-todo.yml's timeout-minutes). A hosted-
+      # which must exceed erp-agent-car.yml's timeout-minutes). A hosted-
       # runner reclaim skips the in-job tow-in-or-revert (always() does not
       # survive a runner shutdown), stranding the item; this is the decoupled
       # backstop. Runs BEFORE the count so a released item is a candidate this
@@ -564,7 +564,7 @@ jobs:
           # The rest of the pace-to-reset formula's tuning vars (laneBudget() in
           # scripts/agent/run/usage.mjs) — defaults here MUST agree with that
           # file's DEFAULT_* constants and claude.sh's own fallbacks, and with
-          # erp-agent-clear-todo.yml's job-level env (same vars, same defaults).
+          # erp-agent-car.yml's job-level env (same vars, same defaults).
           AGENT_MAX_5H_PCT: ${{ vars.AGENT_MAX_5H_PCT || '90' }}
           AGENT_MAX_7D_PCT: ${{ vars.AGENT_MAX_7D_PCT || '95' }}
           AGENT_WARN_5H_PCT: ${{ vars.AGENT_WARN_5H_PCT || '75' }}
@@ -634,8 +634,8 @@ jobs:
       # Rel-planning gate: lanes must not start while ANY open BA leaf lacks
       # the `rel-planned` marker — the scripted claim respects blockedBy edges
       # but PLANNING is what sets them (Phase 0-pre's planning half, shared
-      # skill /order-todo-queue). Unplanned leaves → dispatch ONE agent-rel-plan
-      # run INSTEAD of lanes; on success it re-dispatches agent-loop, and this
+      # skill /order-todo-queue). Unplanned leaves → dispatch ONE agent-qualifying
+      # run INSTEAD of lanes; on success it re-dispatches agent-pit-wall, and this
       # gate then passes. All three kinds are swept (a bug can be blocked by a
       # feature) by scripts/agent/board/pit-wall/unplanned.mjs, which the planner's
       # sweep and its coverage recount call too — one definition, so the gate
@@ -645,7 +645,7 @@ jobs:
       # An unreadable backlog dispatches NOTHING: a count that silently missed
       # a label reads as "all planned" and would send lanes at unplanned work.
       # Duplicate gate dispatches coalesce
-      # in agent-rel-plan's concurrency group (the extra run no-ops + chains).
+      # in agent-qualifying's concurrency group (the extra run no-ops + chains).
       - name: Sweep unplanned leaves
         id: relsweep
         if: steps.probe.outputs.proceed == 'true'
@@ -770,13 +770,13 @@ jobs:
 
   # ONE lane on a named item, from the "Start lane" dialog on
   # /settings/agent-control — outside the loop's cap, gates and backlog, exactly
-  # as the dialog always behaved when it dispatched erp-agent-clear-todo.yml
+  # as the dialog always behaved when it dispatched erp-agent-car.yml
   # directly. It routes through here now because a lane may run on a CI-fleet
   # repo, and only this repo can seal the bundle such a lane needs. Placement is
   # the controller's (scripts/agent/board/pit-wall/dispatch-cars.mjs with ITEM set):
   # K is exactly 1, `loop` is false, so the lane never chains.
-  manual-lane:
-    name: Start a manual lane
+  wildcard-car:
+    name: Start a wildcard car
     if: github.event_name == 'workflow_dispatch' && inputs.item != ''
     runs-on: ubuntu-latest
     timeout-minutes: 5

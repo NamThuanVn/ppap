@@ -1,9 +1,9 @@
-name: ERP · Fleet · Warm-up scheduler
+name: ERP · Warm-up laps
 
 # ONE hourly run that decides which CI-fleet orgs still need their concurrency
-# ceiling proven, and dispatches erp-ci-warmup.yml to just those.
+# ceiling proven, and dispatches erp-inspection-warm-up.yml to just those.
 #
-# WHY IT IS CENTRAL. erp-ci-warmup.yml measures an org's real concurrent-job ceiling
+# WHY IT IS CENTRAL. erp-inspection-warm-up.yml measures an org's real concurrent-job ceiling
 # into that org's own E2E_HOST_CEILING variable, which is what lets
 # scripts/ci/fanout.mjs size the host's e2e batch instead of guessing (see
 # ppap-ci-fleet.md § CI fan-out). It used to carry its OWN hourly cron, so all
@@ -41,12 +41,12 @@ name: ERP · Fleet · Warm-up scheduler
 on:
   # No `schedule:`. The hourly clock moved OUT of GitHub — it delayed the
   # schedule EVENT at its own scheduler and dropped ticks it could not place.
-  # erp-heartbeat.yml dispatches the WRAPPER erp-new-org-warmup.yml (catalogue id
+  # erp-race-clock.yml dispatches the WRAPPER erp-rookie.yml (catalogue id
   # `new-org-warmup`) when its last run is over an hour old, driven by a
   # Cloudflare cron on the ERP's service-utilities worker. The whole-fleet
   # catalogue job was retired once every PPAP_CI_REPOS org measured 20, so this
   # workflow_dispatch trigger is now manual-only — dispatch it by hand to re-probe
-  # the live fleet. See erp-heartbeat.yml's header, and `/settings/agent-control`
+  # the live fleet. See erp-race-clock.yml's header, and `/settings/agent-control`
   # in the ERP for the on/off switch.
   workflow_dispatch:
     inputs:
@@ -65,7 +65,7 @@ on:
         required: false
         default: false
         type: boolean
-  # erp-new-org-warmup.yml calls this with list_var=PPAP_WARMUP_REPOS — new orgs
+  # erp-rookie.yml calls this with list_var=PPAP_WARMUP_REPOS — new orgs
   # warmed BEFORE they join PPAP_CI_REPOS, so routing, fan-out and agent lanes
   # never hand real work to a 5-slot org. Same decision, a different list.
   workflow_call:

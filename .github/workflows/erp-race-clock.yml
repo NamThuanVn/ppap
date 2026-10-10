@@ -1,4 +1,4 @@
-name: ERP · Heartbeat
+name: ERP · Race clock
 
 # The fleet's tick. Triggered by the ERP, not by GitHub.
 #
@@ -25,7 +25,7 @@ name: ERP · Heartbeat
 #      Due-ness is decided by asking GitHub when each last ran, not by wall-clock
 #      arithmetic on this run's start time — a tick that arrives late must not
 #      skip a day, and a re-run must not double-fire.
-#   2. Completes. That completion IS the agent-loop signal: erp-agent-loop.yml
+#   2. Completes. That completion IS the agent-pit-wall signal: erp-agent-pit-wall.yml
 #      lists this workflow in its `workflow_run` trigger, so no dispatch call is
 #      needed for the loop itself.
 #
@@ -49,7 +49,7 @@ permissions: read-all
 # a superseded tick can be killed between deciding that the hunter is due and
 # dispatching it, silently dropping that day's run.
 concurrency:
-  group: erp-heartbeat
+  group: race-clock
   cancel-in-progress: false
 
 jobs:
@@ -202,7 +202,7 @@ jobs:
           AGENT_LANE_HOSTS: ${{ vars.AGENT_LANE_HOSTS }}
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}
           CATALOGUE_OUTCOME: ${{ steps.catalogue.outcome }}
-          CATALOGUE_FILE: catalogue/.github/workflows/erp-heartbeat-schedule.json
+          CATALOGUE_FILE: catalogue/.github/workflows/erp-race-calendar.json
           # WHAT runs WHEN is data, not code: a JSON job list in this repo
           # variable, edited from the ERP's "AI agent control" page
           # (/settings/agent-control). Unset or unreadable means the catalogue as-is —
@@ -289,7 +289,7 @@ jobs:
             # so the workspace root has no git remote for gh to infer from —
             # and before that fix, the decider checkout (no `path:` then) put
             # NamThuanVn/erp-namthuan there instead of this ppap repo. Every
-            # dispatch then 404'd ("workflow erp-hunter.yml not found on the
+            # dispatch then 404'd ("workflow erp-police.yml not found on the
             # default branch") as a ::warning:: on a green run, so the hunter and
             # the fleet warmup went unrun for days without anyone noticing.
             # shellcheck disable=SC2086 — FLAGS is a flag LIST and must word-split.
@@ -305,7 +305,7 @@ jobs:
       # (the ERP's Start/Stop crazy mode writes them). This is the restore
       # side — runs every tick regardless of what the fan-out above dispatched,
       # because crazy mode is a fleet-wide cap, not a per-workflow setting.
-      # erp-agent-loop.yml's own "Resolve cap" step covers the gap between an
+      # erp-agent-pit-wall.yml's own "Resolve cap" step covers the gap between an
       # expiry and the next tick landing here (up to 15 minutes).
       - name: Restore cap after crazy mode expires
         env:
@@ -348,8 +348,8 @@ jobs:
       # God mode's expiry (issue #4744, this slice #4789) mirrors the crazy-mode
       # step above, minus the restore: god mode never writes AGENT_MAX_PARALLEL
       # (it only replaces the effective cap for one loop run — see
-      # erp-agent-loop.yml's "Resolve cap"), so there is nothing to restore when
-      # it expires, only the pair to clear. erp-agent-loop.yml's own "Resolve
+      # erp-agent-pit-wall.yml's "Resolve cap"), so there is nothing to restore when
+      # it expires, only the pair to clear. erp-agent-pit-wall.yml's own "Resolve
       # cap" step covers the gap between an expiry and the next tick landing
       # here (up to 15 minutes).
       - name: Clear god mode after it expires
@@ -407,15 +407,15 @@ jobs:
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         # PPAP_CI_REPOS is an erp-namthuan variable; `vars.PPAP_CI_REPOS` is
         # empty in this repo, so the hub never got the fleet list and the Jobs
-        # card stayed "inferred". Read it at run time, as erp-hunter.yml does.
+        # card stayed "inferred". Read it at run time, as erp-police.yml does.
         run: |
           PPAP_CI_REPOS="$(gh api repos/NamThuanVn/erp-namthuan/actions/variables/PPAP_CI_REPOS --jq .value 2>/dev/null || true)"
           [ -n "$PPAP_CI_REPOS" ] || echo "::warning::could not read PPAP_CI_REPOS from NamThuanVn/erp-namthuan — the hub keeps its last fleet list"
           export PPAP_CI_REPOS
           node decider/scripts/ci/ppap/pool-usage.mjs report
 
-      # The agent loop's actual signal. erp-agent-loop.yml triggers on this
+      # The agent loop's actual signal. erp-agent-pit-wall.yml triggers on this
       # workflow's `workflow_run: [completed]`, so reaching this step at all is
       # what re-arms the controller — there is no dispatch call on this side.
       - name: Tick
-        run: echo "✓ heartbeat tick — agent-loop re-probes on this run's workflow_run completion"
+        run: echo "✓ heartbeat tick — agent-pit-wall re-probes on this run's workflow_run completion"

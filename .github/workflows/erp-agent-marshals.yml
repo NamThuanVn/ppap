@@ -1,12 +1,12 @@
-name: ERP · Agent · sweep conflicting lane PRs
+name: ERP · Marshals · clear crashed-car PRs
 
 # Reconciles a CONFLICTING `agent/*` PR whose lane has already ENDED, with no model
 # turn (issue #5788). A lane still waiting on its own PR's CI reconciles it itself
 # (scripts/agent/run/lib/reconcile.sh); this covers the PRs nobody is waiting on.
 # Design and the never-push-under-a-live-lane rule: scripts/agent/merge/sweep-conflicts.mjs.
 #
-# No `schedule:` — the ERP's Cloudflare cron fires erp-heartbeat.yml, which
-# dispatches this every 15 minutes (erp-heartbeat-schedule.json). `workflow_dispatch`
+# No `schedule:` — the ERP's Cloudflare cron fires erp-race-clock.yml, which
+# dispatches this every 15 minutes (erp-race-calendar.json). `workflow_dispatch`
 # is also how a human forces a sweep.
 #
 # The push uses the resolved App/pool token, never GITHUB_TOKEN: a push made with
@@ -19,7 +19,7 @@ on:
 permissions: read-all
 
 concurrency:
-  group: erp-agent-sweep-conflicts
+  group: erp-agent-marshals
   cancel-in-progress: false
 
 jobs:

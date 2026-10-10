@@ -7,7 +7,7 @@ name: ERP · Agent · ambulance
 # install`, `pnpm worktree:init`, the claim script, an executor — the fault is
 # shared and deterministic: every lane and every item would die at the same step.
 # Before this workflow existed the harness filed that as an item fault, released
-# the untouched item to Todo, and agent-loop's `workflow_run: [completed]`
+# the untouched item to Todo, and agent-pit-wall's `workflow_run: [completed]`
 # trigger re-probed on the very failure — so the fleet re-spun at bootstrap pace
 # until a human noticed Telegram and flipped AGENT_MAX_PARALLEL=0.
 #
@@ -15,7 +15,7 @@ name: ERP · Agent · ambulance
 # dispatching lanes, and dispatches ONE of these instead. Fix the problem before
 # continuing the loop.
 #
-# THE PIPELINE (mirrors erp-agent-clear-todo.yml's shape, one layer thinner):
+# THE PIPELINE (mirrors erp-agent-car.yml's shape, one layer thinner):
 #   1. Materialise the hold  — vars.AGENT_LOOP_HOLD → $AGENT_STATE_DIR/hold.json,
 #      which is what /repair-harness reads. Refuses to run without one.
 #   2. /repair-harness       — reproduce the fault on this runner, fix the root
@@ -30,7 +30,7 @@ name: ERP · Agent · ambulance
 #      failure. STUCK is the safe direction — it KEEPS the hold, so a garbled
 #      ambulance cannot hand a broken fleet its lanes back.
 #   4. execute-repair        — REPAIRED (API-verified merge) / TRANSIENT → clear
-#      the hold + re-dispatch agent-loop. STUCK → record the diagnosis; the
+#      the hold + re-dispatch agent-pit-wall. STUCK → record the diagnosis; the
 #      controller sends an escalated attempt, or parks at the cap.
 #
 # LIGHT BOOTSTRAP on purpose: checkout, node/pnpm, gh, Claude CLI. No Playwright,

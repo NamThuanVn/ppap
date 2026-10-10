@@ -2,7 +2,7 @@
   "jobs": [
     {
       "id": "sweep-conflicts",
-      "workflow": "erp-agent-sweep-conflicts.yml",
+      "workflow": "erp-agent-marshals.yml",
       "enabled": true,
       "mode": "interval",
       "everyMin": 15,
@@ -10,7 +10,7 @@
     },
     {
       "id": "new-org-warmup",
-      "workflow": "erp-new-org-warmup.yml",
+      "workflow": "erp-rookie.yml",
       "enabled": false,
       "mode": "interval",
       "everyMin": 60,
@@ -18,7 +18,7 @@
     },
     {
       "id": "hunter",
-      "workflow": "erp-hunter.yml",
+      "workflow": "erp-police.yml",
       "repo": "@fleet",
       "enabled": true,
       "mode": "slot",
@@ -67,10 +67,10 @@
     }
   ],
   "claudeWorkflows": [
-    { "workflow": "erp-agent-clear-todo.yml", "kind": "lane" },
-    { "workflow": "erp-hunter.yml", "kind": "hunter" },
+    { "workflow": "erp-agent-car.yml", "kind": "lane" },
+    { "workflow": "erp-police.yml", "kind": "hunter" },
     { "workflow": "erp-agent-ambulance.yml", "kind": "ambulance" },
-    { "workflow": "erp-agent-rel-plan.yml", "kind": "rel-plan" },
+    { "workflow": "erp-agent-qualifying.yml", "kind": "rel-plan" },
     { "workflow": "erp-release-notes.yml", "kind": "release-notes" }
   ]
 }

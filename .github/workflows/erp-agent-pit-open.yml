@@ -1,4 +1,4 @@
-name: ERP · Agent · wake
+name: ERP · Pit open
 
 # Timed wake-up for a pool-exhausted hold (issue #4744, this slice #4791).
 #
@@ -11,9 +11,9 @@ name: ERP · Agent · wake
 # wrote gets here.
 #
 # This sleeps until `at`, then fires the loop's own
-# `repository_dispatch[agent-loop]` (erp-agent-loop.yml) — so dispatch resumes
+# `repository_dispatch[agent-pit-wall]` (erp-agent-pit-wall.yml) — so dispatch resumes
 # within ~2 minutes of the window reopening, in EVERY mode (normal, crazy,
-# god), instead of waiting for the next 15-minute `ERP · Heartbeat` tick.
+# god), instead of waiting for the next 15-minute `ERP · Race clock` tick.
 #
 # CHUNKED SLEEP. A GitHub-hosted runner hard-caps a single job at 6h of
 # execution, but a weekly (7-day) usage-window reset can be days away
@@ -38,7 +38,7 @@ permissions: read-all
 # self-chained re-dispatch past the 6h chunk lands on this same group too, so a
 # stray duplicate queues behind the original instead of racing it.
 concurrency:
-  group: agent-wake-${{ inputs.at }}
+  group: pit-open-${{ inputs.at }}
   cancel-in-progress: false
 
 jobs:
@@ -120,7 +120,7 @@ jobs:
 
       # The chunking decision lives in scripts/ci (CLAUDE.md: every executable
       # is in scripts/), in the private repo — same sparse-checkout pattern as
-      # erp-heartbeat.yml's "Check out the due decider".
+      # erp-race-clock.yml's "Check out the due decider".
       - name: Check out scripts/ci
         uses: actions/checkout@v7
         with:
@@ -157,8 +157,8 @@ jobs:
           AT: ${{ inputs.at }}
         run: |
           set -uo pipefail
-          gh workflow run erp-agent-wake.yml -R "${{ github.repository }}" --ref main -f "at=$AT"
-          echo "✓ re-dispatched erp-agent-wake.yml for the remaining wait to $AT"
+          gh workflow run erp-agent-pit-open.yml -R "${{ github.repository }}" --ref main -f "at=$AT"
+          echo "✓ re-dispatched erp-agent-pit-open.yml for the remaining wait to $AT"
 
       - name: Fire the loop
         if: steps.sleep.outputs.rechain != 'true'
@@ -167,6 +167,6 @@ jobs:
         run: |
           set -uo pipefail
           gh api "repos/${{ github.repository }}/dispatches" \
-            -f event_type=agent-loop \
-            -f client_payload[triggered_by]=erp-agent-wake
-          echo "✓ fired repository_dispatch[agent-loop] — the pool-exhausted window has reopened"
+            -f event_type=agent-pit-wall \
+            -f client_payload[triggered_by]=erp-agent-pit-open
+          echo "✓ fired repository_dispatch[agent-pit-wall] — the pool-exhausted window has reopened"

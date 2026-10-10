@@ -1,6 +1,6 @@
-name: ERP · Fleet · Warm-up scheduler (new orgs)
+name: ERP · Rookie · new circuits
 
-# The same hourly warm-up as erp-fleet-warmup.yml, aimed at PPAP_WARMUP_REPOS
+# The same hourly warm-up as erp-warm-up-laps.yml, aimed at PPAP_WARMUP_REPOS
 # instead of PPAP_CI_REPOS.
 #
 # WHY A SECOND LIST. A new free org starts near 5 concurrent jobs and its
@@ -11,7 +11,7 @@ name: ERP · Fleet · Warm-up scheduler (new orgs)
 # — while this job burns its ceiling up, and a person moves it into
 # PPAP_CI_REPOS once its E2E_HOST_CEILING reaches the target.
 #
-# Dispatched by erp-heartbeat.yml (catalogue id `new-org-warmup`, off by
+# Dispatched by erp-race-clock.yml (catalogue id `new-org-warmup`, off by
 # default — switch it on at /settings/agent-control). The decision, the
 # busy/unproven guards and the per-run budget all live in the called workflow
 # and scripts/ci/lib/warmup.mjs; this file only picks the list.
@@ -41,7 +41,7 @@ permissions: read-all
 
 jobs:
   warmup:
-    uses: ./.github/workflows/erp-fleet-warmup.yml
+    uses: ./.github/workflows/erp-warm-up-laps.yml
     with:
       list_var: PPAP_WARMUP_REPOS
       target: ${{ inputs.target || '20' }}

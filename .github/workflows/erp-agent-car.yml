@@ -1,4 +1,4 @@
-name: ERP · Agent · clear-todo-issue
+name: ERP · Car
 
 # Runs ONE headless agent iteration on ppap's free public-repo runners.
 # ONE run = ONE agent = ONE item. Since the solve-issue split, a loop run is a
@@ -31,7 +31,7 @@ name: ERP · Agent · clear-todo-issue
 # LEGACY WRAPPER path instead: no scripted claim; the session runs
 # /clear-todo <item>, which does its own claim + board writes.
 #
-# Parallelism + repetition are owned by erp-agent-loop.yml: loop-spawned runs carry
+# Parallelism + repetition are owned by erp-agent-pit-wall.yml: loop-spawned runs carry
 # client_payload.loop='true', and the final "Continue loop" step chains back to
 # the controller ONLY on an executed verdict (MERGED/PARK/SPLIT/ABANDONED with
 # green executors; MERGED chains even when the run step itself failed — it is
@@ -50,7 +50,7 @@ name: ERP · Agent · clear-todo-issue
 # therefore atomic among all CI agents; human sessions on OTHER forks are covered
 # by the open-PR backstop.
 #
-# Dispatched by erp-agent-loop.yml (repository_dispatch[agent-todo]);
+# Dispatched by erp-agent-pit-wall.yml (repository_dispatch[agent-car]);
 # workflow_dispatch is the manual/smoke-test entry. It runs on the CONTROL repo
 # (NamThuanVn/ppap) AND on every CI-fleet repo — sync-workflows-to-ppap.yml
 # mirrors it to both, and the controller places each lane (AGENT_LANE_HOSTS,
@@ -63,11 +63,11 @@ name: ERP · Agent · clear-todo-issue
 # PUBLIC (accepted trade-off — see docs/engineering/platform/ppap-agent-runs.md
 # § Agent runs).
 
-run-name: 'ERP · Agent · todo'
+run-name: 'ERP · Car · todo'
 
 on:
   repository_dispatch:
-    types: [agent-todo]
+    types: [agent-car]
   workflow_dispatch:
     inputs:
       item:
@@ -85,7 +85,7 @@ on:
         required: false
         default: ''
         type: string
-      # Set by erp-agent-loop.yml's manual-lane job when it places a one-shot
+      # Set by erp-agent-pit-wall.yml's wildcard-car job when it places a one-shot
       # lane on a CI-fleet repo — the same two values a loop lane gets in its
       # client_payload. Sealed, so showing it in the run UI publishes nothing.
       bundle:
@@ -881,7 +881,7 @@ jobs:
       # the only thing standing between a dead wrapper run and a stranded item.
       # It used to merely COMMENT "may be stranded", leaving the item In
       # Progress + assigned — invisible to the claim sweep, which wants Todo +
-      # unassigned — until agent-loop's stranded pass noticed hours later. It
+      # unassigned — until agent-pit-wall's stranded pass noticed hours later. It
       # now RELEASES it (unassign + board → Todo, via scripts/agent/board/claim/release.mjs) so
       # every path out of this workflow hands the item back for the next pick.
       # Open PRs and claim branches stay put: the next claim resumes the PR and
@@ -1055,11 +1055,11 @@ jobs:
           set +e
           # The controller lives on the CONTROL repo, wherever this lane ran.
           if gh api "repos/${AGENT_CONTROL_REPO:-$GITHUB_REPOSITORY}/dispatches" \
-            -f event_type=agent-loop \
+            -f event_type=agent-pit-wall \
             -f client_payload[triggered_by]="${TRIGGERED_BY}"; then
-            echo "✓ chained agent-loop"
+            echo "✓ chained agent-pit-wall"
           else
-            echo "::warning::agent-loop chain dispatch failed — this lane ends; restart via 'gh workflow run erp-agent-loop.yml -R NamThuanVn/ppap' or the next BA-docs merge"
+            echo "::warning::agent-pit-wall chain dispatch failed — this lane ends; restart via 'gh workflow run erp-agent-pit-wall.yml -R NamThuanVn/ppap' or the next BA-docs merge"
           fi
           exit 0
 
@@ -1070,7 +1070,7 @@ jobs:
       # controller once on its way out, exactly what its completion would have
       # done on the control repo. It cannot make the loop spin — the controller
       # still stops when its probe counts zero claimable leaves (see
-      # erp-agent-loop.yml § "Why the loop terminates"). Skipped on the control
+      # erp-agent-pit-wall.yml § "Why the loop terminates"). Skipped on the control
       # repo, where workflow_run already fires.
       - name: Wake controller (fleet lane)
         if: >-
@@ -1087,7 +1087,7 @@ jobs:
         run: |
           set +e
           if gh api "repos/${CONTROLLER_REPO}/dispatches" \
-            -f event_type=agent-loop \
+            -f event_type=agent-pit-wall \
             -f client_payload[triggered_by]="${TRIGGERED_BY}"; then
             echo "✓ woke the controller on ${CONTROLLER_REPO}"
           else

@@ -14,7 +14,7 @@ name: ERP · Release notes
 # `RELEASE_NOTES_CLIENT_*` secret pair it gets. Ships as `staging`; the
 # heartbeat entry flips to `production` only after staging sign-off (Decision 7).
 #
-# LIGHT bootstrap, same reasoning as erp-agent-rel-plan.yml: the script is pure
+# LIGHT bootstrap, same reasoning as erp-agent-qualifying.yml: the script is pure
 # Node built-ins (no package.json deps — see its own imports), so there is no
 # `pnpm install` here, just the PAT pool, a full-history checkout (`git log`
 # needs it) and the Claude CLI the script shells out to for the skill call.
