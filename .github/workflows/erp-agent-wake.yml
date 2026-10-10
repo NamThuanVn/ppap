@@ -2,10 +2,10 @@ name: ERP · Agent · wake
 
 # Timed wake-up for a pool-exhausted hold (issue #4744, this slice #4791).
 #
-# scripts/agent/board/loop/publish-pool.mjs dispatches this `workflow_dispatch`
+# scripts/agent/board/pit-wall/publish-pool.mjs dispatches this `workflow_dispatch`
 # with `at` = the pool-exhausted hold's `until` + 60s, the moment it WRITES a
 # brand-new hold — never on the "already stands" branch.
-# scripts/agent/board/lib/hold.mjs `setHold`'s `wrote` flag IS the dedupe:
+# scripts/agent/board/lib/flags.mjs `setHold`'s `wrote` flag IS the dedupe:
 # several lanes racing onto the same exhausted window all try to set the same
 # `pool-exhausted-${until}`-fingerprinted hold, and only the one that actually
 # wrote gets here.

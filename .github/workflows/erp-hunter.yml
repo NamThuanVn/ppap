@@ -65,7 +65,7 @@ on:
   # into the Vietnam afternoon). The slot fixes that: only a run started at or
   # after 18:30 UTC counts as tonight's sweep, so a daytime run never moves it,
   # and the window closes for good at 23:00 UTC rather than waiting a further
-  # day. See `scripts/ci/heartbeat-due.mjs`'s `slotDueDecision`.
+  # day. See `scripts/ci/race-clock-due.mjs`'s `slotDueDecision`.
   #
   # NOTE FOR ANYONE EDITING `dry_run` BELOW: under `schedule` its value was NULL
   # (falsy → `--apply`). Under `workflow_dispatch` GitHub substitutes the
@@ -262,7 +262,7 @@ jobs:
                      --jq '[.[] | select(.headRefName | startswith("chore/strip-timeouts"))] | length')
           fi
           if [ "${OPEN:-0}" -gt 0 ]; then
-            echo "::notice::a timeout-hunter PR is still open — skipping today's batch"
+            echo "::notice::a timeout-police PR is still open — skipping today's batch"
             echo 'skip=true' >> "$GITHUB_OUTPUT"
           else
             echo 'skip=false' >> "$GITHUB_OUTPUT"
@@ -280,7 +280,7 @@ jobs:
         # invocation (an operator checking, a harness running it with no args)
         # cannot rewrite 35 spec files as a side effect. On the schedule trigger
         # `inputs.dry_run` is null, so the daily run takes the --apply branch.
-        run: bash scripts/ci/timeout-hunter.sh ${{ inputs.dry_run && '--dry-run' || '--apply' }}
+        run: bash scripts/ci/timeout-police.sh ${{ inputs.dry_run && '--dry-run' || '--apply' }}
 
       # The gate must agree before the PR is opened. If the codemod and the
       # baseline disagree here, the PR would land red on its own repo-gates job —
@@ -301,7 +301,7 @@ jobs:
           # Pushed straight into upstream, so under agent/ — the only prefix the
           # merged-head delete and the sweeps take from upstream (ppap-github-app.md).
           BRANCH="agent/chore/strip-timeouts-$(date -u +%Y%m%d)"
-          git config user.name  'timeout-hunter'
+          git config user.name  'timeout-police'
           git config user.email 'noreply@github.com'
           git checkout -b "$BRANCH"
           git add -A
@@ -487,7 +487,7 @@ jobs:
         id: held
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node scripts/agent/board/recover/hunter-hold.mjs check
+        run: node scripts/agent/board/recover/black-flag.mjs check
 
       - name: Scan the fleet's CI logs
         id: scan
@@ -511,7 +511,7 @@ jobs:
           # 400: a 5-day window over this fleet already offers ~720 job logs, so
           # 400 would silently describe half the window. The script says when it
           # truncates, but a scheduled sweep should not need to.
-          PPAP_CI_REPOS="$REPOS" node scripts/ci/noise-hunter.mjs scan \
+          PPAP_CI_REPOS="$REPOS" node scripts/ci/noise-police.mjs scan \
             --days "$DAYS" \
             --max-logs 1200 \
             --json noise/ci-noise-fleet.json \
@@ -1197,7 +1197,7 @@ jobs:
       # SCOPED, so a flaky-test fixer crashing cannot stop BA work. The hold
       # goes in this job's own HUNTER_HOLD variable and travels to the
       # ambulance in the dispatch payload; AGENT_LOOP_HOLD — the one the lanes
-      # gate on — is never touched. Same trick salvage-or-revert.mjs already
+      # gate on — is never touched. Same trick tow-in-or-revert.mjs already
       # uses for an item-scoped hold.
       #
       # Only a HARNESS fault qualifies. A handoff (budget spent, PR open) exits
@@ -1227,7 +1227,7 @@ jobs:
             COUNT=$(gh api "repos/NamThuanVn/erp-namthuan/pulls?state=all&head=${FORK_OWNER}:${BRANCH}&per_page=1" --jq 'length' 2>/dev/null || echo 0)
             [ "${COUNT:-0}" -gt 0 ] && PR_OPENED=true
           fi
-          node scripts/agent/board/recover/hunter-hold.mjs raise \
+          node scripts/agent/board/recover/black-flag.mjs raise \
             --step "${FAILED_STEP:-Fix the flaky sites and ship the PR}" \
             --job-conclusion "${JOB_STATUS}" \
             --fixer-outcome "${FIXER_OUTCOME:-}" \

@@ -15,14 +15,14 @@ name: ERP · Agent · clear-todo-issue
 #      MCP servers and subagents all load): solves the pre-claimed item to a
 #      confirmed-merged PR, or emits a typed solve-verdict block. ZERO board
 #      writes inside the session.
-#   3. EXECUTORS (typed on the parsed verdict): finalize-merged / execute-park /
-#      execute-split / execute-abandoned / execute-blocked mutate the board —
+#   3. EXECUTORS (typed on the parsed verdict): finalize-merged / execute-garage /
+#      execute-stages / execute-retired / execute-blocked mutate the board —
 #      every verdict has one. MERGED/PARK/SPLIT/ABANDONED land the item in a
 #      TERMINAL column (Done or Pending); BLOCKED instead returns it to Todo,
 #      but with an open `blocked by` edge the claim walk and COUNT_ONLY probe
 #      both exclude — so no verdict can return a CLAIMABLE item to Todo to be
 #      re-claimed and re-decided;
-#      salvage-or-revert is the backstop for a
+#      tow-in-or-revert is the backstop for a
 #      run that died without a verdict — it preserves WIP on a
 #      salvage/<issue>-<run_id> branch + draft PR + Claude-session artifact,
 #      then releases the item back to Todo (the next claim resumes it).
@@ -103,7 +103,7 @@ permissions: read-all
 
 # NO concurrency group on purpose: independent runs must coexist, and a new
 # dispatch must never cancel an in-flight agent mid-item (a cancelled agent
-# strands its claimed item In Progress until salvage-or-revert / the stale-ref
+# strands its claimed item In Progress until tow-in-or-revert / the stale-ref
 # rule recovers it).
 
 env:
@@ -122,7 +122,7 @@ jobs:
     name: Agent
     runs-on: ubuntu-latest
     # 30 min under GitHub's 360-min hard cap: leave room for the always-steps
-    # (a timeout-killed run still executes salvage-or-revert).
+    # (a timeout-killed run still executes tow-in-or-revert).
     timeout-minutes: 330
     env:
       # Both repository_dispatch client_payload values and workflow_dispatch
@@ -348,7 +348,7 @@ jobs:
         if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         env:
           CLAIM_ISSUE: ${{ steps.claim.outputs.issue }}
-        run: node scripts/agent/board/claim/lane-item.mjs
+        run: node scripts/agent/board/claim/car-item.mjs
 
       - name: Publish lane item
         if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
@@ -423,7 +423,7 @@ jobs:
           # Publishes AGENT_POOL_STATE, and sets a timed pool-exhausted hold when
           # no account is usable. Runs on BOTH paths: the controller needs the
           # usable-account count even on a healthy probe, to cap K.
-          node scripts/agent/board/loop/publish-pool.mjs || true
+          node scripts/agent/board/pit-wall/publish-pool.mjs || true
           if [ "$RC" -eq 78 ]; then
             echo "exhausted=true" >> "$GITHUB_OUTPUT"
             echo "::notice::pool exhausted — skipping the bootstrap and releasing the claim; the loop holds until a window resets"
@@ -485,7 +485,7 @@ jobs:
       # "the hosted runner lost communication with the server" — not the agent
       # failing at its item. Every one of those also skipped the whole `always()`
       # recovery tail, so the claimed item stranded In Progress and nothing
-      # alerted (scripts/agent/board/recover/sweep-dead-lanes.mjs now catches that; this step is the half
+      # alerted (scripts/agent/board/recover/sweep-crashed-cars.mjs now catches that; this step is the half
       # that stops it happening).
       #
       # Reclaiming the preinstalled toolchains this job never touches, and giving
@@ -654,7 +654,7 @@ jobs:
 
       # ── Typed verdict pipeline (claim-mode runs only) ─────────────────────
       # Parse never fails: no/invalid/mismatched verdict → verdict=NONE, which
-      # routes to salvage-or-revert below — EXCEPT when the claim branch's
+      # routes to tow-in-or-revert below — EXCEPT when the claim branch's
       # upstream PR is already MERGED (auto-merge landed while the run died):
       # then MERGED is synthesized from the API so finalize executes and the
       # loop chains (GH_TOKEN is for that probe).
@@ -677,9 +677,9 @@ jobs:
         if: always() && steps.outcome.outputs.verdict == 'PARK'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node scripts/agent/board/verdict/execute-park.mjs
+        run: node scripts/agent/board/verdict/execute-garage.mjs
 
-      # Every login in the PAT pool, so execute-split.mjs never @mentions a
+      # Every login in the PAT pool, so execute-stages.mjs never @mentions a
       # pool account on a slice/decompose-comment (accounts rotate — never
       # hardcode one). Best-effort: on failure POOL_LOGINS stays empty and the
       # script falls back to excluding only `[bot]` logins (with a warning).
@@ -701,7 +701,7 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           POOL_LOGINS: ${{ env.POOL_LOGINS }}
-        run: node scripts/agent/board/verdict/execute-split.mjs
+        run: node scripts/agent/board/verdict/execute-stages.mjs
 
       # BLOCKED is the one verdict that returns the item to Todo instead of a
       # terminal column — safe only because it never leaves without a
@@ -726,7 +726,7 @@ jobs:
         if: always() && steps.outcome.outputs.verdict == 'ABANDONED'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node scripts/agent/board/verdict/execute-abandoned.mjs
+        run: node scripts/agent/board/verdict/execute-retired.mjs
 
       # Backstop for a run with no executed verdict (failed / cancelled /
       # timed out / verdict=NONE): preserve WIP on salvage/<issue>-<run_id> +
@@ -770,7 +770,7 @@ jobs:
           EXECUTOR_FAILED: ${{ steps.finalize.outcome == 'failure' || steps.park.outcome == 'failure' || steps.split.outcome == 'failure' || steps.abandoned.outcome == 'failure' || steps.blocked.outcome == 'failure' }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # STALE_REF_HOURS comes from "Load lane config".
-        run: node scripts/agent/board/recover/salvage-or-revert.mjs
+        run: node scripts/agent/board/recover/tow-in-or-revert.mjs
 
       # Board hygiene, EVERY run (backlog-empty and wrapper runs included): a
       # child can close without its executor running (the PR's `Closes #`

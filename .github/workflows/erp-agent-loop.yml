@@ -79,7 +79,7 @@ on:
   # An "ERP · Agent · ambulance" completion is in this list for the same reason a
   # lane completion is: an ambulance that dies without a verdict must still
   # re-arm the controller. That cannot loop, because the attempt is charged at
-  # DISPATCH (scripts/agent/board/loop/gate.mjs), not at verdict.
+  # DISPATCH (scripts/agent/board/pit-wall/gate.mjs), not at verdict.
   # "ERP · Heartbeat" is the 15-min tick, now driven by the ERP's own Cloudflare
   # cron rather than a GitHub `schedule:` block (GitHub delayed and dropped those
   # — see that file's header). It fans out to the due scheduled workflows and
@@ -270,7 +270,7 @@ jobs:
           exit 0
 
       # Moved ahead of "Resolve cap" (issue #4543): that step now needs
-      # scripts/ci/crazy-expiry.mjs to apply the crazy-mode effective-cap rule
+      # scripts/ci/turbo-expiry.mjs to apply the crazy-mode effective-cap rule
       # before anything below reads its output. Board hygiene further down
       # still runs unconditionally, exactly as the comments there describe —
       # only the checkout itself moved earlier.
@@ -281,8 +281,8 @@ jobs:
           ref: main
           token: ${{ env.RESOLVED_PAT }}
           fetch-depth: 1
-          # The whole `scripts` tree: this job runs scripts/ci/crazy-expiry.mjs
-          # and scripts/ci/god-expiry.mjs ("Resolve cap"), scripts/ci/ppap/pat-pool.sh
+          # The whole `scripts` tree: this job runs scripts/ci/turbo-expiry.mjs
+          # and scripts/ci/manual-expiry.mjs ("Resolve cap"), scripts/ci/ppap/pat-pool.sh
           # ("Resolve PAT pool logins") AND scripts/agent/board/*.mjs, and the
           # board scripts import a sibling lib/api.mjs.
           sparse-checkout: scripts
@@ -324,7 +324,7 @@ jobs:
           # through to the crazy-mode check below, same as if it had never
           # been set — the heartbeat's own "Clear god mode after it expires"
           # step deletes the pair on its next tick.
-          GOD_VERDICT=$(node scripts/ci/god-expiry.mjs \
+          GOD_VERDICT=$(node scripts/ci/manual-expiry.mjs \
             --god-until "$AGENT_GOD_UNTIL" --god-lanes "$AGENT_GOD_LANES")
           GOD_STATE=$(printf '%s' "$GOD_VERDICT" | cut -f1)
           GOD_LANES=$(printf '%s' "$GOD_VERDICT" | cut -f2)
@@ -346,7 +346,7 @@ jobs:
             # AGENT_MAX_PARALLEL back down — otherwise a stale
             # AGENT_MAX_PARALLEL=12 lets the loop dispatch 12 lanes off a window
             # that already closed.
-            VERDICT=$(node scripts/ci/crazy-expiry.mjs \
+            VERDICT=$(node scripts/ci/turbo-expiry.mjs \
               --crazy-until "$AGENT_CRAZY_UNTIL" --restore-cap "$AGENT_CRAZY_RESTORE_CAP")
             STATE=$(printf '%s' "$VERDICT" | cut -f1)
             RESTORE_CAP=$(printf '%s' "$VERDICT" | cut -f2)
@@ -356,7 +356,7 @@ jobs:
               CAP="$RESTORE_CAP"
             elif [ -n "$AGENT_CRAZY_UNTIL" ]; then
               # Crazy mode is genuinely active (not expired, and the variable is
-              # actually set — crazy-expiry.mjs also reports "not-expired" when
+              # actually set — turbo-expiry.mjs also reports "not-expired" when
               # it's unset). Crazy mode's whole point is burning whatever the
               # remaining quota can fund, not a fixed number, so the effective
               # dispatch cap becomes AGENT_CRAZY_MAX itself — AGENT_MAX_PARALLEL
@@ -398,7 +398,7 @@ jobs:
       # Stranded-claim sweep — release items whose backing run is provably dead
       # (assigned to us + In Progress/Todo + last claimed > STRANDED_HOURS ago,
       # which must exceed erp-agent-clear-todo.yml's timeout-minutes). A hosted-
-      # runner reclaim skips the in-job salvage-or-revert (always() does not
+      # runner reclaim skips the in-job tow-in-or-revert (always() does not
       # survive a runner shutdown), stranding the item; this is the decoupled
       # backstop. Runs BEFORE the count so a released item is a candidate this
       # same tick, and BEFORE the cap gate so the kill switch can't suspend
@@ -435,7 +435,7 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
           DEAD_LANE_LOOKBACK_H: ${{ vars.DEAD_LANE_LOOKBACK_H || '3' }}
-        run: node scripts/agent/board/recover/sweep-dead-lanes.mjs
+        run: node scripts/agent/board/recover/sweep-crashed-cars.mjs
 
       # The alert the dead lane could not send for itself. Gated on held_first so
       # a teardown that kills six lanes at once pages once — the hold coalesces
@@ -492,7 +492,7 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
-        run: node scripts/agent/board/recover/reap-salvage.mjs
+        run: node scripts/agent/board/recover/reap-tow-in.mjs
 
       # #4338 stops NEW merged-head leftovers at merge time; this drains the
       # existing pile (615 branches as of 2026-09-28) and catches anything
@@ -533,7 +533,7 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
-        run: node scripts/agent/board/loop/gate.mjs
+        run: node scripts/agent/board/pit-wall/gate.mjs
 
       # ── Refresh a STALE pool probe before sizing K ────────────────────────
       # AGENT_POOL_STATE is written by each lane's own pre-claim probe, so after a
@@ -588,7 +588,7 @@ jobs:
             || echo "::warning::Claude CLI install failed — the fallback probe cannot run"
           RC=0
           bash scripts/agent/run/claude.sh || RC=$?
-          node scripts/agent/board/loop/publish-pool.mjs || true
+          node scripts/agent/board/pit-wall/publish-pool.mjs || true
           F="${AGENT_STATE_DIR}/pool-state.json"
           if [ ! -s "$F" ]; then
             echo "::warning::pool probe wrote nothing (rc=$RC) — dispatch falls back to one lane"
@@ -637,7 +637,7 @@ jobs:
       # skill /order-todo-queue). Unplanned leaves → dispatch ONE agent-rel-plan
       # run INSTEAD of lanes; on success it re-dispatches agent-loop, and this
       # gate then passes. All three kinds are swept (a bug can be blocked by a
-      # feature) by scripts/agent/board/loop/unplanned.mjs, which the planner's
+      # feature) by scripts/agent/board/pit-wall/unplanned.mjs, which the planner's
       # sweep and its coverage recount call too — one definition, so the gate
       # and the planner can no longer ping-pong over a leaf one counts and the
       # other refuses to plan (batch mains and SPLIT-decomposed originals are
@@ -651,7 +651,7 @@ jobs:
         if: steps.probe.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node scripts/agent/board/loop/unplanned.mjs
+        run: node scripts/agent/board/pit-wall/unplanned.mjs
 
       # A rate-limited dispatch skips the tick instead of failing the controller
       # (ppap run 37741799957) — see the script's header.
@@ -664,7 +664,7 @@ jobs:
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
           UNPLANNED: ${{ steps.relsweep.outputs.unplanned }}
           READABLE: ${{ steps.relsweep.outputs.readable }}
-        run: node scripts/agent/board/loop/relplan-gate.mjs
+        run: node scripts/agent/board/pit-wall/qualifying-gate.mjs
 
       # The sealed bundle a FLEET lane opens in its "Load lane config" step: this
       # repo's Claude pool + Telegram secrets + the AGENT_* settings, encrypted
@@ -694,7 +694,7 @@ jobs:
 
       # Count live lanes on EVERY host (this repo + the CI fleet), compute K
       # (scripts/ci/dispatch-k.mjs, unchanged), place each new lane on a host and
-      # dispatch it — scripts/agent/board/loop/dispatch-lanes.mjs owns all four;
+      # dispatch it — scripts/agent/board/pit-wall/dispatch-cars.mjs owns all four;
       # its header says why lanes left this repo. AGENT_LANE_HOSTS=fleet places
       # on the fleet at AGENT_LANES_PER_HOST (default 2) per host; unset places
       # here, the old behaviour.
@@ -728,7 +728,7 @@ jobs:
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: |
           set -euo pipefail
-          node scripts/agent/board/loop/dispatch-lanes.mjs
+          node scripts/agent/board/pit-wall/dispatch-cars.mjs
           # Hold the concurrency slot while the just-created runs become
           # visible to the Actions API — the NEXT queued controller then
           # counts them and can't over-provision past the cap.
@@ -773,7 +773,7 @@ jobs:
   # as the dialog always behaved when it dispatched erp-agent-clear-todo.yml
   # directly. It routes through here now because a lane may run on a CI-fleet
   # repo, and only this repo can seal the bundle such a lane needs. Placement is
-  # the controller's (scripts/agent/board/loop/dispatch-lanes.mjs with ITEM set):
+  # the controller's (scripts/agent/board/pit-wall/dispatch-cars.mjs with ITEM set):
   # K is exactly 1, `loop` is false, so the lane never chains.
   manual-lane:
     name: Start a manual lane
@@ -898,4 +898,4 @@ jobs:
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
           ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
-        run: node scripts/agent/board/loop/dispatch-lanes.mjs
+        run: node scripts/agent/board/pit-wall/dispatch-cars.mjs

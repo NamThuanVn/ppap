@@ -46,7 +46,7 @@ jobs:
   # Cheap gate in front of the matrix, same two jobs as the e2e batch's plan:
   #   1. Turn `client_payload.units` into the job matrix. Names come from
   #      scripts/ci/checks/plan.mjs DISPLAY — the noise scan, job-index,
-  #      noise-hunter and progress all route a job's log by those names.
+  #      noise-police and progress all route a job's log by those names.
   #   2. STALE CHECK — a cancelled coordinator does not cancel across repos, and
   #      an orphan batch holds JOB SLOTS in this org. Fails OPEN: an unreadable
   #      head still runs, and a skipped matrix fails its units closed at the

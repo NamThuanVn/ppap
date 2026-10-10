@@ -214,7 +214,7 @@ jobs:
           echo "✓ workspace on upstream main $(git rev-parse --short HEAD) · acting as @$LOGIN"
 
       # The SAME sweep as erp-agent-loop.yml's gate and the recount below —
-      # literally, now: all three call scripts/agent/board/loop/unplanned.mjs,
+      # literally, now: all three call scripts/agent/board/pit-wall/unplanned.mjs,
       # which owns the definition of "open leaf lacking rel-planned" and the
       # parent exclusion the three used to restate in copied jq. It retries and
       # reports `readable=false` rather than dying, because one 503 in a step
@@ -223,7 +223,7 @@ jobs:
         id: sweep
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node scripts/agent/board/loop/unplanned.mjs
+        run: node scripts/agent/board/pit-wall/unplanned.mjs
 
       - name: Planning gate
         id: plangate
@@ -294,7 +294,7 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           SCOPE: ${{ steps.sweep.outputs.numbers }}
-        run: node scripts/agent/board/loop/unplanned.mjs
+        run: node scripts/agent/board/pit-wall/unplanned.mjs
 
       - name: Verify plan coverage
         if: steps.plangate.outputs.proceed == 'true'

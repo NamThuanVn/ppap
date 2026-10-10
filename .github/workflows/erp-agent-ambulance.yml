@@ -40,7 +40,7 @@ name: ERP · Agent · ambulance
 # under diagnosis.
 #
 # ATTEMPT BUDGET is spent by the CONTROLLER at dispatch, not here (see
-# scripts/agent/board/loop/gate.mjs claimRepairAttempt). An ambulance can die without a verdict —
+# scripts/agent/board/pit-wall/gate.mjs claimRepairAttempt). An ambulance can die without a verdict —
 # spot reclaim, timeout, exit 65 — and the controller is re-triggered on exactly
 # those completions plus every heartbeat tick, so counting at verdict time would
 # make the ambulance the new infinite loop. `attempt` in the payload only selects
@@ -202,7 +202,7 @@ jobs:
         env:
           # Two sources, in priority order. A payload hold is ITEM-scoped: one
           # cursed issue that failed the same way twice, dispatched by
-          # salvage-or-revert. It travels in the payload rather than the repo
+          # tow-in-or-revert. It travels in the payload rather than the repo
           # variable on purpose — the fleet is healthy and must keep draining the
           # backlog, so this repair must not be able to stop lanes. The repo
           # variable is the FLEET-scoped hold, where lanes really are stopped.

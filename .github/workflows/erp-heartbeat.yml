@@ -21,7 +21,7 @@ name: ERP · Heartbeat
 #   1. Fans out to the scheduled workflows that are due. Every one used to carry
 #      its own `schedule:` block and lost it for the same reason this one did.
 #      Which workflows, and when, is the `HEARTBEAT_SCHEDULE` repo variable,
-#      edited from `/settings/agent-control` (scripts/ci/heartbeat-schedule.mjs).
+#      edited from `/settings/agent-control` (scripts/ci/race-calendar.mjs).
 #      Due-ness is decided by asking GitHub when each last ran, not by wall-clock
 #      arithmetic on this run's start time — a tick that arrives late must not
 #      skip a day, and a re-run must not double-fire.
@@ -165,7 +165,7 @@ jobs:
           sparse-checkout: |
             scripts/ci
             scripts/agent/board/lib
-            scripts/agent/board/loop
+            scripts/agent/board/pit-wall
             scripts/agent/run
           path: decider
           persist-credentials: false
@@ -230,9 +230,9 @@ jobs:
             exit 0
           fi
 
-          # repo<TAB>workflow<TAB>ref<TAB>heartbeat-due args<TAB>gh flags, one
+          # repo<TAB>workflow<TAB>ref<TAB>race-clock-due args<TAB>gh flags, one
           # per ENABLED job. Bad jobs are dropped with a ::warning:: on stderr.
-          JOBS=$(node decider/scripts/ci/heartbeat-schedule.mjs) || {
+          JOBS=$(node decider/scripts/ci/race-calendar.mjs) || {
             echo "::warning::could not read the schedule — skipping the fan-out this tick"
             exit 0
           }
@@ -241,7 +241,7 @@ jobs:
             [ -n "$WF" ] || continue
 
             # Due-ness reads the run's CONCLUSION, not just its age — see
-            # scripts/ci/heartbeat-due.mjs. An age-only rule counted a run that
+            # scripts/ci/race-clock-due.mjs. An age-only rule counted a run that
             # DIED as a run that happened, and the fleet lost a whole day's
             # sweep without a word. Several runs, not one: the retry budget is
             # the count of CONSECUTIVE dead runs at the head of the history, so
@@ -250,13 +250,13 @@ jobs:
             # An `@fleet` job may have run on ANY fleet host (or here, before
             # the move), so its history is merged across all of them first.
             if [ "$REPO" = "@fleet" ]; then
-              RUNS_JSON=$(node decider/scripts/agent/board/loop/fleet-job.mjs history "$WF" 2>/dev/null) || RUNS_JSON='[]'
+              RUNS_JSON=$(node decider/scripts/agent/board/pit-wall/fleet-job.mjs history "$WF" 2>/dev/null) || RUNS_JSON='[]'
             else
               RUNS_JSON=$(gh api "repos/${REPO}/actions/workflows/${WF}/runs?per_page=10" \
                             --jq '.workflow_runs' 2>/dev/null) || RUNS_JSON='[]'
             fi
             # shellcheck disable=SC2086 — DUE_ARGS is a flag LIST and must word-split.
-            VERDICT=$(printf '%s' "$RUNS_JSON" | node decider/scripts/ci/heartbeat-due.mjs $DUE_ARGS 2>/dev/null) || VERDICT=''
+            VERDICT=$(printf '%s' "$RUNS_JSON" | node decider/scripts/ci/race-clock-due.mjs $DUE_ARGS 2>/dev/null) || VERDICT=''
             if [ -z "$VERDICT" ]; then
               echo "::warning::$WF — due check failed ($DUE_ARGS), not dispatching"
               continue
@@ -274,7 +274,7 @@ jobs:
             # on this repo's own secrets, exactly as before the move: a nightly
             # job that skips its slot is a lost day.
             if [ "$REPO" = "@fleet" ]; then
-              HOST=$(node decider/scripts/agent/board/loop/fleet-job.mjs place "$WF" 2>/dev/null) || HOST=''
+              HOST=$(node decider/scripts/agent/board/pit-wall/fleet-job.mjs place "$WF" 2>/dev/null) || HOST=''
               if [ -n "$HOST" ] && B=$(node decider/scripts/agent/run/secret-bundle.mjs build); then
                 REPO="$HOST"
                 FLAGS="$FLAGS -f bundle=$B -f controller_repo=$GITHUB_REPOSITORY"
@@ -324,9 +324,9 @@ jobs:
             exit 0
           fi
 
-          VERDICT=$(node decider/scripts/ci/crazy-expiry.mjs \
+          VERDICT=$(node decider/scripts/ci/turbo-expiry.mjs \
             --crazy-until "$AGENT_CRAZY_UNTIL" --restore-cap "$AGENT_CRAZY_RESTORE_CAP") || {
-            echo "::warning::crazy-expiry check failed — skipping this tick"
+            echo "::warning::turbo-expiry check failed — skipping this tick"
             exit 0
           }
           STATE=$(printf '%s' "$VERDICT" | cut -f1)
@@ -369,9 +369,9 @@ jobs:
             exit 0
           fi
 
-          VERDICT=$(node decider/scripts/ci/god-expiry.mjs \
+          VERDICT=$(node decider/scripts/ci/manual-expiry.mjs \
             --god-until "$AGENT_GOD_UNTIL" --god-lanes "$AGENT_GOD_LANES") || {
-            echo "::warning::god-expiry check failed — skipping this tick"
+            echo "::warning::manual-expiry check failed — skipping this tick"
             exit 0
           }
           STATE=$(printf '%s' "$VERDICT" | cut -f1)
