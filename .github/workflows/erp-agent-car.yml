@@ -53,7 +53,7 @@ name: ERP · Car
 # Dispatched by erp-agent-pit-wall.yml (repository_dispatch[agent-car]);
 # workflow_dispatch is the manual/smoke-test entry. It runs on the CONTROL repo
 # (NamThuanVn/ppap) AND on every CI-fleet repo — sync-workflows-to-ppap.yml
-# mirrors it to both, and the controller places each lane (AGENT_LANE_HOSTS,
+# mirrors it to both, and the controller places each lane (AGENT_CAR_HOSTS,
 # scripts/agent/board/lib/hosts.mjs). A fleet repo holds no secrets but
 # PAT_TOKEN_POOL and none of the control repo's variables, so the dispatch
 # carries them SEALED (client_payload.bundle, scripts/agent/run/secret-bundle.mjs)
@@ -130,9 +130,9 @@ jobs:
       ITEM_ARG: ${{ github.event.client_payload.item || inputs.item || '' }}
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || 'latest' }}
-      # The pool-probe and pace-to-reset tuning vars (AGENT_USAGE_PROBE,
-      # AGENT_BLIND_LANES_PER_ACCOUNT, AGENT_MAX_/WARN_/LANE_RATE_*,
-      # AGENT_LANE_HOURS, AGENT_MAX_LANES_PER_ACCOUNT, AGENT_CRAZY_*) used to be
+      # The pool-probe and pace-to-reset tuning vars (AGENT_FUEL_PROBE,
+      # AGENT_BLIND_CARS_PER_TANK, AGENT_MAX_/WARN_/LANE_RATE_*,
+      # AGENT_CAR_HOURS, AGENT_MAX_CARS_PER_TANK, AGENT_CRAZY_*) used to be
       # declared here as `vars.X || 'default'`. They now come from "Load lane
       # config", and they CANNOT stay here as well: a job-level `env:` key
       # outranks $GITHUB_ENV, so on a fleet repo (no vars) the defaults would
@@ -260,7 +260,7 @@ jobs:
       # Everything this job needs from the CONTROL repo, wherever it runs. A
       # fleet lane gets it from the sealed bundle the controller forwarded —
       # masks every secret before anything else prints, exports the settings
-      # (FORK_REPO, AGENT_MODELS, the tuning vars, AGENT_CONTROL_REPO) to
+      # (FORK_REPO, AGENT_DRIVERS, the tuning vars, AGENT_CONTROL_REPO) to
       # $GITHUB_ENV, and writes the secrets to a 0600 file named by LANE_SECRETS
       # that only the three steps needing them source. A control-repo run (no
       # bundle) takes this repo's own vars and keeps its `secrets.*` step env —
@@ -373,8 +373,8 @@ jobs:
 
       # Loop-spawned lanes dispatch with no `model` at all (issue #4751), so
       # CLAUDE_MODEL above is empty for the bulk of the fleet's spend unless
-      # resolved here — the stored AGENT_MODELS setting must be read INSIDE
-      # clear-todo, not only at the UI/dispatch layer. AGENT_MODELS is already in
+      # resolved here — the stored AGENT_DRIVERS setting must be read INSIDE
+      # clear-todo, not only at the UI/dispatch layer. AGENT_DRIVERS is already in
       # the job env from "Load lane config" (the control repo's variable, wherever
       # this lane runs).
       - name: Resolve model
@@ -420,7 +420,7 @@ jobs:
           if [ -n "${LANE_SECRETS:-}" ]; then . "$LANE_SECRETS"; fi
           RC=0
           bash scripts/agent/run/claude.sh || RC=$?
-          # Publishes AGENT_POOL_STATE, and sets a timed pool-exhausted hold when
+          # Publishes AGENT_FUEL_STATE, and sets a timed pool-exhausted hold when
           # no account is usable. Runs on BOTH paths: the controller needs the
           # usable-account count even on a healthy probe, to cap K.
           node scripts/agent/board/pit-wall/publish-pool.mjs || true

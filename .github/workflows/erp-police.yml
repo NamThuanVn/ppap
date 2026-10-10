@@ -99,7 +99,7 @@ on:
         type: string
         default: '1'
       model:
-        description: 'Optional --model override for the fixer session. Empty = the stored AGENT_MODELS setting (default opus).'
+        description: 'Optional --model override for the fixer session. Empty = the stored AGENT_DRIVERS setting (default opus).'
         required: false
         default: ''
         type: string
@@ -481,8 +481,8 @@ jobs:
       # failure raises a second fingerprint and burns another of only three
       # repair attempts on the same root cause.
       #
-      # Only the hunter stops. This reads HUNTER_HOLD; the lanes gate on
-      # AGENT_LOOP_HOLD and never see it.
+      # Only the hunter stops. This reads AGENT_BLACK_FLAG; the lanes gate on
+      # AGENT_RED_FLAG and never see it.
       - name: Stand down while the harness is being repaired
         id: held
         env:
@@ -1017,7 +1017,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/claude" --version
 
-      # Explicit `model` input > the stored AGENT_MODELS setting > opus
+      # Explicit `model` input > the stored AGENT_DRIVERS setting > opus
       # (issue #4751). Same resolver + precedence every other Claude workflow
       # uses (erp-agent-car.yml, erp-agent-ambulance.yml); hunter had
       # no model plumbing at all before this. Mirrors the fixer's own `if:` —
@@ -1026,7 +1026,7 @@ jobs:
         if: ${{ inputs.smoke || needs.patrol-noise.outputs.open_pr != '' || needs.patrol-noise.outputs.sites != '0' }}
         env:
           EXPLICIT: ${{ inputs.model }}
-          # AGENT_MODELS is in the job env from "Load hunter config".
+          # AGENT_DRIVERS is in the job env from "Load hunter config".
         run: |
           set -euo pipefail
           MODEL=$(scripts/ci/ppap/resolve-model.sh police)
@@ -1195,8 +1195,8 @@ jobs:
       # every one diagnosed by a human.
       #
       # SCOPED, so a flaky-test fixer crashing cannot stop BA work. The hold
-      # goes in this job's own HUNTER_HOLD variable and travels to the
-      # ambulance in the dispatch payload; AGENT_LOOP_HOLD — the one the lanes
+      # goes in this job's own AGENT_BLACK_FLAG variable and travels to the
+      # ambulance in the dispatch payload; AGENT_RED_FLAG — the one the lanes
       # gate on — is never touched. Same trick tow-in-or-revert.mjs already
       # uses for an item-scoped hold.
       #

@@ -9,14 +9,14 @@ name: ERP · Agent · ambulance
 # Before this workflow existed the harness filed that as an item fault, released
 # the untouched item to Todo, and agent-pit-wall's `workflow_run: [completed]`
 # trigger re-probed on the very failure — so the fleet re-spun at bootstrap pace
-# until a human noticed Telegram and flipped AGENT_MAX_PARALLEL=0.
+# until a human noticed Telegram and flipped AGENT_CAR_LIMIT=0.
 #
 # Now capture-failure.mjs writes a `harness-broken` hold, the controller stops
 # dispatching lanes, and dispatches ONE of these instead. Fix the problem before
 # continuing the loop.
 #
 # THE PIPELINE (mirrors erp-agent-car.yml's shape, one layer thinner):
-#   1. Materialise the hold  — vars.AGENT_LOOP_HOLD → $AGENT_STATE_DIR/hold.json,
+#   1. Materialise the hold  — vars.AGENT_RED_FLAG → $AGENT_STATE_DIR/hold.json,
 #      which is what /repair-harness reads. Refuses to run without one.
 #   2. /repair-harness       — reproduce the fault on this runner, fix the root
 #      cause, prove it by re-running, land it as a merged PR. The harness owns
@@ -68,7 +68,7 @@ on:
         default: 'latest'
         type: string
       model:
-        description: 'Optional --model override. Empty = the stored AGENT_MODELS setting (default opus) on attempt 1, escalating to opus from attempt 2 when that setting is cheaper.'
+        description: 'Optional --model override. Empty = the stored AGENT_DRIVERS setting (default opus) on attempt 1, escalating to opus from attempt 2 when that setting is cheaper.'
         required: false
         default: ''
         type: string
@@ -207,7 +207,7 @@ jobs:
           # backlog, so this repair must not be able to stop lanes. The repo
           # variable is the FLEET-scoped hold, where lanes really are stopped.
           PAYLOAD_HOLD: ${{ github.event.client_payload.hold }}
-          LOOP_HOLD: ${{ vars.AGENT_LOOP_HOLD }}
+          LOOP_HOLD: ${{ vars.AGENT_RED_FLAG || vars.AGENT_LOOP_HOLD }}
         run: |
           set -euo pipefail
           if [ -n "${PAYLOAD_HOLD:-}" ]; then
@@ -215,9 +215,9 @@ jobs:
             echo "· hold source: dispatch payload (item-scoped)"
           elif [ -n "${LOOP_HOLD:-}" ]; then
             printf '%s\n' "$LOOP_HOLD" | jq . > "${AGENT_STATE_DIR}/hold.json"
-            echo "· hold source: AGENT_LOOP_HOLD (fleet-scoped)"
+            echo "· hold source: AGENT_RED_FLAG (fleet-scoped)"
           else
-            echo "::error::no hold in the payload and AGENT_LOOP_HOLD is unset — there is no recorded failure to repair, and an ambulance with no fault to reproduce is exactly what this design exists to prevent."
+            echo "::error::no hold in the payload and AGENT_RED_FLAG is unset — there is no recorded failure to repair, and an ambulance with no fault to reproduce is exactly what this design exists to prevent."
             exit 1
           fi
           FP=$(jq -r '.fingerprint // "unknown"' "${AGENT_STATE_DIR}/hold.json")
@@ -260,7 +260,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Explicit > the stored AGENT_MODELS setting (default opus) > escalate to
+      # Explicit > the stored AGENT_DRIVERS setting (default opus) > escalate to
       # opus from attempt 2 when that resolved model is cheaper — the same
       # approach already failed once, so the retry escalates the reasoning
       # tier rather than re-running an identical session. All of this lives in
@@ -270,7 +270,7 @@ jobs:
       - name: Resolve model
         env:
           EXPLICIT: ${{ github.event.client_payload.model || inputs.model || '' }}
-          AGENT_MODELS: ${{ vars.AGENT_MODELS }}
+          AGENT_DRIVERS: ${{ vars.AGENT_DRIVERS || vars.AGENT_MODELS }}
         run: |
           set -euo pipefail
           MODEL=$(scripts/ci/ppap/resolve-model.sh ambulance)

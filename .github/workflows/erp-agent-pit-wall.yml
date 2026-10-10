@@ -30,13 +30,13 @@ name: ERP · Pit wall
 #     controller-self-reclaim gap, kept in its own workflow so it can be toggled
 #     on/off from the Actions UI independently.
 #
-# Cap = repo variable AGENT_MAX_PARALLEL (unset → 6) — a hard CEILING only. How
+# Cap = repo variable AGENT_CAR_LIMIT (unset → 6) — a hard CEILING only. How
 # many lanes actually run is computed every tick from the pool's own quota (see
 # "Count active runs + dispatch top-up"), so there is no per-dispatch override:
 # the old max_parallel input + its 24h sticky AGENT_CAP_OVERRIDE were retired
 # once the budget became automatic.
 # KILL SWITCH:
-#   gh variable set AGENT_MAX_PARALLEL -R NamThuanVn/ppap --body 0
+#   gh variable set AGENT_CAR_LIMIT -R NamThuanVn/ppap --body 0
 # → this controller dispatches nothing; in-flight agents finish their current
 # item and their lanes die (top-up yields 0). Keep the cap conservative: agent
 # jobs occupy an org job slot for up to 330 min each, and NamThuanVn shares a
@@ -69,7 +69,7 @@ on:
   #
   # This trigger fires on the very failures it recovers from, so on its own it
   # would re-spin the fleet at run-duration pace — which is exactly what it used
-  # to do, bounded only by a human flipping AGENT_MAX_PARALLEL=0. The bound is
+  # to do, bounded only by a human flipping AGENT_CAR_LIMIT=0. The bound is
   # now structural: the "Read loop hold" step runs FIRST and dispatches nothing
   # while a hold stands. A spent token pool holds until its window reopens; a
   # harness fault holds until an ambulance repairs it, for at most three
@@ -172,7 +172,7 @@ jobs:
     # (a few dozen API calls on a big backlog) + a 20s settle.
     timeout-minutes: 10
     env:
-      CAP_VAR: ${{ vars.AGENT_MAX_PARALLEL || '' }}
+      CAP_VAR: ${{ vars.AGENT_CAR_LIMIT || vars.AGENT_MAX_PARALLEL || '' }}
       TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
     steps:
       # The board scripts keep their run state here (dead-lanes.json is handed
@@ -291,23 +291,23 @@ jobs:
       - name: Resolve cap
         id: cap
         env:
-          AGENT_CRAZY_UNTIL: ${{ vars.AGENT_CRAZY_UNTIL }}
-          AGENT_CRAZY_RESTORE_CAP: ${{ vars.AGENT_CRAZY_RESTORE_CAP }}
-          AGENT_CRAZY_MAX: ${{ vars.AGENT_CRAZY_MAX || '18' }}
-          AGENT_GOD_UNTIL: ${{ vars.AGENT_GOD_UNTIL }}
-          AGENT_GOD_LANES: ${{ vars.AGENT_GOD_LANES }}
+          AGENT_TURBO_UNTIL: ${{ vars.AGENT_TURBO_UNTIL || vars.AGENT_CRAZY_UNTIL }}
+          AGENT_TURBO_RESTORE_LIMIT: ${{ vars.AGENT_TURBO_RESTORE_LIMIT || vars.AGENT_CRAZY_RESTORE_CAP }}
+          AGENT_TURBO_MAX: ${{ vars.AGENT_TURBO_MAX || vars.AGENT_CRAZY_MAX || '18' }}
+          AGENT_MANUAL_UNTIL: ${{ vars.AGENT_MANUAL_UNTIL || vars.AGENT_GOD_UNTIL }}
+          AGENT_MANUAL_CARS: ${{ vars.AGENT_MANUAL_CARS || vars.AGENT_GOD_LANES }}
         run: |
           set -euo pipefail
           CAP="${CAP_VAR:-6}"
           MODE=normal
 
           if ! printf '%s' "$CAP" | grep -qE '^[0-9]+$'; then
-            echo "::error::cap '$CAP' is not a non-negative integer (AGENT_MAX_PARALLEL)"
+            echo "::error::cap '$CAP' is not a non-negative integer (AGENT_CAR_LIMIT)"
             exit 1
           fi
 
           # The kill switch wins outright, god mode and crazy mode included —
-          # checked on the RAW AGENT_MAX_PARALLEL value before any override
+          # checked on the RAW AGENT_CAR_LIMIT value before any override
           # below can raise it back up (precedence: Pause > hold > exhausted
           # pool > god > crazy > normal).
           if [ "$CAP" -eq 0 ]; then
@@ -319,19 +319,19 @@ jobs:
           fi
 
           # God mode outranks crazy mode (issue #4744, this slice #4789). It
-          # never writes AGENT_MAX_PARALLEL, so there is nothing to restore on
-          # expiry: an expired AGENT_GOD_UNTIL just stops applying and falls
+          # never writes AGENT_CAR_LIMIT, so there is nothing to restore on
+          # expiry: an expired AGENT_MANUAL_UNTIL just stops applying and falls
           # through to the crazy-mode check below, same as if it had never
           # been set — the heartbeat's own "Clear god mode after it expires"
           # step deletes the pair on its next tick.
           GOD_VERDICT=$(node scripts/ci/manual-expiry.mjs \
-            --god-until "$AGENT_GOD_UNTIL" --god-lanes "$AGENT_GOD_LANES")
+            --god-until "$AGENT_MANUAL_UNTIL" --god-lanes "$AGENT_MANUAL_CARS")
           GOD_STATE=$(printf '%s' "$GOD_VERDICT" | cut -f1)
           GOD_LANES=$(printf '%s' "$GOD_VERDICT" | cut -f2)
           GOD_REASON=$(printf '%s' "$GOD_VERDICT" | cut -f3-)
 
-          if [ "$GOD_STATE" = not-expired ] && [ -n "$AGENT_GOD_UNTIL" ]; then
-            echo "::notice::god mode active until $AGENT_GOD_UNTIL — effective cap is $GOD_LANES lane(s), ignoring AGENT_MAX_PARALLEL ($CAP) and crazy mode"
+          if [ "$GOD_STATE" = not-expired ] && [ -n "$AGENT_MANUAL_UNTIL" ]; then
+            echo "::notice::god mode active until $AGENT_MANUAL_UNTIL — effective cap is $GOD_LANES lane(s), ignoring AGENT_CAR_LIMIT ($CAP) and crazy mode"
             MODE=god
             CAP="$GOD_LANES"
           else
@@ -341,30 +341,30 @@ jobs:
 
             # Crazy mode's expiry is enforced here too, not only by the
             # heartbeat's restore step (issue #4538 Part B / #4543): an expired
-            # AGENT_CRAZY_UNTIL must hold THIS run to the restore cap even
+            # AGENT_TURBO_UNTIL must hold THIS run to the restore cap even
             # before the heartbeat's next tick (up to 15 minutes later) writes
-            # AGENT_MAX_PARALLEL back down — otherwise a stale
-            # AGENT_MAX_PARALLEL=12 lets the loop dispatch 12 lanes off a window
+            # AGENT_CAR_LIMIT back down — otherwise a stale
+            # AGENT_CAR_LIMIT=12 lets the loop dispatch 12 lanes off a window
             # that already closed.
             VERDICT=$(node scripts/ci/turbo-expiry.mjs \
-              --crazy-until "$AGENT_CRAZY_UNTIL" --restore-cap "$AGENT_CRAZY_RESTORE_CAP")
+              --crazy-until "$AGENT_TURBO_UNTIL" --restore-cap "$AGENT_TURBO_RESTORE_LIMIT")
             STATE=$(printf '%s' "$VERDICT" | cut -f1)
             RESTORE_CAP=$(printf '%s' "$VERDICT" | cut -f2)
             REASON=$(printf '%s' "$VERDICT" | cut -f3-)
             if [ "$STATE" = expired ]; then
               echo "::notice::$REASON — using the restore cap for this run"
               CAP="$RESTORE_CAP"
-            elif [ -n "$AGENT_CRAZY_UNTIL" ]; then
+            elif [ -n "$AGENT_TURBO_UNTIL" ]; then
               # Crazy mode is genuinely active (not expired, and the variable is
               # actually set — turbo-expiry.mjs also reports "not-expired" when
               # it's unset). Crazy mode's whole point is burning whatever the
               # remaining quota can fund, not a fixed number, so the effective
-              # dispatch cap becomes AGENT_CRAZY_MAX itself — AGENT_MAX_PARALLEL
+              # dispatch cap becomes AGENT_TURBO_MAX itself — AGENT_CAR_LIMIT
               # (today's AGENT_CRAZY_CAP write) no longer bounds it, same as
               # laneBudget()'s per-account ceiling (#4690 Decision 2).
-              echo "::notice::crazy mode active until $AGENT_CRAZY_UNTIL — effective cap is AGENT_CRAZY_MAX ($AGENT_CRAZY_MAX), overriding AGENT_MAX_PARALLEL ($CAP)"
+              echo "::notice::crazy mode active until $AGENT_TURBO_UNTIL — effective cap is AGENT_TURBO_MAX ($AGENT_TURBO_MAX), overriding AGENT_CAR_LIMIT ($CAP)"
               MODE=crazy
-              CAP="$AGENT_CRAZY_MAX"
+              CAP="$AGENT_TURBO_MAX"
             fi
           fi
 
@@ -391,7 +391,7 @@ jobs:
       # backlog-empty run.
 
       # NOT gated on the cap: the stranded sweep below must tick even while the
-      # kill switch (AGENT_MAX_PARALLEL=0) holds dispatch at zero — otherwise a
+      # kill switch (AGENT_CAR_LIMIT=0) holds dispatch at zero — otherwise a
       # switch flip while a lane was mid-item leaves that item assigned + In
       # Progress with nothing left to release it.
       #
@@ -434,7 +434,7 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
-          DEAD_LANE_LOOKBACK_H: ${{ vars.DEAD_LANE_LOOKBACK_H || '3' }}
+          AGENT_CRASH_LOOKBACK_H: ${{ vars.AGENT_CRASH_LOOKBACK_H || vars.DEAD_LANE_LOOKBACK_H || '3' }}
         run: node scripts/agent/board/recover/sweep-crashed-cars.mjs
 
       # The alert the dead lane could not send for itself. Gated on held_first so
@@ -536,7 +536,7 @@ jobs:
         run: node scripts/agent/board/pit-wall/gate.mjs
 
       # ── Refresh a STALE pool probe before sizing K ────────────────────────
-      # AGENT_POOL_STATE is written by each lane's own pre-claim probe, so after a
+      # AGENT_FUEL_STATE is written by each lane's own pre-claim probe, so after a
       # quiet spell (or on a manual start) it is older than its 15-min TTL and the
       # gate above publishes an empty usable_accounts/capacity. The dispatch step
       # used to read "unknown" as "uncapped" — controller 36113823869 sent 6 lanes
@@ -559,22 +559,22 @@ jobs:
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
           ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
-          AGENT_USAGE_PROBE: ${{ vars.AGENT_USAGE_PROBE || '1' }}
-          AGENT_BLIND_LANES_PER_ACCOUNT: ${{ vars.AGENT_BLIND_LANES_PER_ACCOUNT || '2' }}
+          AGENT_FUEL_PROBE: ${{ vars.AGENT_FUEL_PROBE || vars.AGENT_USAGE_PROBE || '1' }}
+          AGENT_BLIND_CARS_PER_TANK: ${{ vars.AGENT_BLIND_CARS_PER_TANK || vars.AGENT_BLIND_LANES_PER_ACCOUNT || '2' }}
           # The rest of the pace-to-reset formula's tuning vars (laneBudget() in
           # scripts/agent/run/usage.mjs) — defaults here MUST agree with that
           # file's DEFAULT_* constants and claude.sh's own fallbacks, and with
           # erp-agent-car.yml's job-level env (same vars, same defaults).
-          AGENT_MAX_5H_PCT: ${{ vars.AGENT_MAX_5H_PCT || '90' }}
-          AGENT_MAX_7D_PCT: ${{ vars.AGENT_MAX_7D_PCT || '95' }}
-          AGENT_WARN_5H_PCT: ${{ vars.AGENT_WARN_5H_PCT || '75' }}
-          AGENT_WARN_7D_PCT: ${{ vars.AGENT_WARN_7D_PCT || '85' }}
-          AGENT_LANE_RATE_5H_PCT: ${{ vars.AGENT_LANE_RATE_5H_PCT || '10' }}
-          AGENT_LANE_RATE_7D_PCT: ${{ vars.AGENT_LANE_RATE_7D_PCT || '1.1' }}
-          AGENT_LANE_HOURS: ${{ vars.AGENT_LANE_HOURS || '5.5' }}
-          AGENT_MAX_LANES_PER_ACCOUNT: ${{ vars.AGENT_MAX_LANES_PER_ACCOUNT || '4' }}
-          AGENT_CRAZY_MAX: ${{ vars.AGENT_CRAZY_MAX || '18' }}
-          AGENT_CRAZY_UNTIL: ${{ vars.AGENT_CRAZY_UNTIL }}
+          AGENT_FUEL_MAX_5H_PCT: ${{ vars.AGENT_FUEL_MAX_5H_PCT || vars.AGENT_MAX_5H_PCT || '90' }}
+          AGENT_FUEL_MAX_7D_PCT: ${{ vars.AGENT_FUEL_MAX_7D_PCT || vars.AGENT_MAX_7D_PCT || '95' }}
+          AGENT_FUEL_WARN_5H_PCT: ${{ vars.AGENT_FUEL_WARN_5H_PCT || vars.AGENT_WARN_5H_PCT || '75' }}
+          AGENT_FUEL_WARN_7D_PCT: ${{ vars.AGENT_FUEL_WARN_7D_PCT || vars.AGENT_WARN_7D_PCT || '85' }}
+          AGENT_CAR_BURN_5H_PCT: ${{ vars.AGENT_CAR_BURN_5H_PCT || vars.AGENT_LANE_RATE_5H_PCT || '10' }}
+          AGENT_CAR_BURN_7D_PCT: ${{ vars.AGENT_CAR_BURN_7D_PCT || vars.AGENT_LANE_RATE_7D_PCT || '1.1' }}
+          AGENT_CAR_HOURS: ${{ vars.AGENT_CAR_HOURS || vars.AGENT_LANE_HOURS || '5.5' }}
+          AGENT_MAX_CARS_PER_TANK: ${{ vars.AGENT_MAX_CARS_PER_TANK || vars.AGENT_MAX_LANES_PER_ACCOUNT || '4' }}
+          AGENT_TURBO_MAX: ${{ vars.AGENT_TURBO_MAX || vars.AGENT_CRAZY_MAX || '18' }}
+          AGENT_TURBO_UNTIL: ${{ vars.AGENT_TURBO_UNTIL || vars.AGENT_CRAZY_UNTIL }}
           PROBE_ONLY: '1'
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           # Always the newest release, like every other agent workflow.
@@ -608,7 +608,7 @@ jobs:
           COUNT_ONLY: '1'
           # The probe and the claim walk must see the same cap, or the probe counts
           # items the lanes refuse (claimable.mjs header). Unset → todo.mjs default.
-          AGENT_SIBLING_CAP: ${{ vars.AGENT_SIBLING_CAP }}
+          AGENT_TEAMMATE_CAP: ${{ vars.AGENT_TEAMMATE_CAP || vars.AGENT_SIBLING_CAP }}
           # In scope even though COUNT_ONLY never touches the fork: every step
           # that runs a board script passes it, so nothing depends on which code
           # path happens to avoid it. scripts/gate/ci/agent-board-env.mjs enforces.
@@ -670,11 +670,11 @@ jobs:
       # repo's Claude pool + Telegram secrets + the AGENT_* settings, encrypted
       # with a key derived from PAT_TOKEN_POOL (identical on every fleet repo), so
       # no fleet repo ever has to hold them. Sealed only when lanes go to the
-      # fleet: with AGENT_LANE_HOSTS unset the lanes run here and read this
+      # fleet: with AGENT_CAR_HOSTS unset the lanes run here and read this
       # repo's secrets directly, exactly as before — rollback is one variable.
       # See scripts/agent/run/secret-bundle.mjs for why the payload must be sealed.
       - name: Seal lane bundle
-        if: steps.relplan.outputs.proceed == 'true' && vars.AGENT_LANE_HOSTS == 'fleet'
+        if: steps.relplan.outputs.proceed == 'true' && (vars.AGENT_CAR_HOSTS || vars.AGENT_LANE_HOSTS) == 'fleet'
         env:
           PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
@@ -695,8 +695,8 @@ jobs:
       # Count live lanes on EVERY host (this repo + the CI fleet), compute K
       # (scripts/ci/dispatch-k.mjs, unchanged), place each new lane on a host and
       # dispatch it — scripts/agent/board/pit-wall/dispatch-cars.mjs owns all four;
-      # its header says why lanes left this repo. AGENT_LANE_HOSTS=fleet places
-      # on the fleet at AGENT_LANES_PER_HOST (default 2) per host; unset places
+      # its header says why lanes left this repo. AGENT_CAR_HOSTS=fleet places
+      # on the fleet at AGENT_CARS_PER_CIRCUIT (default 2) per host; unset places
       # here, the old behaviour.
       - name: Count active runs + dispatch top-up
         if: steps.relplan.outputs.proceed == 'true'
@@ -716,8 +716,8 @@ jobs:
           # when the probe predates this field (or is stale), in which case K is
           # not capped by it and the loop behaves exactly as it did before.
           CAPACITY: ${{ steps.pool.outputs.capacity || steps.hold.outputs.capacity }}
-          AGENT_LANE_HOSTS: ${{ vars.AGENT_LANE_HOSTS }}
-          AGENT_LANES_PER_HOST: ${{ vars.AGENT_LANES_PER_HOST || '2' }}
+          AGENT_CAR_HOSTS: ${{ vars.AGENT_CAR_HOSTS || vars.AGENT_LANE_HOSTS }}
+          AGENT_CARS_PER_CIRCUIT: ${{ vars.AGENT_CARS_PER_CIRCUIT || vars.AGENT_LANES_PER_HOST || '2' }}
           BUNDLE: ${{ env.LANE_BUNDLE }}
           # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
           AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
@@ -863,7 +863,7 @@ jobs:
           persist-credentials: false
 
       - name: Seal lane bundle
-        if: vars.AGENT_LANE_HOSTS == 'fleet'
+        if: (vars.AGENT_CAR_HOSTS || vars.AGENT_LANE_HOSTS) == 'fleet'
         env:
           PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
@@ -888,8 +888,8 @@ jobs:
           MODEL: ${{ inputs.model }}
           CLAUDE_VERSION: ${{ inputs.claude_version }}
           TRIGGERED_BY: ${{ github.actor }}
-          AGENT_LANE_HOSTS: ${{ vars.AGENT_LANE_HOSTS }}
-          AGENT_LANES_PER_HOST: ${{ vars.AGENT_LANES_PER_HOST || '2' }}
+          AGENT_CAR_HOSTS: ${{ vars.AGENT_CAR_HOSTS || vars.AGENT_LANE_HOSTS }}
+          AGENT_CARS_PER_CIRCUIT: ${{ vars.AGENT_CARS_PER_CIRCUIT || vars.AGENT_LANES_PER_HOST || '2' }}
           BUNDLE: ${{ env.LANE_BUNDLE }}
           # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
           AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}

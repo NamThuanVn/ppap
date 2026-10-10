@@ -20,7 +20,7 @@ name: ERP · Race clock
 #
 #   1. Fans out to the scheduled workflows that are due. Every one used to carry
 #      its own `schedule:` block and lost it for the same reason this one did.
-#      Which workflows, and when, is the `HEARTBEAT_SCHEDULE` repo variable,
+#      Which workflows, and when, is the `AGENT_RACE_CALENDAR` repo variable,
 #      edited from `/settings/agent-control` (scripts/ci/race-calendar.mjs).
 #      Due-ness is decided by asking GitHub when each last ran, not by wall-clock
 #      arithmetic on this run's start time — a tick that arrives late must not
@@ -166,9 +166,24 @@ jobs:
             scripts/ci
             scripts/agent/board/lib
             scripts/agent/board/pit-wall
+            scripts/agent/ops
             scripts/agent/run
           path: decider
           persist-credentials: false
+
+      # Moves the fleet's repo variables to their racing names (#5816). Idempotent:
+      # it prints "nothing to move" once every variable has moved, and it NEVER
+      # fails the tick — this run's completion is the pit-wall signal, and the
+      # script turns every error into a ::warning:: itself. `continue-on-error` is
+      # the belt for a missing checkout. Readers fall back to the old names until
+      # it has run; slice 7/7 deletes both the fallback and this step.
+      - name: Migrate repo variables to racing names
+        if: steps.decider.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: node decider/scripts/agent/ops/migrate-race-vars.mjs || true
 
       # The job catalogue itself (issue #4538): this workflow only ever runs
       # AFTER being mirrored to NamThuanVn/ppap, so the implicit repo here
@@ -199,7 +214,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
           VARS_JSON: ${{ toJSON(vars) }}
-          AGENT_LANE_HOSTS: ${{ vars.AGENT_LANE_HOSTS }}
+          AGENT_CAR_HOSTS: ${{ vars.AGENT_CAR_HOSTS || vars.AGENT_LANE_HOSTS }}
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}
           CATALOGUE_OUTCOME: ${{ steps.catalogue.outcome }}
           CATALOGUE_FILE: catalogue/.github/workflows/erp-race-calendar.json
@@ -209,7 +224,7 @@ jobs:
           # every job at its default `enabled` + timing. That file documents
           # the job shape, and why every job's inputs (the hunter's
           # `dry_run=false`) must be explicit.
-          HEARTBEAT_SCHEDULE: ${{ vars.HEARTBEAT_SCHEDULE }}
+          AGENT_RACE_CALENDAR: ${{ vars.AGENT_RACE_CALENDAR || vars.HEARTBEAT_SCHEDULE }}
           AGENT_FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
         run: |
           set -uo pipefail
@@ -301,7 +316,7 @@ jobs:
           done <<< "$JOBS"
 
       # Crazy mode's expiry lives on GitHub now (issue #4538 Part B / #4543):
-      # `AGENT_CRAZY_UNTIL` / `AGENT_CRAZY_RESTORE_CAP` are ppap repo variables
+      # `AGENT_TURBO_UNTIL` / `AGENT_TURBO_RESTORE_LIMIT` are ppap repo variables
       # (the ERP's Start/Stop crazy mode writes them). This is the restore
       # side — runs every tick regardless of what the fan-out above dispatched,
       # because crazy mode is a fleet-wide cap, not a per-workflow setting.
@@ -311,8 +326,8 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}
-          AGENT_CRAZY_UNTIL: ${{ vars.AGENT_CRAZY_UNTIL }}
-          AGENT_CRAZY_RESTORE_CAP: ${{ vars.AGENT_CRAZY_RESTORE_CAP }}
+          AGENT_TURBO_UNTIL: ${{ vars.AGENT_TURBO_UNTIL || vars.AGENT_CRAZY_UNTIL }}
+          AGENT_TURBO_RESTORE_LIMIT: ${{ vars.AGENT_TURBO_RESTORE_LIMIT || vars.AGENT_CRAZY_RESTORE_CAP }}
         run: |
           set -uo pipefail
 
@@ -325,7 +340,7 @@ jobs:
           fi
 
           VERDICT=$(node decider/scripts/ci/turbo-expiry.mjs \
-            --crazy-until "$AGENT_CRAZY_UNTIL" --restore-cap "$AGENT_CRAZY_RESTORE_CAP") || {
+            --crazy-until "$AGENT_TURBO_UNTIL" --restore-cap "$AGENT_TURBO_RESTORE_LIMIT") || {
             echo "::warning::turbo-expiry check failed — skipping this tick"
             exit 0
           }
@@ -338,15 +353,15 @@ jobs:
             exit 0
           fi
 
-          echo "crazy mode: $REASON — restoring AGENT_MAX_PARALLEL and clearing the pair"
-          gh variable set AGENT_MAX_PARALLEL -R NamThuanVn/ppap --body "$CAP" \
-            || echo "::warning::failed to restore AGENT_MAX_PARALLEL=$CAP — the next tick retries"
-          gh variable delete AGENT_CRAZY_UNTIL -R NamThuanVn/ppap 2>/dev/null || true
-          gh variable delete AGENT_CRAZY_RESTORE_CAP -R NamThuanVn/ppap 2>/dev/null || true
-          echo "✓ crazy mode expired — AGENT_MAX_PARALLEL=$CAP, AGENT_CRAZY_UNTIL/AGENT_CRAZY_RESTORE_CAP cleared"
+          echo "crazy mode: $REASON — restoring AGENT_CAR_LIMIT and clearing the pair"
+          gh variable set AGENT_CAR_LIMIT -R NamThuanVn/ppap --body "$CAP" \
+            || echo "::warning::failed to restore AGENT_CAR_LIMIT=$CAP — the next tick retries"
+          gh variable delete AGENT_TURBO_UNTIL -R NamThuanVn/ppap 2>/dev/null || true
+          gh variable delete AGENT_TURBO_RESTORE_LIMIT -R NamThuanVn/ppap 2>/dev/null || true
+          echo "✓ crazy mode expired — AGENT_CAR_LIMIT=$CAP, AGENT_TURBO_UNTIL/AGENT_TURBO_RESTORE_LIMIT cleared"
 
       # God mode's expiry (issue #4744, this slice #4789) mirrors the crazy-mode
-      # step above, minus the restore: god mode never writes AGENT_MAX_PARALLEL
+      # step above, minus the restore: god mode never writes AGENT_CAR_LIMIT
       # (it only replaces the effective cap for one loop run — see
       # erp-agent-pit-wall.yml's "Resolve cap"), so there is nothing to restore when
       # it expires, only the pair to clear. erp-agent-pit-wall.yml's own "Resolve
@@ -356,8 +371,8 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}
-          AGENT_GOD_UNTIL: ${{ vars.AGENT_GOD_UNTIL }}
-          AGENT_GOD_LANES: ${{ vars.AGENT_GOD_LANES }}
+          AGENT_MANUAL_UNTIL: ${{ vars.AGENT_MANUAL_UNTIL || vars.AGENT_GOD_UNTIL }}
+          AGENT_MANUAL_CARS: ${{ vars.AGENT_MANUAL_CARS || vars.AGENT_GOD_LANES }}
         run: |
           set -uo pipefail
 
@@ -370,7 +385,7 @@ jobs:
           fi
 
           VERDICT=$(node decider/scripts/ci/manual-expiry.mjs \
-            --god-until "$AGENT_GOD_UNTIL" --god-lanes "$AGENT_GOD_LANES") || {
+            --god-until "$AGENT_MANUAL_UNTIL" --god-lanes "$AGENT_MANUAL_CARS") || {
             echo "::warning::manual-expiry check failed — skipping this tick"
             exit 0
           }
@@ -382,10 +397,10 @@ jobs:
             exit 0
           fi
 
-          echo "god mode: $REASON — clearing AGENT_GOD_UNTIL/AGENT_GOD_LANES (nothing to restore)"
-          gh variable delete AGENT_GOD_UNTIL -R NamThuanVn/ppap 2>/dev/null || true
-          gh variable delete AGENT_GOD_LANES -R NamThuanVn/ppap 2>/dev/null || true
-          echo "✓ god mode expired — AGENT_GOD_UNTIL/AGENT_GOD_LANES cleared"
+          echo "god mode: $REASON — clearing AGENT_MANUAL_UNTIL/AGENT_MANUAL_CARS (nothing to restore)"
+          gh variable delete AGENT_MANUAL_UNTIL -R NamThuanVn/ppap 2>/dev/null || true
+          gh variable delete AGENT_MANUAL_CARS -R NamThuanVn/ppap 2>/dev/null || true
+          echo "✓ god mode expired — AGENT_MANUAL_UNTIL/AGENT_MANUAL_CARS cleared"
 
       # The fleet's GitHub API budget, measured: one GET /user per pooled
       # account, plus one token mint and GET /rate_limit per GitHub App

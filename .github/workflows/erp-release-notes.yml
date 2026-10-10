@@ -163,13 +163,13 @@ jobs:
           "$HOME/.local/bin/claude" --version
 
       # Same precedence every other Claude workflow uses (issue #4751):
-      # explicit > the stored AGENT_MODELS setting for this kind > the kind's
+      # explicit > the stored AGENT_DRIVERS setting for this kind > the kind's
       # built-in default (sonnet). No dispatch-time override here — this job
       # has no `model` input, unlike the agent-session workflows — so it's
       # always stored-setting-or-default.
       - name: Resolve model
         env:
-          AGENT_MODELS: ${{ vars.AGENT_MODELS }}
+          AGENT_DRIVERS: ${{ vars.AGENT_DRIVERS || vars.AGENT_MODELS }}
         run: |
           set -euo pipefail
           MODEL=$(scripts/ci/ppap/resolve-model.sh release-notes)
