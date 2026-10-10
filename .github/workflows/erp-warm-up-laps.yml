@@ -42,7 +42,7 @@ on:
   # No `schedule:`. The hourly clock moved OUT of GitHub — it delayed the
   # schedule EVENT at its own scheduler and dropped ticks it could not place.
   # erp-race-clock.yml dispatches the WRAPPER erp-rookie.yml (catalogue id
-  # `new-org-warmup`) when its last run is over an hour old, driven by a
+  # `rookie`) when its last run is over an hour old, driven by a
   # Cloudflare cron on the ERP's service-utilities worker. The whole-fleet
   # catalogue job was retired once every PPAP_CI_REPOS org measured 20, so this
   # workflow_dispatch trigger is now manual-only — dispatch it by hand to re-probe

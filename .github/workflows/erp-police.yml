@@ -1029,7 +1029,7 @@ jobs:
           # AGENT_MODELS is in the job env from "Load hunter config".
         run: |
           set -euo pipefail
-          MODEL=$(scripts/ci/ppap/resolve-model.sh hunter)
+          MODEL=$(scripts/ci/ppap/resolve-model.sh police)
           echo "CLAUDE_MODEL=$MODEL" >> "$GITHUB_ENV"
 
       # The flakes themselves. A codemod cannot do this — which of two

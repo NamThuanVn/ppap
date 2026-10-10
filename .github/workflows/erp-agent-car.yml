@@ -383,7 +383,7 @@ jobs:
           EXPLICIT: ${{ env.CLAUDE_MODEL }}
         run: |
           set -euo pipefail
-          MODEL=$(scripts/ci/ppap/resolve-model.sh lane)
+          MODEL=$(scripts/ci/ppap/resolve-model.sh car)
           echo "CLAUDE_MODEL=$MODEL" >> "$GITHUB_ENV"
 
       # Classify the Claude token pool before spending anything on it.

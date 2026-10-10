@@ -7,7 +7,7 @@ name: ERP · Hot files
 # state under HOT_FILES — paths and PR numbers only. The claim step reads it from
 # the hub at zero GitHub cost; nothing is committed to the repo.
 #
-# Dispatched once a day by the heartbeat (job `hot-files` in
+# Dispatched once a day by the heartbeat (job `collision-hotspots` in
 # erp-race-calendar.json), never per loop tick: the PAT pool is shared.
 # Readers fail open on a missing/stale key, so a red run here costs nothing.
 #

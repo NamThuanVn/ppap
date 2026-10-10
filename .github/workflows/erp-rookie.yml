@@ -11,7 +11,7 @@ name: ERP · Rookie · new circuits
 # — while this job burns its ceiling up, and a person moves it into
 # PPAP_CI_REPOS once its E2E_HOST_CEILING reaches the target.
 #
-# Dispatched by erp-race-clock.yml (catalogue id `new-org-warmup`, off by
+# Dispatched by erp-race-clock.yml (catalogue id `rookie`, off by
 # default — switch it on at /settings/agent-control). The decision, the
 # busy/unproven guards and the per-run budget all live in the called workflow
 # and scripts/ci/lib/warmup.mjs; this file only picks the list.

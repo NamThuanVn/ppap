@@ -263,7 +263,7 @@ jobs:
           AGENT_MODELS: ${{ vars.AGENT_MODELS }}
         run: |
           set -euo pipefail
-          MODEL=$(scripts/ci/ppap/resolve-model.sh rel-plan)
+          MODEL=$(scripts/ci/ppap/resolve-model.sh qualifying)
           echo "CLAUDE_MODEL=$MODEL" >> "$GITHUB_ENV"
 
       # REL_PLAN=1 → the wrapper runs `/order-todo-queue` (MCP stripped, token

@@ -1,7 +1,7 @@
 {
   "jobs": [
     {
-      "id": "sweep-conflicts",
+      "id": "marshals",
       "workflow": "erp-agent-marshals.yml",
       "enabled": true,
       "mode": "interval",
@@ -9,7 +9,7 @@
       "inputs": {}
     },
     {
-      "id": "new-org-warmup",
+      "id": "rookie",
       "workflow": "erp-rookie.yml",
       "enabled": false,
       "mode": "interval",
@@ -17,7 +17,7 @@
       "inputs": {}
     },
     {
-      "id": "hunter",
+      "id": "police",
       "workflow": "erp-police.yml",
       "repo": "@fleet",
       "enabled": true,
@@ -27,7 +27,7 @@
       "inputs": { "dry_run": "false" }
     },
     {
-      "id": "local-stack",
+      "id": "shakedown",
       "workflow": "erp-local-stack-matrix.yml",
       "enabled": true,
       "mode": "slot",
@@ -37,7 +37,7 @@
       "inputs": {}
     },
     {
-      "id": "prune-branches",
+      "id": "workshop-sweep",
       "workflow": "prune-stale-branches.yml",
       "repo": "@fork",
       "enabled": true,
@@ -57,7 +57,7 @@
       "inputs": { "target": "staging", "dry_run": "false" }
     },
     {
-      "id": "hot-files",
+      "id": "collision-hotspots",
       "workflow": "erp-hot-files.yml",
       "enabled": true,
       "mode": "slot",
@@ -67,10 +67,10 @@
     }
   ],
   "claudeWorkflows": [
-    { "workflow": "erp-agent-car.yml", "kind": "lane" },
-    { "workflow": "erp-police.yml", "kind": "hunter" },
+    { "workflow": "erp-agent-car.yml", "kind": "car" },
+    { "workflow": "erp-police.yml", "kind": "police" },
     { "workflow": "erp-agent-ambulance.yml", "kind": "ambulance" },
-    { "workflow": "erp-agent-qualifying.yml", "kind": "rel-plan" },
+    { "workflow": "erp-agent-qualifying.yml", "kind": "qualifying" },
     { "workflow": "erp-release-notes.yml", "kind": "release-notes" }
   ]
 }
