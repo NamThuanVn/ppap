@@ -165,9 +165,8 @@ jobs:
           sparse-checkout: |
             scripts/ci
             scripts/agent/board/lib
-            scripts/agent/board/loop/fleet-job.mjs
-            scripts/agent/run/secret-bundle.mjs
-          sparse-checkout-cone-mode: false
+            scripts/agent/board/loop
+            scripts/agent/run
           path: decider
           persist-credentials: false
 
@@ -180,8 +179,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v7
         with:
-          sparse-checkout: .github/workflows/erp-heartbeat-schedule.json
-          sparse-checkout-cone-mode: false
+          sparse-checkout: .github/workflows
           path: catalogue
           persist-credentials: false
 

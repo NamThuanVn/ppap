@@ -128,7 +128,6 @@ jobs:
           ref: main
           token: ${{ env.RESOLVED_PAT }}
           sparse-checkout: scripts/ci
-          sparse-checkout-cone-mode: false
           path: decider
           persist-credentials: false
 

@@ -148,7 +148,6 @@ jobs:
           token: ${{ env.RESOLVED_PAT }}
           ref: ${{ github.event.client_payload.ctx.checkout_ref }}
           sparse-checkout: scripts/ci
-          sparse-checkout-cone-mode: false
           persist-credentials: false
 
       - id: plan

@@ -374,7 +374,6 @@ jobs:
           sparse-checkout: |
             scripts/ci
             scripts/agent/board/lib
-          sparse-checkout-cone-mode: false
 
       - name: Watch jobs and publish parts
         continue-on-error: true
@@ -545,7 +544,6 @@ jobs:
           sparse-checkout: |
             scripts/ci
             scripts/agent/board/lib
-          sparse-checkout-cone-mode: false
           persist-credentials: false
 
       # The "green is not clean" scan, folded into this job rather than a

@@ -1560,7 +1560,6 @@ jobs:
           token: ${{ env.RESOLVED_PAT }}
           ref: main
           sparse-checkout: scripts/ci
-          sparse-checkout-cone-mode: false
           persist-credentials: false
 
       - name: Ping Deployment status on private repo
