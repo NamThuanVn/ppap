@@ -115,9 +115,9 @@ jobs:
   record:
     name: 2 · Record the ceiling
     needs: [burn]
-    # `always()` so a probe whose slots all timed out still records what DID
+    # `!cancelled()` so a probe whose slots all timed out still records what DID
     # overlap; the measurement is the timestamps, not the jobs' conclusions.
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

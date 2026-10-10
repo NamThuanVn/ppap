@@ -687,7 +687,7 @@ jobs:
 
   summary:
     needs: [boot, gates]
-    if: always()
+    if: ${{ !cancelled() }}
     name: 3 · Summary
     runs-on: ubuntu-latest
     timeout-minutes: 2

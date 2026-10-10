@@ -892,9 +892,16 @@ jobs:
   # sequential and always all-or-nothing, so the split bought nothing but three
   # nodes in the run graph and two sets of job plumbing. The `result` job
   # existed only because a workflow output must be produced even when the stage
-  # is skipped — handled here by `if: always()` plus an explicit precondition
+  # is skipped — handled here by `if: !cancelled()` plus an explicit precondition
   # gate, which is also the one place that has to get "did the stage actually
   # run?" right.
+  #
+  # `!cancelled()`, never `always()`: on a cancel GitHub re-evaluates each running
+  # job's `if:` and keeps the ones still true, so an `always()` coordinator outlived
+  # every superseding push — it sat in `Wait for e2e batches` to the 40-minute
+  # TIMEOUT_S while the new run waited `pending` on the `ci-<pr>` concurrency
+  # group (PR #5831: two re-pushes, ~36 min each, and the lane exited 65 at
+  # terminal-state-unmet). scripts/gate/ci/workflows.sh pass 0g enforces it.
   #
   # FAILS CLOSED by construction: `result` is the workflow's `e2e` output and
   # the caller treats anything other than the literal `success` as red, so a
@@ -902,7 +909,7 @@ jobs:
   e2e:
     name: 1 · CI · E2E
     needs: [e2e-plan, e2e-build-zones, e2e-seed]
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     # Bounded by the slowest remote shard; the batch jobs cap at 30 min each.
     timeout-minutes: 60
