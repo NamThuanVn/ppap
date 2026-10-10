@@ -47,6 +47,15 @@
       "end": "2300",
       "days": ["mon"],
       "inputs": { "target": "staging", "dry_run": "false" }
+    },
+    {
+      "id": "hot-files",
+      "workflow": "erp-hot-files.yml",
+      "enabled": true,
+      "mode": "slot",
+      "start": "0300",
+      "end": "0600",
+      "inputs": {}
     }
   ],
   "claudeWorkflows": [
