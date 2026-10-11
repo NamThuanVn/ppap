@@ -169,7 +169,7 @@ jobs:
       # always stored-setting-or-default.
       - name: Resolve model
         env:
-          AGENT_DRIVERS: ${{ vars.AGENT_DRIVERS || vars.AGENT_MODELS }}
+          AGENT_DRIVERS: ${{ vars.AGENT_DRIVERS }}
         run: |
           set -euo pipefail
           MODEL=$(scripts/ci/ppap/resolve-model.sh release-notes)

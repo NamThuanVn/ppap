@@ -136,7 +136,7 @@ jobs:
       # declared here as `vars.X || 'default'`. They now come from "Load lane
       # config", and they CANNOT stay here as well: a job-level `env:` key
       # outranks $GITHUB_ENV, so on a fleet repo (no vars) the defaults would
-      # silently override the control repo's real settings — crazy mode included.
+      # silently override the control repo's real settings — turbo mode included.
       # Their defaults live in scripts/agent/run/secret-bundle.mjs VAR_DEFAULTS and
       # MUST agree with laneBudget()'s DEFAULT_* constants in
       # scripts/agent/run/usage.mjs and claude.sh's own fallbacks.

@@ -14,14 +14,14 @@ name: ERP · Race clock
 # The clock is now a Cloudflare cron trigger on the ERP's `service-utilities`
 # worker (`apis/utilities/wrangler.jsonc`), which POSTs `workflow_dispatch` here
 # every 15 minutes using a PAT. To turn it on or off, or to see whether it is
-# actually ticking, use `/settings/admin/agent-control` in the ERP — NOT the Actions UI.
+# actually ticking, use `/settings/admin/race-control` in the ERP — NOT the Actions UI.
 #
 # WHAT IT DOES. Two things, in this order:
 #
 #   1. Fans out to the scheduled workflows that are due. Every one used to carry
 #      its own `schedule:` block and lost it for the same reason this one did.
 #      Which workflows, and when, is the `AGENT_RACE_CALENDAR` repo variable,
-#      edited from `/settings/admin/agent-control` (scripts/ci/race-calendar.mjs).
+#      edited from `/settings/admin/race-control` (scripts/ci/race-calendar.mjs).
 #      Due-ness is decided by asking GitHub when each last ran, not by wall-clock
 #      arithmetic on this run's start time — a tick that arrives late must not
 #      skip a day, and a re-run must not double-fire.
@@ -214,17 +214,17 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
           VARS_JSON: ${{ toJSON(vars) }}
-          AGENT_CAR_HOSTS: ${{ vars.AGENT_CAR_HOSTS || vars.AGENT_LANE_HOSTS }}
+          AGENT_CAR_HOSTS: ${{ vars.AGENT_CAR_HOSTS }}
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}
           CATALOGUE_OUTCOME: ${{ steps.catalogue.outcome }}
           CATALOGUE_FILE: catalogue/.github/workflows/erp-race-calendar.json
           # WHAT runs WHEN is data, not code: a JSON job list in this repo
           # variable, edited from the ERP's "AI agent control" page
-          # (/settings/admin/agent-control). Unset or unreadable means the catalogue as-is —
+          # (/settings/admin/race-control). Unset or unreadable means the catalogue as-is —
           # every job at its default `enabled` + timing. That file documents
           # the job shape, and why every job's inputs (the hunter's
           # `dry_run=false`) must be explicit.
-          AGENT_RACE_CALENDAR: ${{ vars.AGENT_RACE_CALENDAR || vars.HEARTBEAT_SCHEDULE }}
+          AGENT_RACE_CALENDAR: ${{ vars.AGENT_RACE_CALENDAR }}
           AGENT_FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
         run: |
           set -uo pipefail
@@ -315,32 +315,32 @@ jobs:
             fi
           done <<< "$JOBS"
 
-      # Crazy mode's expiry lives on GitHub now (issue #4538 Part B / #4543):
+      # turbo mode's expiry lives on GitHub now (issue #4538 Part B / #4543):
       # `AGENT_TURBO_UNTIL` / `AGENT_TURBO_RESTORE_LIMIT` are ppap repo variables
-      # (the ERP's Start/Stop crazy mode writes them). This is the restore
+      # (the ERP's Start/Stop turbo mode writes them). This is the restore
       # side — runs every tick regardless of what the fan-out above dispatched,
-      # because crazy mode is a fleet-wide cap, not a per-workflow setting.
+      # because turbo mode is a fleet-wide cap, not a per-workflow setting.
       # erp-agent-pit-wall.yml's own "Resolve cap" step covers the gap between an
       # expiry and the next tick landing here (up to 15 minutes).
-      - name: Restore cap after crazy mode expires
+      - name: Restore cap after turbo mode expires
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}
-          AGENT_TURBO_UNTIL: ${{ vars.AGENT_TURBO_UNTIL || vars.AGENT_CRAZY_UNTIL }}
-          AGENT_TURBO_RESTORE_LIMIT: ${{ vars.AGENT_TURBO_RESTORE_LIMIT || vars.AGENT_CRAZY_RESTORE_CAP }}
+          AGENT_TURBO_UNTIL: ${{ vars.AGENT_TURBO_UNTIL }}
+          AGENT_TURBO_RESTORE_LIMIT: ${{ vars.AGENT_TURBO_RESTORE_LIMIT }}
         run: |
           set -uo pipefail
 
           # Same fallback as the dispatch step above: no scripts/ci checkout,
-          # nothing safe to run. Crazy mode simply stays active until the next
+          # nothing safe to run. turbo mode simply stays active until the next
           # tick retries — it is never lost, only delayed.
           if [ "$DECIDER_OUTCOME" != success ]; then
-            echo "::warning::scripts/ci checkout failed — skipping the crazy-mode check this tick"
+            echo "::warning::scripts/ci checkout failed — skipping the turbo-mode check this tick"
             exit 0
           fi
 
           VERDICT=$(node decider/scripts/ci/turbo-expiry.mjs \
-            --crazy-until "$AGENT_TURBO_UNTIL" --restore-cap "$AGENT_TURBO_RESTORE_LIMIT") || {
+            --turbo-until "$AGENT_TURBO_UNTIL" --restore-cap "$AGENT_TURBO_RESTORE_LIMIT") || {
             echo "::warning::turbo-expiry check failed — skipping this tick"
             exit 0
           }
@@ -349,43 +349,43 @@ jobs:
           REASON=$(printf '%s' "$VERDICT" | cut -f3-)
 
           if [ "$STATE" != expired ]; then
-            echo "crazy mode: $REASON"
+            echo "turbo mode: $REASON"
             exit 0
           fi
 
-          echo "crazy mode: $REASON — restoring AGENT_CAR_LIMIT and clearing the pair"
+          echo "turbo mode: $REASON — restoring AGENT_CAR_LIMIT and clearing the pair"
           gh variable set AGENT_CAR_LIMIT -R NamThuanVn/ppap --body "$CAP" \
             || echo "::warning::failed to restore AGENT_CAR_LIMIT=$CAP — the next tick retries"
           gh variable delete AGENT_TURBO_UNTIL -R NamThuanVn/ppap 2>/dev/null || true
           gh variable delete AGENT_TURBO_RESTORE_LIMIT -R NamThuanVn/ppap 2>/dev/null || true
-          echo "✓ crazy mode expired — AGENT_CAR_LIMIT=$CAP, AGENT_TURBO_UNTIL/AGENT_TURBO_RESTORE_LIMIT cleared"
+          echo "✓ turbo mode expired — AGENT_CAR_LIMIT=$CAP, AGENT_TURBO_UNTIL/AGENT_TURBO_RESTORE_LIMIT cleared"
 
-      # God mode's expiry (issue #4744, this slice #4789) mirrors the crazy-mode
-      # step above, minus the restore: god mode never writes AGENT_CAR_LIMIT
+      # Manual mode's expiry (issue #4744, this slice #4789) mirrors the turbo-mode
+      # step above, minus the restore: manual mode never writes AGENT_CAR_LIMIT
       # (it only replaces the effective cap for one loop run — see
       # erp-agent-pit-wall.yml's "Resolve cap"), so there is nothing to restore when
       # it expires, only the pair to clear. erp-agent-pit-wall.yml's own "Resolve
       # cap" step covers the gap between an expiry and the next tick landing
       # here (up to 15 minutes).
-      - name: Clear god mode after it expires
+      - name: Clear manual mode after it expires
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}
-          AGENT_MANUAL_UNTIL: ${{ vars.AGENT_MANUAL_UNTIL || vars.AGENT_GOD_UNTIL }}
-          AGENT_MANUAL_CARS: ${{ vars.AGENT_MANUAL_CARS || vars.AGENT_GOD_LANES }}
+          AGENT_MANUAL_UNTIL: ${{ vars.AGENT_MANUAL_UNTIL }}
+          AGENT_MANUAL_CARS: ${{ vars.AGENT_MANUAL_CARS }}
         run: |
           set -uo pipefail
 
-          # Same fallback as the crazy-mode step above: no scripts/ci checkout,
-          # nothing safe to run. God mode simply stays active until the next
+          # Same fallback as the turbo-mode step above: no scripts/ci checkout,
+          # nothing safe to run. Manual mode simply stays active until the next
           # tick retries — it is never lost, only delayed.
           if [ "$DECIDER_OUTCOME" != success ]; then
-            echo "::warning::scripts/ci checkout failed — skipping the god-mode check this tick"
+            echo "::warning::scripts/ci checkout failed — skipping the manual-mode check this tick"
             exit 0
           fi
 
           VERDICT=$(node decider/scripts/ci/manual-expiry.mjs \
-            --god-until "$AGENT_MANUAL_UNTIL" --god-lanes "$AGENT_MANUAL_CARS") || {
+            --manual-until "$AGENT_MANUAL_UNTIL" --manual-lanes "$AGENT_MANUAL_CARS") || {
             echo "::warning::manual-expiry check failed — skipping this tick"
             exit 0
           }
@@ -393,14 +393,14 @@ jobs:
           REASON=$(printf '%s' "$VERDICT" | cut -f3-)
 
           if [ "$STATE" != expired ]; then
-            echo "god mode: $REASON"
+            echo "manual mode: $REASON"
             exit 0
           fi
 
-          echo "god mode: $REASON — clearing AGENT_MANUAL_UNTIL/AGENT_MANUAL_CARS (nothing to restore)"
+          echo "manual mode: $REASON — clearing AGENT_MANUAL_UNTIL/AGENT_MANUAL_CARS (nothing to restore)"
           gh variable delete AGENT_MANUAL_UNTIL -R NamThuanVn/ppap 2>/dev/null || true
           gh variable delete AGENT_MANUAL_CARS -R NamThuanVn/ppap 2>/dev/null || true
-          echo "✓ god mode expired — AGENT_MANUAL_UNTIL/AGENT_MANUAL_CARS cleared"
+          echo "✓ manual mode expired — AGENT_MANUAL_UNTIL/AGENT_MANUAL_CARS cleared"
 
       # The fleet's GitHub API budget, measured: one GET /user per pooled
       # account, plus one token mint and GET /rate_limit per GitHub App

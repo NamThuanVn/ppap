@@ -12,8 +12,8 @@ name: ERP · Pit open
 #
 # This sleeps until `at`, then fires the loop's own
 # `repository_dispatch[agent-pit-wall]` (erp-agent-pit-wall.yml) — so dispatch resumes
-# within ~2 minutes of the window reopening, in EVERY mode (normal, crazy,
-# god), instead of waiting for the next 15-minute `ERP · Race clock` tick.
+# within ~2 minutes of the window reopening, in EVERY mode (normal, turbo,
+# manual), instead of waiting for the next 15-minute `ERP · Race clock` tick.
 #
 # CHUNKED SLEEP. A GitHub-hosted runner hard-caps a single job at 6h of
 # execution, but a weekly (7-day) usage-window reset can be days away

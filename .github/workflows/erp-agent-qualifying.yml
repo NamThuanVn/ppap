@@ -260,7 +260,7 @@ jobs:
         if: steps.plangate.outputs.proceed == 'true'
         env:
           EXPLICIT: ${{ env.CLAUDE_MODEL }}
-          AGENT_DRIVERS: ${{ vars.AGENT_DRIVERS || vars.AGENT_MODELS }}
+          AGENT_DRIVERS: ${{ vars.AGENT_DRIVERS }}
         run: |
           set -euo pipefail
           MODEL=$(scripts/ci/ppap/resolve-model.sh qualifying)

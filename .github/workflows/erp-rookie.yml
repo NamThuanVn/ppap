@@ -12,7 +12,7 @@ name: ERP · Rookie · new circuits
 # PPAP_CI_REPOS once its E2E_HOST_CEILING reaches the target.
 #
 # Dispatched by erp-race-clock.yml (catalogue id `rookie`, off by
-# default — switch it on at /settings/admin/agent-control). The decision, the
+# default — switch it on at /settings/admin/race-control). The decision, the
 # busy/unproven guards and the per-run budget all live in the called workflow
 # and scripts/ci/lib/warmup.mjs; this file only picks the list.
 #

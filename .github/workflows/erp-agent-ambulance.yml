@@ -207,7 +207,7 @@ jobs:
           # backlog, so this repair must not be able to stop lanes. The repo
           # variable is the FLEET-scoped hold, where lanes really are stopped.
           PAYLOAD_HOLD: ${{ github.event.client_payload.hold }}
-          LOOP_HOLD: ${{ vars.AGENT_RED_FLAG || vars.AGENT_LOOP_HOLD }}
+          LOOP_HOLD: ${{ vars.AGENT_RED_FLAG }}
         run: |
           set -euo pipefail
           if [ -n "${PAYLOAD_HOLD:-}" ]; then
@@ -270,7 +270,7 @@ jobs:
       - name: Resolve model
         env:
           EXPLICIT: ${{ github.event.client_payload.model || inputs.model || '' }}
-          AGENT_DRIVERS: ${{ vars.AGENT_DRIVERS || vars.AGENT_MODELS }}
+          AGENT_DRIVERS: ${{ vars.AGENT_DRIVERS }}
         run: |
           set -euo pipefail
           MODEL=$(scripts/ci/ppap/resolve-model.sh ambulance)
