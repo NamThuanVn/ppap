@@ -46,7 +46,7 @@ on:
   # Cloudflare cron on the ERP's service-utilities worker. The whole-fleet
   # catalogue job was retired once every PPAP_CI_REPOS org measured 20, so this
   # workflow_dispatch trigger is now manual-only — dispatch it by hand to re-probe
-  # the live fleet. See erp-race-clock.yml's header, and `/settings/agent-control`
+  # the live fleet. See erp-race-clock.yml's header, and `/settings/admin/agent-control`
   # in the ERP for the on/off switch.
   workflow_dispatch:
     inputs:

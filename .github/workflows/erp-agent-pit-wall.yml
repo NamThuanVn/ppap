@@ -111,7 +111,7 @@ on:
     types: [agent-pit-wall]
   workflow_dispatch:
     # A non-empty `item` is a ONE-SHOT manual lane (the "Start lane" dialog on
-    # /settings/agent-control): the `wildcard-car` job below places it on a host
+    # /settings/admin/agent-control): the `wildcard-car` job below places it on a host
     # and seals the bundle for it, and the loop's controller does not run. It
     # comes through here rather than straight to erp-agent-car.yml
     # because only this repo holds the secrets a fleet lane must be handed.
@@ -769,7 +769,7 @@ jobs:
           exit 0
 
   # ONE lane on a named item, from the "Start lane" dialog on
-  # /settings/agent-control — outside the loop's cap, gates and backlog, exactly
+  # /settings/admin/agent-control — outside the loop's cap, gates and backlog, exactly
   # as the dialog always behaved when it dispatched erp-agent-car.yml
   # directly. It routes through here now because a lane may run on a CI-fleet
   # repo, and only this repo can seal the bundle such a lane needs. Placement is
