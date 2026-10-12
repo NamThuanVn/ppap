@@ -63,7 +63,11 @@ name: ERP · Car
 # PUBLIC (accepted trade-off — see docs/engineering/platform/ppap-agent-runs.md
 # § Agent runs).
 
-run-name: 'ERP · Car · todo'
+# A lane the pit wall placed through the fleet hub carries the reservation's token
+# (client_payload.token), so the hub matches the run to its hold and shrinks it
+# (apis/utilities fleet-capacity.ts). No token (a manual or control-repo lane) =
+# the bare title. Match on the `ERP · Car · todo` PREFIX, never the whole title.
+run-name: "ERP · Car · todo${{ github.event.client_payload.token && format(' · {0}', github.event.client_payload.token) || '' }}"
 
 on:
   repository_dispatch:
