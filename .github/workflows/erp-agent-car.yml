@@ -335,7 +335,10 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           # STALE_REF_HOURS / BARE_REF_MINUTES come from "Load lane config".
-        run: node scripts/agent/board/claim/todo.mjs
+        run: |
+          # shellcheck source=/dev/null — written by "Load lane config"
+          if [ -n "${LANE_SECRETS:-}" ]; then . "$LANE_SECRETS"; fi
+          node scripts/agent/board/claim/todo.mjs
 
       # Right after the item is known — scripted claim OR a manual `item:`
       # dispatch — publish it as a `lane-item-*` artifact so the ERP status
@@ -765,7 +768,10 @@ jobs:
           # A green run that never got to work: the item is innocent and nothing
           # is broken, so the release comment must say so.
           POOL_EXHAUSTED: ${{ steps.pool.outputs.exhausted }}
-        run: node scripts/agent/board/recover/capture-failure.mjs
+        run: |
+          # shellcheck source=/dev/null — written by "Load lane config"
+          if [ -n "${LANE_SECRETS:-}" ]; then . "$LANE_SECRETS"; fi
+          node scripts/agent/board/recover/capture-failure.mjs
 
       - name: Salvage or revert
         id: salvage
@@ -777,7 +783,10 @@ jobs:
           EXECUTOR_FAILED: ${{ steps.finalize.outcome == 'failure' || steps.park.outcome == 'failure' || steps.split.outcome == 'failure' || steps.abandoned.outcome == 'failure' || steps.blocked.outcome == 'failure' }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # STALE_REF_HOURS comes from "Load lane config".
-        run: node scripts/agent/board/recover/tow-in-or-revert.mjs
+        run: |
+          # shellcheck source=/dev/null — written by "Load lane config"
+          if [ -n "${LANE_SECRETS:-}" ]; then . "$LANE_SECRETS"; fi
+          node scripts/agent/board/recover/tow-in-or-revert.mjs
 
       # Board hygiene, EVERY run (backlog-empty and wrapper runs included): a
       # child can close without its executor running (the PR's `Closes #`
@@ -797,7 +806,10 @@ jobs:
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
           ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
-        run: node scripts/agent/board/claim/reconcile-parents.mjs
+        run: |
+          # shellcheck source=/dev/null — written by "Load lane config"
+          if [ -n "${LANE_SECRETS:-}" ]; then . "$LANE_SECRETS"; fi
+          node scripts/agent/board/claim/reconcile-parents.mjs
 
       # A closed issue is always Done — whatever moved its Status off Done.
       # GitHub's built-in project workflows and this harness both write Status,

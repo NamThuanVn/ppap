@@ -487,7 +487,10 @@ jobs:
         id: held
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: node scripts/agent/board/recover/black-flag.mjs check
+        run: |
+          # shellcheck source=/dev/null — written by "Load lane config"
+          if [ -n "${LANE_SECRETS:-}" ]; then . "$LANE_SECRETS"; fi
+          node scripts/agent/board/recover/black-flag.mjs check
 
       - name: Scan the fleet's CI logs
         id: scan
@@ -1218,6 +1221,8 @@ jobs:
           FAILED_STEP: ${{ steps.fixer.outcome == 'failure' && 'Fix the flaky sites and ship the PR' || '' }}
         run: |
           set -uo pipefail
+          # shellcheck source=/dev/null — written by "Load hunter config"
+          if [ -n "${LANE_SECRETS:-}" ]; then . "$LANE_SECRETS"; fi
           # The exit reason claude.sh recorded, when it got that far. Absent
           # means it never started — which is itself a harness fault.
           REASON=$(jq -r '.reason // ""' "$RUNNER_TEMP/agent-exit.json" 2>/dev/null || echo '')
