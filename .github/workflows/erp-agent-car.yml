@@ -672,11 +672,16 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: node scripts/agent/board/verdict/finalize-merged.mjs
 
+      # Refuses a PARK whose claim-branch PR has unfinished CI (pending / red /
+      # conflicting) and returns the item to Todo instead, PR kept for the
+      # next lane's resume path. After three refusals it also holds the item
+      # and dispatches an item-scoped ambulance.
       - name: Execute park
         id: park
         if: always() && steps.outcome.outputs.verdict == 'PARK'
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: node scripts/agent/board/verdict/execute-garage.mjs
 
       # Every login in the PAT pool, so execute-stages.mjs never @mentions a
@@ -732,7 +737,9 @@ jobs:
       # timed out / verdict=NONE): preserve WIP on salvage/<issue>-<run_id> +
       # draft PR (Refs, never Closes) + session artifact, then release the
       # item back to Todo (unassign + delete claim ref). A run whose claim
-      # branch already has a real PR is left alone (auto-merge lands it).
+      # branch already has an open PR also goes back to Todo, with the branch
+      # and PR kept for the next claim's resume path. A run that hits
+      # timeout-minutes lands here.
       # Executor failures are flag-only. Never reds the job further.
       # Classify WHY this run died, before the salvage path decides what to do
       # about it. A run that died in its BOOTSTRAP never reached the session at
