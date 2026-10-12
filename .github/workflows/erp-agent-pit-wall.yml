@@ -559,6 +559,8 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
+          # NT quota hold threshold, % of the hourly limit left (unset → 15).
+          AGENT_NT_FLOOR_PCT: ${{ vars.AGENT_NT_FLOOR_PCT || '' }}
         run: node scripts/agent/board/pit-wall/gate.mjs
 
       # ── Refresh a STALE pool probe before sizing K ────────────────────────
