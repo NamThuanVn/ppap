@@ -328,6 +328,12 @@ jobs:
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}
           AGENT_TURBO_UNTIL: ${{ vars.AGENT_TURBO_UNTIL }}
           AGENT_TURBO_RESTORE_LIMIT: ${{ vars.AGENT_TURBO_RESTORE_LIMIT }}
+          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: |
           set -uo pipefail
 
@@ -354,10 +360,18 @@ jobs:
           fi
 
           echo "turbo mode: $REASON — restoring AGENT_CAR_LIMIT and clearing the pair"
-          gh variable set AGENT_CAR_LIMIT -R NamThuanVn/ppap --body "$CAP" \
-            || echo "::warning::failed to restore AGENT_CAR_LIMIT=$CAP — the next tick retries"
-          gh variable delete AGENT_TURBO_UNTIL -R NamThuanVn/ppap 2>/dev/null || true
-          gh variable delete AGENT_TURBO_RESTORE_LIMIT -R NamThuanVn/ppap 2>/dev/null || true
+          # Each write is reported back to the hub (the cockpit reads the hub's
+          # copy, not GitHub — fleet-hub.md). Best-effort: the reconcile
+          # corrects a missed mirror within 15 minutes.
+          mirror() { node decider/scripts/agent/run/hub-cli.mjs mirror "$@" \
+            || echo "::warning::could not mirror $1 to the fleet hub — the reconcile corrects it"; }
+          if gh variable set AGENT_CAR_LIMIT -R NamThuanVn/ppap --body "$CAP"; then
+            mirror AGENT_CAR_LIMIT "$CAP"
+          else
+            echo "::warning::failed to restore AGENT_CAR_LIMIT=$CAP — the next tick retries"
+          fi
+          gh variable delete AGENT_TURBO_UNTIL -R NamThuanVn/ppap 2>/dev/null && mirror AGENT_TURBO_UNTIL
+          gh variable delete AGENT_TURBO_RESTORE_LIMIT -R NamThuanVn/ppap 2>/dev/null && mirror AGENT_TURBO_RESTORE_LIMIT
           echo "✓ turbo mode expired — AGENT_CAR_LIMIT=$CAP, AGENT_TURBO_UNTIL/AGENT_TURBO_RESTORE_LIMIT cleared"
 
       # Manual mode's expiry (issue #4744, this slice #4789) mirrors the turbo-mode
@@ -373,6 +387,12 @@ jobs:
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}
           AGENT_MANUAL_UNTIL: ${{ vars.AGENT_MANUAL_UNTIL }}
           AGENT_MANUAL_CARS: ${{ vars.AGENT_MANUAL_CARS }}
+          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: |
           set -uo pipefail
 
@@ -398,8 +418,11 @@ jobs:
           fi
 
           echo "manual mode: $REASON — clearing AGENT_MANUAL_UNTIL/AGENT_MANUAL_CARS (nothing to restore)"
-          gh variable delete AGENT_MANUAL_UNTIL -R NamThuanVn/ppap 2>/dev/null || true
-          gh variable delete AGENT_MANUAL_CARS -R NamThuanVn/ppap 2>/dev/null || true
+          # Reported back to the hub, which the cockpit reads (see the turbo step).
+          mirror() { node decider/scripts/agent/run/hub-cli.mjs mirror "$@" \
+            || echo "::warning::could not mirror $1 to the fleet hub — the reconcile corrects it"; }
+          gh variable delete AGENT_MANUAL_UNTIL -R NamThuanVn/ppap 2>/dev/null && mirror AGENT_MANUAL_UNTIL
+          gh variable delete AGENT_MANUAL_CARS -R NamThuanVn/ppap 2>/dev/null && mirror AGENT_MANUAL_CARS
           echo "✓ manual mode expired — AGENT_MANUAL_UNTIL/AGENT_MANUAL_CARS cleared"
 
       # The fleet's GitHub API budget, measured: one GET /user per pooled
