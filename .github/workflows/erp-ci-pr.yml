@@ -12,7 +12,7 @@ name: ERP · CI · PR · Lint · Typecheck · Test · E2E
 # Note: this collapses the fork-safety boundary that a separate CI_PAT
 # would have provided — see the trade-off note in docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL.
 
-run-name: "${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('ERP · CI · PR #{0} · {1}', github.event.client_payload.pr_number || inputs.pr_number, github.event.client_payload.title || 'manual rerun') || 'ERP · CI · manual · main' }}"
+run-name: "${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('ERP · CI · PR #{0} · {1}', github.event.client_payload.pr_number || inputs.pr_number, github.event.client_payload.title || 'manual rerun') || 'ERP · CI · manual · main' }}${{ github.event.client_payload.token && format(' · {0}', github.event.client_payload.token) || '' }}"
 
 on:
   repository_dispatch:
