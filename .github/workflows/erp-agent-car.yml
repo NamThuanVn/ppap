@@ -1113,3 +1113,15 @@ jobs:
             echo "::warning::could not wake the controller on ${CONTROLLER_REPO} — the 15-min heartbeat re-probes"
           fi
           exit 0
+
+      # The whole job's GitHub spend per token (App installation per org, each
+      # pooled PAT by login) — the numbers a car-limit raise is measured against.
+      # Counted by the `gh` wrapper (fleet-token.sh), so it exists only in App
+      # mode; a PAT-mode lane has no wrapper and prints nothing.
+      - name: GitHub calls summary
+        if: always()
+        run: |
+          if command -v fleet-token >/dev/null 2>&1; then
+            fleet-token calls-table >>"$GITHUB_STEP_SUMMARY" || true
+            fleet-token spill-report >>"$GITHUB_STEP_SUMMARY" || true
+          fi
