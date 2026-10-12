@@ -193,6 +193,12 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           TARGET: ${{ inputs.target || '20' }}
+          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          HUB_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          HUB_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          HUB_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          HUB_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: |
           set -euo pipefail
           JOBS=$(gh api --paginate \
@@ -240,6 +246,29 @@ jobs:
               -f name=E2E_HOST_CEILING -f value="$MAX"
           fi
           echo "✓ E2E_HOST_CEILING: $CUR → $MAX"
+
+          # Tell the fleet hub too, so /capacity answers without a GitHub read
+          # (fleet-hub.md). Best effort: a hub that is off or down never fails the
+          # probe — the next scripts/ci/warmup-fleet.mjs sweep posts it again.
+          if [ "${AGENT_HUB_MODE:-off}" != "off" ]; then
+            if [ "${ERP_HUB_ENV:-staging}" = "production" ]; then
+              HUB=https://namthuan.co/api; HID="${HUB_ID_PRODUCTION:-}"; HSEC="${HUB_SECRET_PRODUCTION:-}"
+            else
+              HUB=https://namthuan.org/api; HID="${HUB_ID_STAGING:-}"; HSEC="${HUB_SECRET_STAGING:-}"
+            fi
+            HTOK=$(curl -s -m 30 -X POST "$HUB/auth/oauth/token" \
+              --data-urlencode grant_type=client_credentials \
+              --data-urlencode "client_id=$HID" --data-urlencode "client_secret=$HSEC" \
+              | jq -r '.access_token // empty' 2>/dev/null || true)
+            if [ -n "$HTOK" ] && curl -sf -m 30 -X POST \
+                 -H "Authorization: Bearer $HTOK" -H 'Content-Type: application/json' \
+                 -d "{\"ceiling\": $MAX}" \
+                 "$HUB/utilities/fleet/_system/hosts/${{ github.repository }}/ceiling" >/dev/null; then
+              echo "✓ fleet hub: ceiling $MAX posted"
+            else
+              echo "fleet hub ceiling post skipped — the next warm-up sweep retries it"
+            fi
+          fi
 
           if [ "$MAX" -ge "$TARGET" ]; then
             echo "🎉 proven at the target — erp-warm-up-laps.yml will stop dispatching to this host."
