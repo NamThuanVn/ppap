@@ -5,6 +5,9 @@ name: ERP · Marshals · clear crashed-car PRs
 # (scripts/agent/run/lib/reconcile.sh); this covers the PRs nobody is waiting on.
 # Design and the never-push-under-a-live-lane rule: scripts/agent/merge/sweep-conflicts.mjs.
 #
+# Then cancels fleet PR CI runs a newer push has superseded
+# (scripts/ci/ppap/cancel-superseded.sh) — moved off the per-push dispatcher.
+#
 # No `schedule:` — the ERP's Cloudflare cron fires erp-race-clock.yml, which
 # dispatches this every 15 minutes (erp-race-calendar.json). `workflow_dispatch`
 # is also how a human forces a sweep.
@@ -121,3 +124,22 @@ jobs:
           git config user.name "${RESOLVED_PAT_LOGIN}"
           git config user.email "${RESOLVED_PAT_LOGIN}@users.noreply.github.com"
           node scripts/agent/merge/sweep-conflicts.mjs --repo NamThuanVn/erp-namthuan
+
+      # Cancels fleet PR CI runs a newer push has superseded. Moved here from
+      # pr-triage-and-ci-dispatch.yml, where it ran on every push on the
+      # self-hosted pool and was most of that job's wall-clock. Why 15 minutes
+      # late is fine, and how "superseded" is decided: the script's header.
+      # `!cancelled()` so a failed conflict sweep above still runs this one.
+      - name: Cancel superseded fleet CI runs
+        if: ${{ !cancelled() }}
+        working-directory: erp
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          # PPAP_CI_REPOS is an erp-namthuan variable; this run lives on ppap.
+          REPOS=$(gh api repos/NamThuanVn/erp-namthuan/actions/variables/PPAP_CI_REPOS --jq .value 2>/dev/null || true)
+          IFS=',' read -r -a FLEET <<< "$REPOS"
+          FLEET+=("NamThuanVn/ppap")  # the dispatcher's fallback target — sweep it too
+          bash scripts/ci/ppap/cancel-superseded.sh NamThuanVn/erp-namthuan "${FLEET[@]}"
