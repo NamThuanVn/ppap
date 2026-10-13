@@ -230,26 +230,28 @@ jobs:
                   --jq '.value' 2>/dev/null || echo '')
           case "$CUR" in ''|*[!0-9]*) CUR=0 ;; esac
 
-          # Monotonic: only ever raise it. A single run can be throttled by
-          # unrelated load in the org, and one unlucky probe must not undo a
+          # Monotonic: only ever raise the VARIABLE. A single run can be throttled
+          # by unrelated load in the org, and one unlucky probe must not undo a
           # ceiling we have already demonstrated.
           if [ "$MAX" -le "$CUR" ]; then
-            echo "✓ ceiling already $CUR ≥ measured $MAX — unchanged"
-            exit 0
-          fi
-
-          if gh api "repos/${{ github.repository }}/actions/variables/E2E_HOST_CEILING" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/${{ github.repository }}/actions/variables/E2E_HOST_CEILING" \
-              -f name=E2E_HOST_CEILING -f value="$MAX"
+            echo "✓ ceiling already $CUR ≥ measured $MAX — variable unchanged"
+            MAX=$CUR
           else
-            gh api -X POST "repos/${{ github.repository }}/actions/variables" \
-              -f name=E2E_HOST_CEILING -f value="$MAX"
+            if gh api "repos/${{ github.repository }}/actions/variables/E2E_HOST_CEILING" >/dev/null 2>&1; then
+              gh api -X PATCH "repos/${{ github.repository }}/actions/variables/E2E_HOST_CEILING" \
+                -f name=E2E_HOST_CEILING -f value="$MAX"
+            else
+              gh api -X POST "repos/${{ github.repository }}/actions/variables" \
+                -f name=E2E_HOST_CEILING -f value="$MAX"
+            fi
+            echo "✓ E2E_HOST_CEILING: $CUR → $MAX"
           fi
-          echo "✓ E2E_HOST_CEILING: $CUR → $MAX"
 
-          # Tell the fleet hub too, so /capacity answers without a GitHub read
-          # (fleet-hub.md). Best effort: a hub that is off or down never fails the
-          # probe — the next scripts/ci/warmup-fleet.mjs sweep posts it again.
+          # Tell the fleet hub the known ceiling, max(CUR, MAX), even when the
+          # variable did not move: a hub that has never seen this host reads it as
+          # unknown (0 free slots). Best effort: a hub that is off or down never
+          # fails the probe. erp-rookie.yml's backfill job re-posts every
+          # PPAP_CI_REPOS host's variable on each sweep (scripts/ci/warmup-fleet.mjs).
           if [ "${AGENT_HUB_MODE:-off}" != "off" ]; then
             if [ "${ERP_HUB_ENV:-staging}" = "production" ]; then
               HUB=https://namthuan.co/api; HID="${HUB_ID_PRODUCTION:-}"; HSEC="${HUB_SECRET_PRODUCTION:-}"
@@ -266,7 +268,7 @@ jobs:
                  "$HUB/utilities/fleet/_system/hosts/${{ github.repository }}/ceiling" >/dev/null; then
               echo "✓ fleet hub: ceiling $MAX posted"
             else
-              echo "fleet hub ceiling post skipped — the next warm-up sweep retries it"
+              echo "fleet hub ceiling post skipped — the rookie backfill sweep retries it"
             fi
           fi
 

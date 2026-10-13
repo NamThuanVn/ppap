@@ -48,3 +48,14 @@ jobs:
       max_hosts: ${{ inputs.max_hosts || '4' }}
       dry_run: ${{ inputs.dry_run == true }}
     secrets: inherit
+
+  # Backfill the fleet hub's ceilings. Hosts already proven are never re-probed, so
+  # nothing else posts their E2E_HOST_CEILING and the hub reads them as unknown
+  # (0 free slots). dry_run: the sweep posts what it reads and dispatches nothing.
+  backfill:
+    uses: ./.github/workflows/erp-warm-up-laps.yml
+    with:
+      list_var: PPAP_CI_REPOS
+      target: ${{ inputs.target || '20' }}
+      dry_run: true
+    secrets: inherit
