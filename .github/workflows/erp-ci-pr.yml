@@ -98,6 +98,11 @@ jobs:
               'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
               || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
             FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            # actions/checkout spends one GET /repos/{owner}/{repo}/hash-algorithm per checkout of a
+            # branch, on the token it is given. A checkout that persists no credentials only reads,
+            # so it takes a pooled PAT (CHECKOUT_PAT) for that call; git writes stay on the App.
+            CO=$(FLEET_APP_DIR="$D" "$D/bin/fleet-token" spill NamThuanVn api repos/NamThuanVn/erp-namthuan/hash-algorithm 2>/dev/null) || CO=''
+            if [ -n "$CO" ]; then echo "::add-mask::$CO"; echo "CHECKOUT_PAT=$CO" >> "$GITHUB_ENV"; fi
             LOGIN='namthuan-erp-fleet[bot]'
             { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
             echo "GitHub App -> @$LOGIN"
@@ -320,6 +325,11 @@ jobs:
               'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
               || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
             FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            # actions/checkout spends one GET /repos/{owner}/{repo}/hash-algorithm per checkout of a
+            # branch, on the token it is given. A checkout that persists no credentials only reads,
+            # so it takes a pooled PAT (CHECKOUT_PAT) for that call; git writes stay on the App.
+            CO=$(FLEET_APP_DIR="$D" "$D/bin/fleet-token" spill NamThuanVn api repos/NamThuanVn/erp-namthuan/hash-algorithm 2>/dev/null) || CO=''
+            if [ -n "$CO" ]; then echo "::add-mask::$CO"; echo "CHECKOUT_PAT=$CO" >> "$GITHUB_ENV"; fi
             LOGIN='namthuan-erp-fleet[bot]'
             { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
             echo "GitHub App -> @$LOGIN"
@@ -484,6 +494,11 @@ jobs:
               'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
               || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
             FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            # actions/checkout spends one GET /repos/{owner}/{repo}/hash-algorithm per checkout of a
+            # branch, on the token it is given. A checkout that persists no credentials only reads,
+            # so it takes a pooled PAT (CHECKOUT_PAT) for that call; git writes stay on the App.
+            CO=$(FLEET_APP_DIR="$D" "$D/bin/fleet-token" spill NamThuanVn api repos/NamThuanVn/erp-namthuan/hash-algorithm 2>/dev/null) || CO=''
+            if [ -n "$CO" ]; then echo "::add-mask::$CO"; echo "CHECKOUT_PAT=$CO" >> "$GITHUB_ENV"; fi
             LOGIN='namthuan-erp-fleet[bot]'
             { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
             echo "GitHub App -> @$LOGIN"
@@ -562,7 +577,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: ${{ env.PRIVATE_REPO }}
-          token: ${{ env.RESOLVED_PAT }}
+          token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
           ref: ${{ steps.digest_ref.outputs.ref }}
           # scripts/agent/board/lib: the fleet hub client `parts.mjs clear` reads in `on` mode.
           sparse-checkout: |
