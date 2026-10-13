@@ -44,9 +44,12 @@ on:
   # erp-race-clock.yml dispatches the WRAPPER erp-rookie.yml (catalogue id
   # `rookie`) when its last run is over an hour old, driven by a
   # Cloudflare cron on the ERP's service-utilities worker. The whole-fleet
-  # catalogue job was retired once every PPAP_CI_REPOS org measured 20, so this
-  # workflow_dispatch trigger is now manual-only — dispatch it by hand to re-probe
-  # the live fleet. See erp-race-clock.yml's header, and `/settings/admin/race-control`
+  # PROBE was retired once every PPAP_CI_REPOS org measured 20; the catalogue's
+  # `fleet-warmup` job now dispatches this hourly with dry_run=true, which probes
+  # nothing and only posts each proven host's E2E_HOST_CEILING to the fleet hub —
+  # without it the hub knows no ceiling, reads every host as full, and the pit
+  # wall places 0 cars. Dispatch it by hand with dry_run=false to re-probe the
+  # live fleet. See erp-race-clock.yml's header, and `/settings/admin/race-control`
   # in the ERP for the on/off switch.
   workflow_dispatch:
     inputs:

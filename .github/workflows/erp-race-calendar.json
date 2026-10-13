@@ -17,6 +17,14 @@
       "inputs": {}
     },
     {
+      "id": "fleet-warmup",
+      "workflow": "erp-warm-up-laps.yml",
+      "enabled": true,
+      "mode": "interval",
+      "everyMin": 60,
+      "inputs": { "dry_run": "true" }
+    },
+    {
       "id": "police",
       "workflow": "erp-police.yml",
       "repo": "@fleet",
