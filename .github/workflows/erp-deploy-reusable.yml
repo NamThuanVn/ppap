@@ -401,6 +401,12 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
   # ───────────────────────────────────────────────────────────────────────────
   # 1. CI gate. Runs biome / typecheck / lint / vitest in parallel against
   #    the deploy ref BEFORE any infra touches Cloudflare or HCP. Lives in
@@ -620,6 +626,12 @@ jobs:
           path: terraform/tf-outputs.json
           retention-days: 1
 
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
   # ───────────────────────────────────────────────────────────────────────────
   # 2. Build every API worker bundle in parallel. `wrangler deploy --dry-run
   #    --outdir dist` bundles + minifies WITHOUT contacting Cloudflare; the
@@ -777,6 +789,12 @@ jobs:
           path: worker-${{ matrix.service }}.tar
           retention-days: 1
           compression-level: 0
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
 
   # ───────────────────────────────────────────────────────────────────────────
   # 3. Build every Next.js zone (OpenNext → Cloudflare Workers) in parallel.
@@ -962,6 +980,12 @@ jobs:
           path: zone-${{ matrix.zone.name }}.tar
           retention-days: 1
           compression-level: 0
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
 
   # ───────────────────────────────────────────────────────────────────────────
   # 4. ONE ordered deploy job. Downloads every prebuilt artifact (worker
@@ -1422,6 +1446,12 @@ jobs:
           gh variable set "$VAR_NAME" --body "$SHA" -R "$REPO"
           echo "✓ $VAR_NAME = $SHA"
 
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
   # ───────────────────────────────────────────────────────────────────────────
   # 5. Pingback. The dispatcher in the private repo created a *pending*
   #    GitHub Deployment; we close it out here with success/failure so
@@ -1665,3 +1695,9 @@ jobs:
           else
             echo "::warning::Telegram notify failed (deploy failure alert not delivered)."
           fi
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true

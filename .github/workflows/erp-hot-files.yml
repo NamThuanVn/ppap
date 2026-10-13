@@ -134,3 +134,9 @@ jobs:
           git config user.name 'erp-hot-files'
           git config user.email 'erp-hot-files@users.noreply.github.com'
           node scripts/agent/merge/hot-files.mjs --publish
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true

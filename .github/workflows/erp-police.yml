@@ -330,6 +330,12 @@ jobs:
 
           **The full e2e suite on this PR is the evidence.** A failure here is a real finding: it names a spec that was relying on a hand-typed budget."
 
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
   # ------------------------------------------------------------------ noise
   #
   # The "green is not clean" hunt. erp-ci-pr.yml already counts this residue PER RUN
@@ -682,6 +688,12 @@ jobs:
             echo "filed #$NUM — $SUMMARY"
           fi
           exit 0
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
 
   # ── THE KILL ──────────────────────────────────────────────────────────────
   #
@@ -1371,6 +1383,12 @@ jobs:
           esac
           exit 0
 
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
   # ── HUNT WHEN THE WINDOW IS QUIET ────────────────────────────────────────
   #
   # A pooled window with nothing to kill is not the same as a healthy suite.
@@ -1557,3 +1575,9 @@ jobs:
             echo "::warning::could not re-enter the hunter — the sampling runs are in the fleet's logs and tonight's sweep will pool them anyway, a day later than intended"
           fi
           exit 0
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true

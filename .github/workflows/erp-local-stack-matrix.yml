@@ -507,6 +507,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
   # The gates a BA's machine runs on EVERY turn, on every OS. Cheap: one install
   # and six commands, no stack, no browser, no database.
   #
@@ -684,6 +690,12 @@ jobs:
 
       - name: Doc links (CLAUDE.md, .claude/, READMEs)
         run: node scripts/ba/doc-links.mjs
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
 
   summary:
     needs: [boot, gates]

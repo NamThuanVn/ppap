@@ -350,6 +350,12 @@ jobs:
             echo "▶ $s: $v" >&2
           done
 
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
   # Plan the e2e run. Two responsibilities:
   #   1. Decide SCOPE — when e2e_changed_only is true (PR CI), diff the PR
   #      (HEAD^1..HEAD on refs/pull/N/merge) through scripts/ci/e2e/plan.sh:
@@ -543,6 +549,12 @@ jobs:
           MATRIX="$(node scripts/ci/e2e/zones.mjs)"
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "▶ e2e zones: $(node scripts/ci/e2e/zones.mjs --names | tr '\n' ' ')" >&2
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
 
   # Build each dashboard zone on its OWN runner, in parallel. The 6 OpenNext
   # zones are fully independent (no cross-zone deps; dashboard-shell exports raw
@@ -758,6 +770,12 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
   # Seed the isolated e2e DB ONCE, in parallel with the zone builds (it only
   # needs the per-service migration scripts, not the dashboard build output).
   # Isolated-state branch of scripts/dev/db/reset.sh: per-service `wrangler d1 migrations
@@ -885,6 +903,12 @@ jobs:
           path: e2e-seed.tar
           retention-days: 1
           compression-level: 0
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
   # ONE job for the whole e2e stage: work out where the shards go, dispatch
   # them, wait for them, and emit the single verdict the caller reads.
   #
@@ -1145,3 +1169,9 @@ jobs:
           fi
           echo "result=$RESULT" >> "$GITHUB_OUTPUT"
           echo "▶ e2e verdict: proceed=$PROCEED dispatch=$DISPATCH collect=$COLLECT/$COLLECT_RESULT → $RESULT" >&2
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true

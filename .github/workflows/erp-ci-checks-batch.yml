@@ -172,6 +172,12 @@ jobs:
           echo "run=$RUN" >> "$GITHUB_OUTPUT"
           echo "▶ checks batch units=[$UNITS] run=$RUN" >&2
 
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
   check:
     name: ${{ matrix.unit.name }}
     needs: plan
@@ -306,3 +312,9 @@ jobs:
           FLEET_AUTH_MODE: ''
           FLEET_APP_DIR: ''
         run: bash ./scripts/ci/checks/run-shard.sh "$SUITE" "$SHARD"
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true

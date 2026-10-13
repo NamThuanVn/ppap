@@ -172,6 +172,12 @@ jobs:
           echo "run=$RUN" >> "$GITHUB_OUTPUT"
           echo "▶ batch shards=$JSON run=$RUN" >&2
 
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
   # Identical to erp-ci-checks.yml's `e2e` job, except the build/seed artifacts are
   # pulled from the COORDINATOR's run in another repo. Keep the two in step:
   # a change to the boot/run contract in one must land in the other.
@@ -608,3 +614,9 @@ jobs:
             e2e-serve*.log
           retention-days: 7
           if-no-files-found: ignore
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true

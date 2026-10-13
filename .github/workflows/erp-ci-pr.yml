@@ -183,6 +183,12 @@ jobs:
             echo "::warning::could not re-point the pending $STATUS_CONTEXT status at this run — the dispatcher's pending status stands"
           fi
 
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
   # Run the CI graph. erp-ci-checks.yml lives in the same repo and exposes one
   # verdict per suite (gates, typecheck, lint, test, e2e) as a workflow_call
   # output, so the report job below can build a per-suite summary without
@@ -398,6 +404,12 @@ jobs:
             --run-id "${{ github.run_id }}" \
             --repo "${{ github.repository }}" \
             --private-repo "${{ env.PRIVATE_REPO }}"
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
 
   # Posts the final commit-status update on the PR's head SHA, replacing the
   # `pending` status that pr-triage-and-ci-dispatch.yml created. `if: !cancelled()` so
@@ -1100,3 +1112,9 @@ jobs:
           node scripts/ci/parts.mjs clear --pr "$PR_NUMBER" --repo "$REPO" 2>/dev/null || true
           echo "▶ $MERGE_LINE"
           exit 0
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
