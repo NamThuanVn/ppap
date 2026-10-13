@@ -571,8 +571,8 @@ jobs:
           TRIGGERED_BY: ${{ github.event.client_payload.triggered_by || github.actor }}
           # NT quota hold threshold, % of the hourly limit left (unset → 15).
           AGENT_NT_FLOOR_PCT: ${{ vars.AGENT_NT_FLOOR_PCT || '' }}
-          # The fleet hub's NT sample overrules a header read that looks wrong
-          # (a fresh token reports a fresh window) — lib/nt-quota.mjs.
+          # The fleet hub's NT sample stands in when the header read fails
+          # (lib/nt-quota.mjs chooseNtReading).
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
@@ -586,8 +586,8 @@ jobs:
       # cool — never above AGENT_CAR_LIMIT, which it never writes. Manual mode
       # is untouched; turbo is clamped (precedence: Pause > hold > exhausted
       # pool > manual > thermostat > turbo / normal). The live reading is the
-      # gate's NT reading (header, or the hub sample when the header looks
-      # wrong); history and the stored level come from the
+      # gate's NT reading (a real call's headers, or the hub sample when there
+      # is none); history and the stored level come from the
       # fleet hub, so this costs no GitHub call. Config: AGENT_THERMOSTAT
       # (race-control cockpit). Best-effort: if it dies, its `cap` output is
       # empty and the dispatch below uses the mode's cap, exactly as before.
