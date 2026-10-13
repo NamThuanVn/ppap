@@ -309,7 +309,8 @@ jobs:
           # The kill switch wins outright, manual mode and turbo mode included —
           # checked on the RAW AGENT_CAR_LIMIT value before any override
           # below can raise it back up (precedence: Pause > hold > exhausted
-          # pool > manual > turbo > normal).
+          # pool > manual > thermostat > turbo > normal; the thermostat is its
+          # own step, after the hold).
           if [ "$CAP" -eq 0 ]; then
             echo "::notice::cap is 0 (kill switch) — dispatching nothing"
             echo "proceed=false" >> "$GITHUB_OUTPUT"
@@ -563,6 +564,34 @@ jobs:
           AGENT_NT_FLOOR_PCT: ${{ vars.AGENT_NT_FLOOR_PCT || '' }}
         run: node scripts/agent/board/pit-wall/gate.mjs
 
+      # ── The NT thermostat (#6134) ─────────────────────────────────────────
+      # Sizes the fleet from NT's hourly quota: cuts to lowCars when NT runs
+      # hot, restores after the reset, grows a step per window while it stays
+      # cool — never above AGENT_CAR_LIMIT, which it never writes. Manual mode
+      # is untouched; turbo is clamped (precedence: Pause > hold > exhausted
+      # pool > manual > thermostat > turbo / normal). The live reading is the
+      # gate's own header read; history and the stored level come from the
+      # fleet hub, so this costs no GitHub call. Config: AGENT_THERMOSTAT
+      # (race-control cockpit). Best-effort: if it dies, its `cap` output is
+      # empty and the dispatch below uses the mode's cap, exactly as before.
+      - name: NT thermostat
+        id: thermostat
+        if: steps.cap.outputs.proceed == 'true' && steps.hold.outputs.proceed == 'true'
+        continue-on-error: true
+        env:
+          CAP: ${{ steps.cap.outputs.cap }}
+          MODE: ${{ steps.cap.outputs.mode }}
+          AGENT_THERMOSTAT: ${{ vars.AGENT_THERMOSTAT }}
+          NT_REMAINING: ${{ steps.hold.outputs.nt_remaining }}
+          NT_LIMIT: ${{ steps.hold.outputs.nt_limit }}
+          NT_RESET: ${{ steps.hold.outputs.nt_reset }}
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
+        run: node scripts/agent/board/pit-wall/thermostat.mjs
+
       # ── Refresh a STALE pool probe before sizing K ────────────────────────
       # AGENT_FUEL_STATE is written by each lane's own pre-claim probe, so after a
       # quiet spell (or on a manual start) it is older than its 15-min TTL and the
@@ -742,7 +771,8 @@ jobs:
           # Reads now cross repos, so the pooled PAT does both reads and writes
           # (GITHUB_TOKEN events don't trigger workflows anyway).
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          CAP: ${{ steps.cap.outputs.cap }}
+          # The thermostat's clamp when it ran, the mode's cap otherwise.
+          CAP: ${{ steps.thermostat.outputs.cap || steps.cap.outputs.cap }}
           MODE: ${{ steps.cap.outputs.mode }}
           CANDIDATES: ${{ steps.probe.outputs.candidates }}
           # How many Claude accounts the last pool probe found usable. Empty when
