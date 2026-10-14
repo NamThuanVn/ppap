@@ -304,7 +304,7 @@ jobs:
         env:
           AGENT_TURBO_UNTIL: ${{ vars.AGENT_TURBO_UNTIL }}
           AGENT_TURBO_RESTORE_LIMIT: ${{ vars.AGENT_TURBO_RESTORE_LIMIT }}
-          AGENT_TURBO_MAX: ${{ vars.AGENT_TURBO_MAX || '18' }}
+          AGENT_TURBO_MAX: ${{ vars.AGENT_TURBO_MAX || '30' }}
           AGENT_MANUAL_UNTIL: ${{ vars.AGENT_MANUAL_UNTIL }}
           AGENT_MANUAL_CARS: ${{ vars.AGENT_MANUAL_CARS }}
         run: |
