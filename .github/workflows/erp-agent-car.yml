@@ -134,16 +134,14 @@ jobs:
       ITEM_ARG: ${{ github.event.client_payload.item || inputs.item || '' }}
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || 'latest' }}
-      # The pool-probe and pace-to-reset tuning vars (AGENT_FUEL_PROBE,
-      # AGENT_BLIND_CARS_PER_TANK, AGENT_MAX_/WARN_/LANE_RATE_*,
-      # AGENT_CAR_HOURS, AGENT_MAX_CARS_PER_TANK, AGENT_CRAZY_*) used to be
-      # declared here as `vars.X || 'default'`. They now come from "Load lane
+      # The pool-probe tuning vars (AGENT_FUEL_PROBE, AGENT_FUEL_MAX_*/WARN_*)
+      # used to be declared here as `vars.X || 'default'`. They now come from "Load lane
       # config", and they CANNOT stay here as well: a job-level `env:` key
       # outranks $GITHUB_ENV, so on a fleet repo (no vars) the defaults would
-      # silently override the control repo's real settings — turbo mode included.
+      # silently override the control repo's real settings.
       # Their defaults live in scripts/agent/run/secret-bundle.mjs VAR_DEFAULTS and
-      # MUST agree with laneBudget()'s DEFAULT_* constants in
-      # scripts/agent/run/usage.mjs and claude.sh's own fallbacks.
+      # MUST agree with DEFAULT_THRESHOLDS in scripts/agent/run/usage.mjs and
+      # claude.sh's own fallbacks.
     steps:
       # AGENT_STATE_DIR must be set HERE, not in the job-level `env:` block.
       # `runner` is not an available context for `jobs.<id>.env` — only from
