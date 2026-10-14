@@ -71,6 +71,8 @@ jobs:
           AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
           APP_ID: ${{ secrets.FLEET_APP_ID }}
           APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          # A batch job's PAT budgets from its coordinator (scripts/ci/ppap/fleet-token.sh hint); empty otherwise.
+          FLEET_PAT_HINT: ${{ github.event.client_payload.ctx.pat_hint }}
         run: |
           set -uo pipefail
           if [ "${AUTH_MODE:-pat}" = app ]; then
@@ -298,6 +300,8 @@ jobs:
           AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
           APP_ID: ${{ secrets.FLEET_APP_ID }}
           APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          # A batch job's PAT budgets from its coordinator (scripts/ci/ppap/fleet-token.sh hint); empty otherwise.
+          FLEET_PAT_HINT: ${{ github.event.client_payload.ctx.pat_hint }}
         run: |
           set -uo pipefail
           if [ "${AUTH_MODE:-pat}" = app ]; then
@@ -467,6 +471,8 @@ jobs:
           AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
           APP_ID: ${{ secrets.FLEET_APP_ID }}
           APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          # A batch job's PAT budgets from its coordinator (scripts/ci/ppap/fleet-token.sh hint); empty otherwise.
+          FLEET_PAT_HINT: ${{ github.event.client_payload.ctx.pat_hint }}
         run: |
           set -uo pipefail
           if [ "${AUTH_MODE:-pat}" = app ]; then
