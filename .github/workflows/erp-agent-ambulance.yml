@@ -308,6 +308,10 @@ jobs:
             git config user.email "${LOGIN}@users.noreply.github.com"
           fi
           echo "✓ workspace on upstream main $(git rev-parse --short HEAD) · acting as @$LOGIN"
+          # Who this run pushes as, and from when — what "Arm the side PRs"
+          # uses to tell a PR this session opened from every other bot PR.
+          echo "FLEET_LOGIN=$LOGIN" >> "$GITHUB_ENV"
+          echo "RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
       # continue-on-error because the dependency install may BE the fault under
       # diagnosis — and an ambulance that dies on the very step it was sent to
@@ -363,6 +367,18 @@ jobs:
           rm -rf "$SNAPSHOT"
           cp -a scripts "$SNAPSHOT"
           bash "$SNAPSHOT/agent/run/claude.sh"
+
+      # The repair PR on $REPAIR_BRANCH is armed by the session itself
+      # (/repair-harness opens it with --label auto-merge) and waited on by the
+      # wrapper. Any OTHER PR the session opened had nobody arming it — the
+      # same single-branch blind spot Police had (#6333). Same helper, same
+      # rule: only PRs this run opened, each labelled and given one evaluating
+      # wave; never another run's PR, never a human's.
+      - name: Arm the side PRs the session opened
+        if: always()
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node scripts/ci/ppap/arm-side-prs.mjs --exclude "$REPAIR_BRANCH"
 
       - name: Parse repair verdict
         id: verdict

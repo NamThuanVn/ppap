@@ -1025,6 +1025,10 @@ jobs:
             echo "✓ shipping from $BRANCH via $FORK_REPO as @$LOGIN"
           fi
           echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          # Who this run pushes as, and from when — what "Arm the side PRs"
+          # uses to tell a PR this session opened from every other bot PR.
+          echo "FLEET_LOGIN=$LOGIN" >> "$GITHUB_ENV"
+          echo "RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
       - uses: ./.github/actions/install
 
@@ -1395,6 +1399,19 @@ jobs:
             echo "::warning::could not label PR #$PR auto-merge; it will need a human to merge"
           fi
           exit 0
+
+      # …and every OTHER PR the session opened. The step above looks only at
+      # $BRANCH, so a second branch cut mid-session (the brief allows one when
+      # CI itself is broken) sat unlabelled for ever: #6333, run 38465438636.
+      # scripts/ci/ppap/arm-side-prs.mjs picks only PRs this run opened — a
+      # local branch of this checkout, our fork, our login, opened after
+      # RUN_STARTED_AT — and arms each the way the step above does: label, then
+      # one evaluating wave. Never another run's PR, never a human's.
+      - name: Arm the side PRs the session opened
+        if: ${{ always() && !inputs.dry_run && !inputs.smoke }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node scripts/ci/ppap/arm-side-prs.mjs --exclude "$BRANCH"
 
       - name: Say plainly whether the session got its PR merged
         if: ${{ always() && !inputs.smoke }}
