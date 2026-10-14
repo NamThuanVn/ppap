@@ -677,6 +677,16 @@ jobs:
           # that runs a board script passes it, so nothing depends on which code
           # path happens to avoid it. scripts/gate/ci/agent-board-env.mjs enforces.
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
+          # Without it the probe read GitHub every tick — 8 label listings plus one
+          # GraphQL read per unassigned leaf, ~48 PAT calls — although the hub has
+          # served the sweep and every leaf's edges since #5587.
+          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: node scripts/agent/board/claim/todo.mjs
 
       - name: Probe private-repo backlog (exact eligibility)
