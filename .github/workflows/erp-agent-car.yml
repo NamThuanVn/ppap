@@ -347,6 +347,12 @@ jobs:
         if: env.ITEM_ARG == ''
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          # A Critical-reserve car (dispatch-cars.mjs pinnedArgs): claims this one
+          # item or nothing. A separate field from `item` on purpose — `item` is the
+          # legacy one-shot path that skips this scripted claim altogether. A pinned
+          # car carries no `loop`, so "Continue loop" never chains it into a
+          # general-capacity car.
+          PINNED_ITEM: ${{ github.event.client_payload.pin || '' }}
           # STALE_REF_HOURS / BARE_REF_MINUTES come from "Load lane config".
         run: |
           # shellcheck source=/dev/null — written by "Load lane config"
