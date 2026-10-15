@@ -372,11 +372,12 @@ jobs:
           fi
           exit 0
 
-      - name: Checkout ppap (for scripts/ci)
-        uses: actions/checkout@v5
-
       # Same race as the report job's: the PR can merge mid-run and take
       # refs/pull/N/merge with it. Fall back to main rather than fail the watcher.
+      # Runs BEFORE the ppap checkout: that checkout persists this run's own
+      # github.token as an http extraheader in the workspace's .git/config, which
+      # git sends in place of the URL's credentials — so an ls-remote of
+      # erp-namthuan from inside it answers "Repository not found" (exit 128).
       - name: Pick the scripts ref
         id: scripts_ref
         env:
@@ -394,6 +395,9 @@ jobs:
             if [ -n "$M" ]; then REF="refs/pull/${PR}/merge"; SHA="$M"; fi
           fi
           echo "ref=${SHA:-$REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout ppap (for scripts/ci)
+        uses: actions/checkout@v5
 
       - name: Check out erp-namthuan scripts
         uses: actions/checkout@v5
