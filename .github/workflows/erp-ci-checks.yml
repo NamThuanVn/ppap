@@ -254,6 +254,12 @@ jobs:
           ref: ${{ inputs.checkout_ref }}
           persist-credentials: false
 
+      # The remote check shards run the commit this job checked out, not the
+      # moving `checkout_ref` (see the e2e-plan job's pin step).
+      - name: Pin the commit under test
+        id: pin
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Plan check shards
         id: plan
         env:
@@ -287,7 +293,7 @@ jobs:
           CHECK_UNITS: ${{ steps.plan.outputs.units }}
           SELF: ${{ github.repository }}
           FLEET: ${{ inputs.fleet }}
-          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+          CHECKOUT_REF: ${{ steps.pin.outputs.sha }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
           CORRELATION: ${{ github.run_id }}-${{ github.run_attempt }}
@@ -389,6 +395,7 @@ jobs:
       # The zone build matrix, DISCOVERED rather than hardcoded — see the
       # `zones` step below and scripts/ci/e2e/zones.mjs.
       zones: ${{ steps.zones.outputs.matrix }}
+      sha: ${{ steps.pin.outputs.sha }}
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
       # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
@@ -493,6 +500,15 @@ jobs:
           # available for the diff.
           fetch-depth: 0
           persist-credentials: false
+
+      # The commit every e2e job tests. `checkout_ref` is a MOVING ref (`main`, or
+      # refs/pull/N/merge, which GitHub recomputes when main moves), and each job
+      # and every remote batch checks it out on its own, minutes apart: a merge in
+      # between ran main's NEW specs against the bundles built from the OLD main
+      # (race-control-replay-ui, ppap run 38651378126). Resolved once here.
+      - name: Pin the commit under test
+        id: pin
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - id: plan
         env:
@@ -702,7 +718,7 @@ jobs:
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ needs.e2e-plan.outputs.sha }}
           persist-credentials: false
 
       # OUTPUT cache — the packaged bundle itself, not just the compiler cache.
@@ -921,7 +937,7 @@ jobs:
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ needs.e2e-plan.outputs.sha }}
           persist-credentials: false
 
       - uses: ./.github/actions/install
@@ -1118,7 +1134,7 @@ jobs:
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ needs.e2e-plan.outputs.sha }}
           persist-credentials: false
 
       - name: Dispatch e2e batches
@@ -1139,7 +1155,7 @@ jobs:
           PLAN_TOTAL: ${{ needs.e2e-plan.outputs.total }}
           DESIRED_TOTAL: ${{ inputs.e2e_shards }}
           TARGETS: ${{ needs.e2e-plan.outputs.targets }}
-          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+          CHECKOUT_REF: ${{ needs.e2e-plan.outputs.sha }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
           COORD_RUN_ID: ${{ github.run_id }}
