@@ -7,8 +7,10 @@ name: ERP · Release · Bump · Tag · Deploy Production
 # scripts/ci/release-flow.mjs in erp-namthuan (tested, shared with the private repo's
 # release.yml), so there is one copy of it. See docs/engineering/platform/ppap.md.
 #
-# DARK for now: nothing dispatches this yet. The private release.yml still runs its
-# own copy of the flow, and the race-control cockpit still redeploys an old tag.
+# The private release.yml is now a thin dispatcher to this workflow, so the GitHub
+# "Run workflow" button runs this flow. The race-control cockpit still redeploys an old
+# tag until its own slice switches it over. The service road watches this workflow, so
+# a release van shows from the moment it starts.
 #
 # Every write to erp-namthuan (the commit, the tag, the Release, the Deployment)
 # uses the pooled/App token resolved below, never ppap's own GITHUB_TOKEN, which
