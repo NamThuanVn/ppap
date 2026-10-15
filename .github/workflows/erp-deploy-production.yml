@@ -63,7 +63,10 @@ jobs:
       tf_workspace: namthuanvn-production
       domain: namthuan.co
       api_url: https://namthuan.co/api
-      checkout_ref: refs/tags/${{ github.event.client_payload.tag || inputs.tag }}
+      # The tagged commit when release.yml sent it, so every checkout in the deploy
+      # graph takes a full sha and actions/checkout skips its hash-algorithm REST
+      # call (one pooled-PAT call per job). A hand-run dispatch names only the tag.
+      checkout_ref: ${{ github.event.client_payload.sha || format('refs/tags/{0}', github.event.client_payload.tag || inputs.tag) }}
       deploy_script_suffix: ':production'
       release_tag: ${{ github.event.client_payload.tag || inputs.tag }}
       deployment_id: ${{ github.event.client_payload.deployment_id }}

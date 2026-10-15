@@ -384,11 +384,16 @@ jobs:
           PAT: ${{ env.RESOLVED_PAT }}
         run: |
           set -uo pipefail
+          # Emit the commit, not the ref name: actions/checkout skips its
+          # GET /repos/{o}/{r}/hash-algorithm REST call only for a full sha.
+          URL="https://x-access-token:${PAT}@github.com/${PRIVATE_REPO}.git"
           REF=main
-          if [ -n "${PR:-}" ] && git ls-remote "https://x-access-token:${PAT}@github.com/${PRIVATE_REPO}.git" "refs/pull/${PR}/merge" | grep -q .; then
-            REF="refs/pull/${PR}/merge"
+          SHA=$(git ls-remote "$URL" refs/heads/main | cut -f1)
+          if [ -n "${PR:-}" ]; then
+            M=$(git ls-remote "$URL" "refs/pull/${PR}/merge" | cut -f1)
+            if [ -n "$M" ]; then REF="refs/pull/${PR}/merge"; SHA="$M"; fi
           fi
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "ref=${SHA:-$REF}" >> "$GITHUB_OUTPUT"
 
       - name: Check out erp-namthuan scripts
         uses: actions/checkout@v5
@@ -567,15 +572,20 @@ jobs:
           PAT: ${{ env.RESOLVED_PAT }}
         run: |
           set -uo pipefail
+          # Emit the commit, not the ref name: actions/checkout skips its
+          # GET /repos/{o}/{r}/hash-algorithm REST call only for a full sha.
+          URL="https://x-access-token:${PAT}@github.com/${PRIVATE_REPO}.git"
           REF=main
+          SHA=$(git ls-remote "$URL" refs/heads/main | cut -f1)
           if [ -n "${PR:-}" ]; then
-            if git ls-remote "https://x-access-token:${PAT}@github.com/${PRIVATE_REPO}.git" "refs/pull/${PR}/merge" | grep -q .; then
-              REF="refs/pull/${PR}/merge"
+            M=$(git ls-remote "$URL" "refs/pull/${PR}/merge" | cut -f1)
+            if [ -n "$M" ]; then
+              REF="refs/pull/${PR}/merge"; SHA="$M"
             else
               echo "· refs/pull/${PR}/merge is gone (the PR merged or closed during this run) — reporting from main's scripts"
             fi
           fi
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "ref=${SHA:-$REF}" >> "$GITHUB_OUTPUT"
 
       - name: Check out the digest script
         continue-on-error: true

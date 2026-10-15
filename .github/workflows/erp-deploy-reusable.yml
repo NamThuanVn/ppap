@@ -46,7 +46,7 @@ on:
         type: string
         required: true
       checkout_ref:
-        description: 'Private-repo ref to deploy (sha for staging, refs/tags/<tag> for production).'
+        description: 'Private-repo ref to deploy (sha for staging; production passes the tagged sha, or refs/tags/<tag> on a hand-run dispatch).'
         type: string
         required: true
       fleet:
