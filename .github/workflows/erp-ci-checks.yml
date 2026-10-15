@@ -96,7 +96,7 @@ on:
       FLEET_APP_PRIVATE_KEY:
         required: false
       # The ERP fleet hub's client credentials (scripts/agent/board/lib/hub.mjs),
-      # read by `fanout.mjs collect` when AGENT_HUB_MODE is shadow or on. Optional:
+      # read by `fanout.mjs run` when AGENT_HUB_MODE is shadow or on. Optional:
       # unset simply leaves the hub off for this run.
       ERP_HUB_CLIENT_ID_STAGING:
         required: false
@@ -279,14 +279,17 @@ jobs:
           echo "units=$UNITS" >> "$GITHUB_OUTPUT"
           echo "▶ check units: $UNITS" >&2
 
-      - name: Dispatch check batches
-        id: dispatch
+      # ONE step: each batch leaves the moment a fleet host with room is found
+      # (random order, never this repo nor NamThuanVn/ppap), then the same step
+      # waits for every batch run and sets result_<suite> per suite.
+      - name: Dispatch + wait for check batches
+        id: collect
         env:
           # A pooled PAT, not GITHUB_TOKEN: the probe and the dispatch both cross
           # org boundaries, and events created with GITHUB_TOKEN do not trigger
           # workflows at all.
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          # The whole pool, so fanout.mjs can move a dispatch refused by GitHub's
+          # The whole pool, so fanout.mjs can move a call refused by GitHub's
           # per-account secondary rate limit to another account.
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           SUITE: checks
@@ -297,36 +300,13 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
           CORRELATION: ${{ github.run_id }}-${{ github.run_attempt }}
-          COORD_FALLBACK_SLOTS: '14'
           # Per-host cap. 14 default units over 8 lands on two hosts, leaving
           # the rest of the fleet to the e2e shards that dispatch minutes later.
           WORKER_SLOTS: '8'
-        run: node scripts/ci/fanout.mjs dispatch
-
-      # Uploaded BEFORE collect as well as after it: scripts/ci/progress.mjs
-      # reads this map while the run is still going, to find the batch runs
-      # whose failures it publishes early. After collect it also carries each
-      # batch's run id, for scripts/ci/ppap/ci-repo.sh --fanout.
-      - name: Upload check fan-out map (dispatched)
-        if: ${{ steps.dispatch.outcome == 'success' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: ci-fanout-checks
-          path: ci-fanout-checks.json
-          retention-days: 7
-          overwrite: true
-          if-no-files-found: ignore
-
-      - name: Wait for check batches
-        id: collect
-        if: ${{ steps.dispatch.outcome == 'success' }}
-        env:
-          GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          # Same no-wait account failover as the dispatch step (fanout.mjs gh()):
-          # collect polls every host it dispatched to, on one pooled token.
-          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
-          SUITE: checks
-          FANOUT: ${{ steps.dispatch.outputs.fanout }}
+          # TIMEOUT_S bounds the whole step (inside the job's timeout-minutes);
+          # DISPATCH_WAIT_S is how much of it a busy fleet may keep items
+          # waiting for room before the run fails.
+          DISPATCH_WAIT_S: '1200'
           TIMEOUT_S: '2400'
           # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
           AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
@@ -335,10 +315,26 @@ jobs:
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
           ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
-        run: node scripts/ci/fanout.mjs collect
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/ci/fanout.mjs ]; then
+            echo "::error::scripts/ci/fanout.mjs is missing on this ref — rebase the PR onto main."
+            exit 1
+          fi
+          if grep -q "cmd === 'run'" scripts/ci/fanout.mjs; then
+            node scripts/ci/fanout.mjs run
+            exit 0
+          fi
+          # A ref cut before the merged step: its fanout.mjs only knows the old
+          # two-step dispatch/collect (and may still self-dispatch). Remove once
+          # no open PR predates it.
+          node scripts/ci/fanout.mjs dispatch
+          FANOUT="$(cat ci-fanout-checks.json)" node scripts/ci/fanout.mjs collect
 
-      - name: Upload check fan-out map (resolved)
-        if: ${{ always() && steps.dispatch.outcome == 'success' }}
+      # Consumed by scripts/ci/ppap/ci-repo.sh --fanout (and scripts/ci/progress.mjs)
+      # to find the batch runs that live in other repos.
+      - name: Upload check fan-out map
+        if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
           name: ci-fanout-checks
@@ -982,7 +978,7 @@ jobs:
   #
   # `!cancelled()`, never `always()`: on a cancel GitHub re-evaluates each running
   # job's `if:` and keeps the ones still true, so an `always()` coordinator outlived
-  # every superseding push — it sat in `Wait for e2e batches` to the 40-minute
+  # every superseding push — it sat in `Dispatch + wait for e2e batches` to the 40-minute
   # TIMEOUT_S while the new run waited `pending` on the `ci-<pr>` concurrency
   # group (PR #5831: two re-pushes, ~36 min each, and the lane exited 65 at
   # terminal-state-unmet). scripts/gate/ci/workflows.sh pass 0g enforces it.
@@ -1137,15 +1133,18 @@ jobs:
           ref: ${{ needs.e2e-plan.outputs.sha }}
           persist-credentials: false
 
-      - name: Dispatch e2e batches
-        id: dispatch
+      # ONE step: each batch leaves the moment a fleet host with room is found
+      # (random order, never this repo nor NamThuanVn/ppap), then the same step
+      # waits for every batch run and sets `result`.
+      - name: Dispatch + wait for e2e batches
+        id: collect
         if: ${{ steps.gate.outputs.proceed == 'true' }}
         env:
           # A pooled PAT, not GITHUB_TOKEN: the probe and the dispatch both cross
           # org boundaries, and events created with GITHUB_TOKEN do not trigger
           # workflows at all.
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          # The whole pool, so fanout.mjs can move a dispatch refused by GitHub's
+          # The whole pool, so fanout.mjs can move a call refused by GitHub's
           # per-account secondary rate limit to another account.
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           SELF: ${{ github.repository }}
@@ -1160,40 +1159,20 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           COORD_RUN_ID: ${{ github.run_id }}
           # Unique per coordinator run+attempt — this is what a batch's
-          # run-name embeds and what `collect` matches on.
+          # run-name embeds and what the wait matches on.
           CORRELATION: ${{ github.run_id }}-${{ github.run_attempt }}
-          # With no recruitable worker the coordinator dispatches to its OWN
-          # repo rather than running inline, so there is never a local matrix.
-          COORD_FALLBACK_SLOTS: '14'
           # The per-host CAP, applied on top of what the host actually has free
-          # (fanout counts in-flight JOBS now, so a host running someone else's
+          # (fanout counts in-flight JOBS, so a host running someone else's
           # batch lends its remainder rather than being skipped). 12 shards plus
           # the worker's own `plan` job sits at 13 of the org's 20, so one PR
           # still cannot monopolise a host. Paired with the 48-shard default it
           # fans out over four workers — for PR CI and the production deploy
           # gate alike, which scripts/gate/ci/e2e-shards.mjs holds in step.
-          #
-          # It was 8 while the probe was a binary busy check: every host was
-          # either idle or skipped, so 8 was the whole reservation policy. With
-          # real occupancy measured, that reservation is automatic.
           WORKER_SLOTS: '12'
-        run: |
-          set -euo pipefail
-          if [ ! -f scripts/ci/fanout.mjs ]; then
-            echo "::error::scripts/ci/fanout.mjs is missing on this ref — rebase the PR onto main."
-            exit 1
-          fi
-          node scripts/ci/fanout.mjs dispatch
-
-      - name: Wait for e2e batches
-        id: collect
-        if: ${{ steps.gate.outputs.proceed == 'true' && steps.dispatch.outcome == 'success' }}
-        env:
-          GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          # Same no-wait account failover as the dispatch step (fanout.mjs gh()):
-          # collect polls every host it dispatched to, on one pooled token.
-          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
-          FANOUT: ${{ steps.dispatch.outputs.fanout }}
+          # TIMEOUT_S bounds the whole step (inside the job's timeout-minutes);
+          # DISPATCH_WAIT_S is how much of it a busy fleet may keep shards
+          # waiting for room before the run fails.
+          DISPATCH_WAIT_S: '1200'
           TIMEOUT_S: '2400'
           # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
           AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
@@ -1202,7 +1181,21 @@ jobs:
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
           ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
-        run: node scripts/ci/fanout.mjs collect
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/ci/fanout.mjs ]; then
+            echo "::error::scripts/ci/fanout.mjs is missing on this ref — rebase the PR onto main."
+            exit 1
+          fi
+          if grep -q "cmd === 'run'" scripts/ci/fanout.mjs; then
+            node scripts/ci/fanout.mjs run
+            exit 0
+          fi
+          # A ref cut before the merged step: its fanout.mjs only knows the old
+          # two-step dispatch/collect (and may still self-dispatch). Remove once
+          # no open PR predates it.
+          node scripts/ci/fanout.mjs dispatch
+          FANOUT="$(cat ci-fanout.json)" node scripts/ci/fanout.mjs collect
 
       # Consumed by /watch-ci and /fix-ci (via scripts/ci/ppap/ci-repo.sh
       # --fanout) to find the shard logs that live in other repos. Uploaded
@@ -1222,24 +1215,21 @@ jobs:
         env:
           PROCEED: ${{ steps.gate.outputs.proceed }}
           GATE_RESULT: ${{ steps.gate.outputs.result }}
-          DISPATCH: ${{ steps.dispatch.outcome }}
           COLLECT: ${{ steps.collect.outcome }}
           COLLECT_RESULT: ${{ steps.collect.outputs.result }}
         run: |
           set -euo pipefail
           if [ "$PROCEED" != "true" ]; then
             RESULT="$GATE_RESULT"
-          elif [ "$DISPATCH" != "success" ]; then
-            # scripts/ci/fanout.mjs throws rather than dispatch a partial set, so a
-            # failed dispatch means an unknown share of the suite never ran.
-            RESULT=failure
           elif [ "$COLLECT" != "success" ] || [ "$COLLECT_RESULT" != "success" ]; then
+            # Includes a failed dispatch: scripts/ci/fanout.mjs fails the step
+            # rather than run a partial set, so an unknown share never ran.
             RESULT=failure
           else
             RESULT=success
           fi
           echo "result=$RESULT" >> "$GITHUB_OUTPUT"
-          echo "▶ e2e verdict: proceed=$PROCEED dispatch=$DISPATCH collect=$COLLECT/$COLLECT_RESULT → $RESULT" >&2
+          echo "▶ e2e verdict: proceed=$PROCEED collect=$COLLECT/$COLLECT_RESULT → $RESULT" >&2
 
       # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
       # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.

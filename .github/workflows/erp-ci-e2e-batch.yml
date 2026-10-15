@@ -8,7 +8,7 @@ name: ERP · CI · E2E batch (fan-out worker)
 # workflow runs one. The dispatching repo remains the COORDINATOR — it owns the
 # checkout ref, the zone builds, the DB seed, the commit Status and every PR
 # write. A batch does exactly one thing: run its shard indices and conclude.
-# The coordinator reads that conclusion (scripts/ci/fanout.mjs collect).
+# The coordinator reads that conclusion (scripts/ci/fanout.mjs run).
 #
 # This file MUST keep its `ci-` prefix: sync-workflows-to-ppap.yml mirrors only
 # `erp-ci-*.yml` to the CI fleet, and a fleet repo without this workflow is skipped

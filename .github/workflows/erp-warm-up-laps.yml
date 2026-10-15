@@ -34,8 +34,8 @@ name: ERP · Warm-up laps
 # (docs/engineering/platform/ppap.md § What lives where). That is also what
 # makes it a scheduler rather than a seventeenth copy of the thing it schedules.
 #
-# This repo is not in PPAP_CI_REPOS and never probes ITSELF: its own e2e
-# fallback is sized by COORD_FALLBACK_SLOTS, a constant, so nothing here reads a
+# This repo is not in PPAP_CI_REPOS and never probes ITSELF: it never takes an
+# e2e batch (scripts/ci/fanout.mjs NEVER_HOSTS), so nothing here reads a
 # ceiling for it.
 
 on:

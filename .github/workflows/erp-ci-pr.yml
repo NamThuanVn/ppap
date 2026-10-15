@@ -233,8 +233,7 @@ jobs:
       # dispatcher (which owns PPAP_CI_REPOS). A manual workflow_dispatch
       # usually leaves it empty; scripts/ci/fanout.mjs then reads PPAP_CI_REPOS
       # itself. Before that fallback an empty list collapsed every shard onto
-      # this one repo (up to COORD_FALLBACK_SLOTS), so a manual main run never
-      # touched the fleet.
+      # this one repo, so a manual main run never touched the fleet.
       fleet: ${{ github.event.client_payload.fleet || inputs.fleet }}
       pr_number: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
       head_sha: ${{ github.event.client_payload.head_sha }}
