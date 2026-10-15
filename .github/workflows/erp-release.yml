@@ -1,0 +1,333 @@
+name: ERP · Release · Bump · Tag · Deploy Production
+
+# The full production release flow, run on ppap: bump every package.json, refresh
+# the lockfile, one signed commit on erp-namthuan `main`, annotated tag, GitHub
+# Release, a pending Production Deployment, then the deploy-production dispatch and
+# the D1 snapshot rebuild. The version / commit / tag logic is
+# scripts/ci/release-flow.mjs in erp-namthuan (tested, shared with the private repo's
+# release.yml), so there is one copy of it. See docs/engineering/platform/ppap.md.
+#
+# DARK for now: nothing dispatches this yet. The private release.yml still runs its
+# own copy of the flow, and the race-control cockpit still redeploys an old tag.
+#
+# Every write to erp-namthuan (the commit, the tag, the Release, the Deployment)
+# uses the pooled/App token resolved below, never ppap's own GITHUB_TOKEN, which
+# has no access to the private repo. The commit goes through GraphQL
+# createCommitOnBranch so it stays Verified, and scripts/ci/ppap/gh-write.sh retries
+# a write on GitHub's secondary rate limit.
+#
+# FILENAME: must NOT start with `ci-` — deploy repo only, never mirrored to the CI
+# fleet (same reason as erp-db-snapshot.yml).
+run-name: "ERP · Release ${{ inputs.bump_type }} — triggered by @${{ inputs.triggered_by || github.actor }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: 'Which part of the version to increment?'
+        type: choice
+        required: true
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+      confirm:
+        description: 'Type PRODUCTION to confirm.'
+        required: true
+        default: ''
+      triggered_by:
+        description: 'Actor handle for the run title and the Deployment (the cockpit passes the signed-in user)'
+        required: false
+        default: ''
+      fleet:
+        description: 'Comma-separated owner/repo ppap list the production deploy gate borrows idle e2e capacity from (PPAP_CI_REPOS). Empty falls back to the repo variable.'
+        required: false
+        default: ''
+        type: string
+
+permissions: read-all
+
+# One release at a time, and never cancel one half-way: a cancelled run can leave a
+# tag with no Release or no deploy.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+  # Pre-seed init.defaultBranch so actions/checkout's internal `git init` stops
+  # printing the hint line. Same cosmetic fix as erp-ci-checks.yml.
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
+jobs:
+  release:
+    name: Bump · Tag · Release · Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Tripwire, first: the job fails fast before spending a token if the confirm
+      # word is not exactly PRODUCTION (the dialog and the leaf check it too).
+      - name: Guard — confirm tripwire
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "PRODUCTION" ]; then
+            echo "::error::Confirmation input must be exactly 'PRODUCTION' (got '$CONFIRM')."
+            exit 1
+          fi
+
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          # A batch job's PAT budgets from its coordinator (scripts/ci/ppap/fleet-token.sh hint); empty otherwise.
+          FLEET_PAT_HINT: ${{ github.event.client_payload.ctx.pat_hint }}
+        run: |
+          set -uo pipefail
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            # raw.githubusercontent.com costs no REST quota; the contents API costs one NT call per job
+            # (about 80 jobs per PR). The contents API stays as the fallback.
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -o "$D/fleet-token.sh" \
+              'https://raw.githubusercontent.com/NamThuanVn/erp-namthuan/main/scripts/ci/ppap/fleet-token.sh' \
+              || curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            # actions/checkout spends one GET /repos/{owner}/{repo}/hash-algorithm per checkout of a
+            # branch, on the token it is given. A checkout that persists no credentials only reads,
+            # so it takes a pooled PAT (CHECKOUT_PAT) for that call; git writes stay on the App.
+            CO=$(FLEET_APP_DIR="$D" "$D/bin/fleet-token" spill NamThuanVn api repos/NamThuanVn/erp-namthuan/hash-algorithm 2>/dev/null) || CO=''
+            if [ -n "$CO" ]; then echo "::add-mask::$CO"; echo "CHECKOUT_PAT=$CO" >> "$GITHUB_ENV"; fi
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
+          fi
+          exit 0
+
+      - name: Checkout erp-namthuan main
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: main
+          fetch-depth: 0
+          token: ${{ env.RESOLVED_PAT }}
+
+      # pnpm from its own release binary — see scripts/ci/pnpm-binary.sh.
+      - name: Setup pnpm
+        run: |
+          set -euo pipefail
+          bin="$(bash scripts/ci/pnpm-binary.sh install "$HOME/.cache/pnpm-bin")"
+          bash scripts/ci/pnpm-binary.sh path-entry "$(dirname "$bin")" >> "$GITHUB_PATH"
+          echo "pnpm $("$bin" --version) → $bin"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      # The number is computed HERE from package.json at run time. A preview the
+      # dialog showed earlier is only a preview: if main moved, this number wins.
+      - name: Compute next version
+        id: ver
+        env:
+          BUMP_TYPE: ${{ inputs.bump_type }}
+        run: node scripts/ci/release-flow.mjs next "$BUMP_TYPE"
+
+      - name: Bump all package.json files (lockstep)
+        run: node scripts/ci/release-flow.mjs bump "${{ steps.ver.outputs.next }}"
+
+      - name: Refresh pnpm lockfile
+        run: pnpm install --lockfile-only
+
+      - name: Commit (signed via API), tag, push
+        id: push
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          node scripts/ci/release-flow.mjs commit --repo "$PRIVATE_REPO" --tag "$TAG" | tee /tmp/commit.out
+          SHA=$(sed -n 's/^sha=//p' /tmp/commit.out)
+          node scripts/ci/release-flow.mjs tag "$TAG" "$SHA"
+
+      # The private repo's write, so the pooled/App token and not ppap's GITHUB_TOKEN.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          bash scripts/ci/ppap/gh-write.sh release create "$TAG" \
+            --repo "$PRIVATE_REPO" \
+            --title "$TAG" \
+            --target main \
+            --generate-notes
+
+      # Register a pending Deployment on erp-namthuan so its Environments tab shows
+      # the in-flight production deploy; the deploy graph reports back on it.
+      - name: Create pending Production deployment
+        id: deploy
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          SHA: ${{ steps.push.outputs.sha }}
+          ACTOR: ${{ inputs.triggered_by || github.actor }}
+        run: |
+          set -euo pipefail
+          TITLE="Release $TAG by @$ACTOR"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          # --input with a real JSON array, from a file so gh-write.sh can resend it.
+          jq -n \
+            --arg ref "$SHA" \
+            --arg env "production" \
+            --arg desc "ppap deploy $TAG (triggered by @$ACTOR)" \
+            '{ref: $ref, environment: $env, description: $desc, auto_merge: false, required_contexts: []}' \
+            > /tmp/deploy-payload.json
+          ID=$(bash scripts/ci/ppap/gh-write.sh api "repos/$PRIVATE_REPO/deployments" --input /tmp/deploy-payload.json --jq .id)
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "✓ Created Deployment $ID for $TAG"
+
+      - name: Dispatch deploy-production
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          SHA: ${{ steps.push.outputs.sha }}
+          ACTOR: ${{ inputs.triggered_by || github.actor }}
+          DEPLOY_ID: ${{ steps.deploy.outputs.id }}
+          TITLE: ${{ steps.deploy.outputs.title }}
+          FLEET: ${{ inputs.fleet || vars.PPAP_CI_REPOS }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/ppap/gh-write.sh api "repos/${{ github.repository }}/dispatches" \
+            -f event_type=deploy-production \
+            -f client_payload[triggered_by]="$ACTOR" \
+            -f client_payload[tag]="$TAG" \
+            -f client_payload[sha]="$SHA" \
+            -f client_payload[deployment_id]="$DEPLOY_ID" \
+            -f client_payload[fleet]="$FLEET" \
+            -f client_payload[title]="$TITLE"
+          echo "✓ Dispatched deploy-production — $TITLE"
+
+      # A performance artifact: pinned to the RELEASE SHA, and it must never fail a
+      # release that is already tagged and deploying.
+      - name: Dispatch db-snapshot rebuild
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          SHA: ${{ steps.push.outputs.sha }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/ppap/gh-write.sh api "repos/${{ github.repository }}/dispatches" \
+            -f event_type=db-snapshot \
+            -f client_payload[sha]="$SHA" \
+            -f client_payload[tag]="$TAG"
+          echo "✓ Dispatched db-snapshot for $TAG ($SHA)"
+
+      # A failed release is high-stakes silence: the tag + Release may exist with no
+      # deploy dispatched. Failure-only alert; `!cancelled()` keeps a cancel silent.
+      - name: Notify Telegram on failure
+        if: failure() && !cancelled()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          ACTOR: ${{ inputs.triggered_by || github.actor }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured — skipping notify."
+            exit 0
+          fi
+          TEXT=$(printf '🚨 <b>Production release failed</b>%s\nby @%s\nThe tag/GitHub Release may exist with no production deploy dispatched; it may need manual cleanup.\n<a href="%s">View run</a>' \
+            "${TAG:+ — $TAG}" "$ACTOR" "$RUN_URL")
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" \
+            -d parse_mode=HTML \
+            -d disable_web_page_preview=true; then
+            echo "✓ Telegram failure alert sent."
+          else
+            echo "::warning::Telegram notify failed."
+          fi
+
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
