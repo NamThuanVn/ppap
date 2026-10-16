@@ -648,10 +648,10 @@ jobs:
           # has ≥20% left). Defaults here MUST agree with DEFAULT_THRESHOLDS in
           # scripts/agent/run/usage.mjs, claude.sh's own fallbacks and
           # secret-bundle.mjs VAR_DEFAULTS.
-          AGENT_FUEL_MAX_5H_PCT: ${{ vars.AGENT_FUEL_MAX_5H_PCT || '80' }}
-          AGENT_FUEL_MAX_7D_PCT: ${{ vars.AGENT_FUEL_MAX_7D_PCT || '80' }}
+          AGENT_FUEL_MAX_5H_PCT: ${{ vars.AGENT_FUEL_MAX_5H_PCT || '100' }}
+          AGENT_FUEL_MAX_7D_PCT: ${{ vars.AGENT_FUEL_MAX_7D_PCT || '100' }}
           AGENT_FUEL_WARN_5H_PCT: ${{ vars.AGENT_FUEL_WARN_5H_PCT || '75' }}
-          AGENT_FUEL_WARN_7D_PCT: ${{ vars.AGENT_FUEL_WARN_7D_PCT || '85' }}
+          AGENT_FUEL_WARN_7D_PCT: ${{ vars.AGENT_FUEL_WARN_7D_PCT || '100' }}
           PROBE_ONLY: '1'
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           # Always the newest release, like every other agent workflow.
