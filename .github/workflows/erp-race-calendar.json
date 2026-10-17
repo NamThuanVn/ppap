@@ -72,6 +72,15 @@
       "start": "0300",
       "end": "0600",
       "inputs": {}
+    },
+    {
+      "id": "scrutineering",
+      "workflow": "erp-hub-webhook-check.yml",
+      "enabled": true,
+      "mode": "slot",
+      "start": "0700",
+      "end": "0900",
+      "inputs": {}
     }
   ],
   "claudeWorkflows": [

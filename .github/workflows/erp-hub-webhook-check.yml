@@ -1,0 +1,189 @@
+name: ERP · Hub webhook check
+
+# Daily drift check of the org webhooks that feed the fleet hub. `fleet-hub-setup.sh
+# webhooks <env> --check` compares each org's live hook (by URL) with the event
+# lists in that script, for both hubs; a forgotten `--apply` re-run once left the
+# staging batch counter at "0 / 10" (#6670). Drift pages Telegram and fails the job.
+#
+# Dispatched once a day by the heartbeat (job `scrutineering` in
+# erp-race-calendar.json), never per loop tick: the PAT pool is shared.
+#
+# Token prerequisite: reading org hooks needs org-webhook read access, which the
+# fleet App does not hold yet (ppap-github-app.md § Permissions). Until an org owner
+# grants Organization permissions → Webhooks: Read-only, the check exits 3 and this
+# job only warns — it never goes red for a missing token.
+#
+# Filename is deliberately NOT erp-ci-*.yml → the sync mirrors it to
+# NamThuanVn/ppap only, never to the CI fleet.
+
+run-name: ERP · Hub webhook check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hub-webhook-check
+  cancel-in-progress: false
+
+jobs:
+  hub-webhook-check:
+    name: Check both hubs' webhooks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. Inlined
+      # rather than calling scripts/ci/ppap/pat-pool.sh (the canonical copy —
+      # keep the two in step) because the private-repo checkout itself needs a
+      # token, so the pool cannot live behind it. GET /rate_limit does not count
+      # against the limit, so probing every token is free.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          # A batch job's PAT budgets from its coordinator (scripts/ci/ppap/fleet-token.sh hint); empty otherwise.
+          FLEET_PAT_HINT: ${{ github.event.client_payload.ctx.pat_hint }}
+        run: |
+          set -uo pipefail
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            # raw.githubusercontent.com costs no REST quota; the contents API costs one NT call per job
+            # (about 80 jobs per PR). The contents API stays as the fallback.
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -o "$D/fleet-token.sh" \
+              'https://raw.githubusercontent.com/NamThuanVn/erp-namthuan/main/scripts/ci/ppap/fleet-token.sh' \
+              || curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            # actions/checkout spends one GET /repos/{owner}/{repo}/hash-algorithm per checkout of a
+            # branch, on the token it is given. A checkout that persists no credentials only reads,
+            # so it takes a pooled PAT (CHECKOUT_PAT) for that call; git writes stay on the App.
+            CO=$(FLEET_APP_DIR="$D" "$D/bin/fleet-token" spill NamThuanVn api repos/NamThuanVn/erp-namthuan/hash-algorithm 2>/dev/null) || CO=''
+            if [ -n "$CO" ]; then echo "::add-mask::$CO"; echo "CHECKOUT_PAT=$CO" >> "$GITHUB_ENV"; fi
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
+          fi
+          exit 0
+
+      - name: Checkout upstream main
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          persist-credentials: true
+          sparse-checkout: scripts/ci/ppap/
+
+      - name: Check both hubs' webhooks
+        id: check
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          FLEET_REPOS="$(gh api repos/NamThuanVn/erp-namthuan/actions/variables/PPAP_CI_REPOS --jq .value 2>/dev/null || true)"
+          [ -n "$FLEET_REPOS" ] || echo "::warning::could not read PPAP_CI_REPOS — the check will report the fleet orgs as unreadable"
+          export FLEET_REPOS
+          drift=false; unreadable=false
+          for env in staging production; do
+            out=$(bash scripts/ci/ppap/fleet-hub-setup.sh webhooks "$env" --check 2>&1); rc=$?
+            printf '%s\n' "── $env (exit $rc)" "$out"
+            [ "$rc" = 1 ] && drift=true
+            [ "$rc" = 3 ] && unreadable=true
+            delim="CHECK_EOF_${env}_${RANDOM}${RANDOM}"
+            { echo "out_${env}<<${delim}"; printf '%s\n' "$out"; echo "${delim}"; } >> "$GITHUB_OUTPUT"
+            echo "rc_${env}=$rc" >> "$GITHUB_OUTPUT"
+          done
+          { echo "drift=$drift"; echo "unreadable=$unreadable"; } >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Notify Telegram on drift
+        if: steps.check.outputs.drift == 'true'
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
+          OUT_STAGING: ${{ steps.check.outputs.out_staging }}
+          OUT_PRODUCTION: ${{ steps.check.outputs.out_production }}
+        run: |
+          set -uo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram not configured — skipping notify."
+            exit 0
+          fi
+          esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+          # Prefix every line with its env, so the alert names where the drift is.
+          LINES=$( { printf '%s\n' "$OUT_STAGING" | sed 's/^/staging: /'; printf '%s\n' "$OUT_PRODUCTION" | sed 's/^/production: /'; } \
+            | grep -E '^(staging|production): (✗|\?) ' | esc || true)
+          TEXT="🔌🚨 <b>Fleet hub webhook drift</b>"$'\n'"$LINES"$'\n'"Fix: <code>fleet-hub-setup.sh webhooks &lt;env&gt; --apply</code> (an org owner)."
+          THREAD_ARGS=()
+          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
+          curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            "${THREAD_ARGS[@]}" \
+            --data-urlencode "text=${TEXT}" \
+            -d parse_mode=HTML \
+            -d disable_web_page_preview=true \
+            && echo "✓ Telegram drift alert sent." \
+            || echo "::warning::Telegram notify failed."
+          exit 0
+
+      - name: Verdict
+        if: always()
+        run: |
+          [ "${{ steps.check.outputs.drift }}" = true ] && { echo "::error::fleet hub webhook drift — see the check step"; exit 1; }
+          [ "${{ steps.check.outputs.unreadable }}" = true ] && echo "::warning::cannot read org hooks — grant the App Organization webhooks: Read (ppap-github-app.md)"
+          exit 0
