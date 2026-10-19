@@ -138,7 +138,9 @@ jobs:
           export FLEET_REPOS
           drift=false; unreadable=false
           for env in staging production; do
-            out=$(bash scripts/ci/ppap/fleet-hub-setup.sh webhooks "$env" --check 2>&1); rc=$?
+            # `|| rc=$?`, not `; rc=$?`: the runner's `bash -e` would kill the step on a
+            # non-zero exit before the per-org lines are printed or the verdict recorded.
+            rc=0; out=$(bash scripts/ci/ppap/fleet-hub-setup.sh webhooks "$env" --check 2>&1) || rc=$?
             printf '%s\n' "── $env (exit $rc)" "$out"
             [ "$rc" = 1 ] && drift=true
             [ "$rc" = 3 ] && unreadable=true
