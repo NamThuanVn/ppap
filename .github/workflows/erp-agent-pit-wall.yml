@@ -441,7 +441,7 @@ jobs:
       # its dead-lanes.json to release those claims without a grace period.
       # ── Board sweeps: once per race-clock interval, not every tick ─────────
       # This controller fires on every lane completion, race-clock tick and cap
-      # change (~10/h at five cars), and the four sweeps below re-read the board on
+      # change (~10/h at five cars), and the five sweeps below re-read the board on
       # the NamThuanVn App quota each time — the same 5,000/h every lane spends on
       # its writes. They repair things measured in hours, so one pass per
       # AGENT_SWEEP_EVERY_MIN (default 15) is enough. The stamp is compare-and-swap
@@ -559,6 +559,17 @@ jobs:
           ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: node scripts/agent/board/recover/reap-merged-heads.mjs
+
+      # The ONE place a parent closes: any open issue whose sub-issues are all
+      # closed is closed + flipped Done, a whole chain in one pass. Decided by
+      # the sub-issue edge, never a body marker, so a hand-made split closes
+      # too — see scripts/agent/board/pit-wall/close-parents.mjs.
+      - name: Close finished parents
+        if: steps.sweep.outputs.due != 'false'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node scripts/agent/board/pit-wall/close-parents.mjs
 
       # ── Loop hold: the FIRST question, before the backlog matters ─────────
       # A lane that died outside its Claude session left a `harness-broken` hold;
