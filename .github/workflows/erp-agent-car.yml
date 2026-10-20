@@ -663,7 +663,7 @@ jobs:
         run: pnpm worktree:init --verbose
 
       # The main event. GH_TOKEN = the resolved pooled PAT is the gh identity for the whole
-      # session (board GraphQL reads, PR create, /watch-ci across the fleet
+      # session (board GraphQL reads, PR create, /fix-ci across the fleet
       # orgs). The wrapper owns workspace trust, token-pool selection,
       # mid-run failover, mode detection (claim.json → /solve-issue; ITEM_ARG
       # → legacy /clear-todo), and the salvaged-session resume. No

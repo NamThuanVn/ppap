@@ -1251,7 +1251,7 @@ jobs:
           node scripts/ci/fanout.mjs dispatch
           FANOUT="$(cat ci-fanout.json)" node scripts/ci/fanout.mjs collect
 
-      # Consumed by /watch-ci and /fix-ci (via scripts/ci/ppap/ci-repo.sh
+      # Consumed by /fix-ci (via scripts/ci/ppap/ci-repo.sh
       # --fanout) to find the shard logs that live in other repos. Uploaded
       # after collect so it carries the resolved run ids.
       - name: Upload fan-out map
