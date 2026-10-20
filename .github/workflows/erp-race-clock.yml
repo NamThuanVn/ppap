@@ -339,7 +339,6 @@ jobs:
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}
           AGENT_TURBO_UNTIL: ${{ vars.AGENT_TURBO_UNTIL }}
           AGENT_TURBO_RESTORE_LIMIT: ${{ vars.AGENT_TURBO_RESTORE_LIMIT }}
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
@@ -398,7 +397,6 @@ jobs:
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}
           AGENT_MANUAL_UNTIL: ${{ vars.AGENT_MANUAL_UNTIL }}
           AGENT_MANUAL_CARS: ${{ vars.AGENT_MANUAL_CARS }}
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}

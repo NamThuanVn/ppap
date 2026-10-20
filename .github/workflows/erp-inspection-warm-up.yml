@@ -204,7 +204,6 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           TARGET: ${{ inputs.target || '20' }}
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           HUB_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           HUB_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
@@ -260,27 +259,25 @@ jobs:
 
           # Tell the fleet hub the known ceiling, max(CUR, MAX), even when the
           # variable did not move: a hub that has never seen this host reads it as
-          # unknown (0 free slots). Best effort: a hub that is off or down never
+          # unknown (0 free slots). Best effort: a hub that is down never
           # fails the probe. The catalogue's hourly `fleet-warmup` sweep re-posts every
           # PPAP_CI_REPOS host's variable on each sweep (scripts/ci/warmup-fleet.mjs).
-          if [ "${AGENT_HUB_MODE:-off}" != "off" ]; then
-            if [ "${ERP_HUB_ENV:-staging}" = "production" ]; then
-              HUB=https://namthuan.co/api; HID="${HUB_ID_PRODUCTION:-}"; HSEC="${HUB_SECRET_PRODUCTION:-}"
-            else
-              HUB=https://namthuan.org/api; HID="${HUB_ID_STAGING:-}"; HSEC="${HUB_SECRET_STAGING:-}"
-            fi
-            HTOK=$(curl -s -m 30 -X POST "$HUB/auth/oauth/token" \
-              --data-urlencode grant_type=client_credentials \
-              --data-urlencode "client_id=$HID" --data-urlencode "client_secret=$HSEC" \
-              | jq -r '.access_token // empty' 2>/dev/null || true)
-            if [ -n "$HTOK" ] && curl -sf -m 30 -X POST \
-                 -H "Authorization: Bearer $HTOK" -H 'Content-Type: application/json' \
-                 -d "{\"ceiling\": $MAX}" \
-                 "$HUB/utilities/fleet/_system/hosts/${{ github.repository }}/ceiling" >/dev/null; then
-              echo "✓ fleet hub: ceiling $MAX posted"
-            else
-              echo "fleet hub ceiling post skipped — the hourly fleet-warmup sweep retries it"
-            fi
+          if [ "${ERP_HUB_ENV:-staging}" = "production" ]; then
+            HUB=https://namthuan.co/api; HID="${HUB_ID_PRODUCTION:-}"; HSEC="${HUB_SECRET_PRODUCTION:-}"
+          else
+            HUB=https://namthuan.org/api; HID="${HUB_ID_STAGING:-}"; HSEC="${HUB_SECRET_STAGING:-}"
+          fi
+          HTOK=$(curl -s -m 30 -X POST "$HUB/auth/oauth/token" \
+            --data-urlencode grant_type=client_credentials \
+            --data-urlencode "client_id=$HID" --data-urlencode "client_secret=$HSEC" \
+            | jq -r '.access_token // empty' 2>/dev/null || true)
+          if [ -n "$HTOK" ] && curl -sf -m 30 -X POST \
+               -H "Authorization: Bearer $HTOK" -H 'Content-Type: application/json' \
+               -d "{\"ceiling\": $MAX}" \
+               "$HUB/utilities/fleet/_system/hosts/${{ github.repository }}/ceiling" >/dev/null; then
+            echo "✓ fleet hub: ceiling $MAX posted"
+          else
+            echo "fleet hub ceiling post skipped — the hourly fleet-warmup sweep retries it"
           fi
 
           if [ "$MAX" -ge "$TARGET" ]; then

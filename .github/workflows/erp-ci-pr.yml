@@ -406,7 +406,7 @@ jobs:
           ref: ${{ steps.scripts_ref.outputs.ref }}
           token: ${{ env.RESOLVED_PAT }}
           path: erp
-          # scripts/agent/board/lib: the fleet hub client progress.mjs reads in `on` mode.
+          # scripts/agent/board/lib: the fleet hub client progress.mjs reads.
           sparse-checkout: |
             scripts/ci
             scripts/agent/board/lib
@@ -420,8 +420,7 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           SELF_TOKEN: ${{ github.token }}
           PRIVATE_REPO: ${{ env.PRIVATE_REPO }}
-          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs).
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
@@ -598,7 +597,7 @@ jobs:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
           ref: ${{ steps.digest_ref.outputs.ref }}
-          # scripts/agent/board/lib: the fleet hub client `parts.mjs clear` reads in `on` mode.
+          # scripts/agent/board/lib: the fleet hub client `parts.mjs clear` writes to.
           sparse-checkout: |
             scripts/ci
             scripts/agent/board/lib
@@ -893,8 +892,7 @@ jobs:
           R_TEST: ${{ needs.checks.outputs.test }}
           R_E2E: ${{ needs.checks.outputs.e2e }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): in `on` the parts clear there.
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): the parts clear there.
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
@@ -1149,13 +1147,10 @@ jobs:
               && echo "✓ Retired the standalone run-log comment — its rows are in the report now"
           fi
 
-          # The consolidated comment is up, so the per-job progress comments have
-          # served their purpose — remove them and leave the PR with exactly one
-          # CI comment, as it looked before progressive reporting existed.
-          # Best-effort by construction: a part we cannot delete is cosmetic.
-          # In hub `on` mode the parts live on the hub, not in comments, and this
-          # clears them there.
-          node scripts/ci/parts.mjs clear --pr "$PR_NUMBER" --repo "$REPO" 2>/dev/null || true
+          # The consolidated comment is up, so the per-job parts on the fleet hub
+          # have served their purpose — clear them. Best-effort by construction:
+          # a part we cannot clear is pruned by the hub after seven days.
+          node scripts/ci/parts.mjs clear --pr "$PR_NUMBER" 2>/dev/null || true
           echo "▶ $MERGE_LINE"
           exit 0
 

@@ -96,8 +96,8 @@ on:
       FLEET_APP_PRIVATE_KEY:
         required: false
       # The ERP fleet hub's client credentials (scripts/agent/board/lib/hub.mjs),
-      # read by `fanout.mjs run` when AGENT_HUB_MODE is shadow or on. Optional:
-      # unset simply leaves the hub off for this run.
+      # read by `fanout.mjs run`. Optional: unset, the fan-out finds its batch
+      # runs on GitHub after the grace period instead.
       ERP_HUB_CLIENT_ID_STAGING:
         required: false
       ERP_HUB_CLIENT_SECRET_STAGING:
@@ -330,8 +330,7 @@ jobs:
           # waiting for room before the run fails.
           DISPATCH_WAIT_S: '1200'
           TIMEOUT_S: '2400'
-          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs).
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
@@ -1230,8 +1229,7 @@ jobs:
           # waiting for room before the run fails.
           DISPATCH_WAIT_S: '1200'
           TIMEOUT_S: '2400'
-          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs).
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}

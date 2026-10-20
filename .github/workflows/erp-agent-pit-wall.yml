@@ -403,34 +403,17 @@ jobs:
 
       # NOT gated on the cap: the stranded sweep below must tick even while the
       # kill switch (AGENT_CAR_LIMIT=0) holds dispatch at zero — otherwise a
-      # switch flip while a lane was mid-item leaves that item assigned + In
+      # switch flip while a lane was mid-item leaves that item labelled + In
       # Progress with nothing left to release it.
       #
       # Stranded-claim sweep — release items whose backing run is provably dead
-      # (assigned to us + In Progress/Todo + last claimed > STRANDED_HOURS ago,
+      # (labelled agent:lane + In Progress/Todo + last claimed > STRANDED_HOURS ago,
       # which must exceed erp-agent-car.yml's timeout-minutes). A hosted-
       # runner reclaim skips the in-job tow-in-or-revert (always() does not
       # survive a runner shutdown), stranding the item; this is the decoupled
       # backstop. Runs BEFORE the count so a released item is a candidate this
       # same tick, and BEFORE the cap gate so the kill switch can't suspend
       # board hygiene. Best-effort, never reds the controller.
-      # Every login in the PAT pool, so the sweep below can see a claim held by
-      # ANY pooled account — not just the one this tick authenticated as. Without
-      # it, a pool silently breaks the sweep: lane A claims as account X, the
-      # controller runs as Y, and X's stranded items are never released.
-      # Best-effort: on failure AGENT_LOGINS stays empty and the sweep falls back
-      # to its own login (single-PAT behaviour).
-      - name: Resolve PAT pool logins
-        id: logins
-        continue-on-error: true
-        env:
-          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
-        run: |
-          set -uo pipefail
-          L=$(bash scripts/ci/ppap/pat-pool.sh --logins || true)
-          echo "AGENT_LOGINS=$L" >> "$GITHUB_ENV"
-          echo "claim owners: ${L:-<none — sweep uses its own login>}"
-
       # ── Dead-lane sweep: the EXTERNAL dead-man's switch ───────────────────
       # A lane the RUNNER killed (OOM 137, SIGTERM 143, lost communication) never
       # runs its own `always()` steps — not "Capture failure", not "Salvage or
@@ -452,8 +435,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           AGENT_SWEEP_EVERY_MIN: ${{ vars.AGENT_SWEEP_EVERY_MIN || '15' }}
-          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs).
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
@@ -466,6 +448,12 @@ jobs:
         if: steps.sweep.outputs.due != 'false'
         continue-on-error: true
         env:
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs).
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
           AGENT_CRASH_LOOKBACK_H: ${{ vars.AGENT_CRASH_LOOKBACK_H || '3' }}
@@ -510,12 +498,9 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           STRANDED_HOURS: ${{ vars.STRANDED_HOURS || '6' }}
-          AGENT_LOGINS: ${{ env.AGENT_LOGINS }}
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
-          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
-          # In `on` the candidates, their board status and the live lanes come from
-          # the hub instead of an issue list per pool login + a GraphQL read per item.
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): the candidates, their
+          # board status and the live lanes come from the hub, not a GraphQL read per item.
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
@@ -551,8 +536,7 @@ jobs:
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
-          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs).
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
@@ -699,11 +683,10 @@ jobs:
           # that runs a board script passes it, so nothing depends on which code
           # path happens to avoid it. scripts/gate/ci/agent-board-env.mjs enforces.
           FORK_REPO: ${{ vars.AGENT_FORK_REPO }}
-          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
-          # Without it the probe read GitHub every tick — 8 label listings plus one
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs). Without it the
+          # probe read GitHub every tick — 8 label listings plus one
           # GraphQL read per unassigned leaf, ~48 PAT calls — although the hub has
           # served the sweep and every leaf's edges since #5587.
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
@@ -752,8 +735,7 @@ jobs:
           # One fleet-hub read instead of one GitHub listing per label; GitHub when
           # the hub cannot vouch for every open issue (scripts/agent/board/pit-wall/unplanned.mjs).
           UNPLANNED_SOURCE: hub
-          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs).
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
@@ -830,8 +812,7 @@ jobs:
           AGENT_CAR_HOSTS: ${{ vars.AGENT_CAR_HOSTS }}
           AGENT_CARS_PER_CIRCUIT: ${{ vars.AGENT_CARS_PER_CIRCUIT || '2' }}
           BUNDLE: ${{ env.LANE_BUNDLE }}
-          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs).
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
@@ -1019,8 +1000,7 @@ jobs:
           AGENT_CAR_HOSTS: ${{ vars.AGENT_CAR_HOSTS }}
           AGENT_CARS_PER_CIRCUIT: ${{ vars.AGENT_CARS_PER_CIRCUIT || '2' }}
           BUNDLE: ${{ env.LANE_BUNDLE }}
-          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): off | shadow | on.
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
+          # The ERP fleet hub (scripts/agent/board/lib/hub.mjs).
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}

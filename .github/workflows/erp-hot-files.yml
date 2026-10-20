@@ -134,7 +134,6 @@ jobs:
       - name: Measure and publish HOT_FILES
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          AGENT_HUB_MODE: ${{ vars.AGENT_HUB_MODE }}
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
