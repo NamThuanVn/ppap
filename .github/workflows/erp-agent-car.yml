@@ -825,8 +825,7 @@ jobs:
       #
       # Pushes straight to main. `main` carries no branch protection, and a
       # docs-only push triggers only sync-agent-fork.yml (main-push-dispatch
-      # filters docs/ out, so no deploy; ba-to-issues is pull_request_target, so
-      # a push does not fire it at all). Several lanes run concurrently, hence
+      # filters docs/ out, so no deploy). Several lanes run concurrently, hence
       # rebase-and-retry. Never reds the job — an unswept item is picked up next
       # run.
       - name: Archive finished BA items
