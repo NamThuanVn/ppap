@@ -613,11 +613,21 @@ jobs:
       # caching it would only slow the job down. `restore-keys` are kept for the
       # same reason the zone jobs keep theirs — a partially-matching compiler
       # cache makes a build faster, never wrong.
+      #
+      # Both keys are hashed HERE, once: actions/cache re-evaluates `key:` in its
+      # post step, after the session filled the tree with build output, and
+      # hashFiles has a hard 120s limit (ppap run 39392805280, #7131).
+      - name: Cache keys
+        id: keys
+        run: |
+          echo "mononext=mono-next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/*/src/**', 'packages/*/src/**') }}" >> "$GITHUB_OUTPUT"
+          echo "codegraph=codegraph-v1-${{ hashFiles('apps/**', 'apis/**', 'packages/**') }}" >> "$GITHUB_OUTPUT"
+
       - name: Cache monolith Next build
         uses: actions/cache@v6
         with:
           path: monolith/app/.next-e2e/cache
-          key: mono-next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/*/src/**', 'packages/*/src/**') }}
+          key: ${{ steps.keys.outputs.mononext }}
           restore-keys: |
             mono-next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
             mono-next-${{ runner.os }}-
@@ -627,7 +637,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .codegraph
-          key: codegraph-v1-${{ hashFiles('apps/**', 'apis/**', 'packages/**') }}
+          key: ${{ steps.keys.outputs.codegraph }}
           restore-keys: |
             codegraph-v1-
 

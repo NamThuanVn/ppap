@@ -957,6 +957,14 @@ jobs:
         id: sha
         run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      # Hashed HERE, once, on the fresh checkout: actions/cache re-evaluates its
+      # `key:` in its post step, after the build filled apps/ with .next/ and
+      # .open-next/, and hashFiles has a hard 120s limit the shell zone crossed
+      # (ppap run 39392805280). Same fix as erp-ci-checks.yml (#7131).
+      - name: Cache keys
+        id: keys
+        run: echo "next=next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/**', 'packages/**') }}" >> "$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/install
 
       - uses: actions/download-artifact@v8
@@ -972,7 +980,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: apps/${{ matrix.zone.name }}/.next/cache
-          key: next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/**', 'packages/**') }}
+          key: ${{ steps.keys.outputs.next }}
           restore-keys: |
             next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-
             next-${{ runner.os }}-${{ matrix.zone.name }}-
