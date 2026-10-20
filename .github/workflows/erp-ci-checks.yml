@@ -761,6 +761,18 @@ jobs:
           ref: ${{ needs.e2e-plan.outputs.sha }}
           persist-credentials: false
 
+      # Both cache keys are hashed HERE, once, on the freshly checked-out tree.
+      # actions/cache re-evaluates its `key:` input in its post step too, after
+      # the build has filled apps/<zone>/ with .next/ and .open-next/ — and
+      # hashFiles has a hard 120s limit. The shell zone crossed it, failing a
+      # green build in `Post Cache Next build` (ppap run 39360182925). A key
+      # read from a step output costs the post step nothing.
+      - name: Cache keys
+        id: keys
+        run: |
+          echo "zonetar=zonetar-v2-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'apps/*/src/app/**', 'apps/shell/src/styles/**', 'scripts/ci/remote/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
+          echo "next=next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('apps/{0}/**', matrix.zone.name), 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
+
       # OUTPUT cache — the packaged bundle itself, not just the compiler cache.
       # On a hit this job does checkout → restore → upload (~10s) and skips
       # install AND the build entirely; the ~103–166s build is the single
@@ -805,7 +817,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: zone-${{ matrix.zone.name }}.tar
-          key: zonetar-v2-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'apps/*/src/app/**', 'apps/shell/src/styles/**', 'scripts/ci/remote/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}
+          key: ${{ steps.keys.outputs.zonetar }}
           # No restore-keys ON PURPOSE: a partial-match restore would hand back
           # a bundle built from different source. Exact key or rebuild.
 
@@ -825,7 +837,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: apps/${{ matrix.zone.name }}/.next/cache
-          key: next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('apps/{0}/**', matrix.zone.name), 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}
+          key: ${{ steps.keys.outputs.next }}
           restore-keys: |
             next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-
             next-${{ runner.os }}-${{ matrix.zone.name }}-
