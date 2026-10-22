@@ -183,6 +183,7 @@ jobs:
       deploy_dispatcher: ${{ steps.plan.outputs.deploy_dispatcher }}
       deploy_all: ${{ steps.plan.outputs.deploy_all }}
       nothing_to_deploy: ${{ steps.plan.outputs.nothing_to_deploy }}
+      app_version: ${{ steps.version.outputs.version }}
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
       # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
@@ -382,6 +383,13 @@ jobs:
           # previous-push tip (and scripts/ci/deploy-targets.sh full-deploys if empty).
           BASE_SHA: ${{ steps.baseline.outputs.base_sha || inputs.base_sha }}
         run: scripts/ci/deploy-targets.sh
+
+      - name: Compute the app version
+        id: version
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: node scripts/ci/app-version.mjs "$ENVIRONMENT" "$(git rev-parse HEAD)" "$RELEASE_TAG"
 
       # A merge that deploys nothing skips tf-outputs + the whole deploy job
       # (terraform apply included), which reads as a silent no-op in the Actions
@@ -1006,6 +1014,7 @@ jobs:
         run: pnpm --filter ${{ matrix.zone.pkg }} run build:pages
         env:
           NEXT_PUBLIC_APP_ENV: ${{ inputs.environment }}
+          NEXT_PUBLIC_APP_VERSION: ${{ needs.changes.outputs.app_version }}
           NEXT_PUBLIC_APP_RELEASE: ${{ steps.sha.outputs.value }}
           NEXT_PUBLIC_API_URL: ${{ inputs.api_url }}
           NEXT_PUBLIC_DASHBOARD_URL: https://${{ inputs.domain }}
