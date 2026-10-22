@@ -1,9 +1,10 @@
-name: ERP · Release · Bump · Tag · Deploy Production
+name: ERP · Release · Tag · Deploy Production
 
-# The full production release flow, run on ppap: bump every package.json, refresh
-# the lockfile, one signed commit on erp-namthuan `main`, annotated tag, GitHub
-# Release, a pending Production Deployment, then the deploy-production dispatch and
-# the D1 snapshot rebuild. The version / commit / tag logic is
+# The full production release flow, run on ppap: resolve the release commit (the
+# one staging last deployed, or main's head), tag it, create the GitHub Release, a
+# pending Production Deployment, then the deploy-production dispatch and the D1
+# snapshot rebuild. A release only tags: no package.json bump, no lockfile refresh,
+# no commit on erp-namthuan `main`. The version / source / tag logic is
 # scripts/ci/release-flow.mjs in erp-namthuan (tested, shared with the private repo's
 # release.yml), so there is one copy of it. See docs/engineering/platform/ppap.md.
 #
@@ -12,15 +13,14 @@ name: ERP · Release · Bump · Tag · Deploy Production
 # production dialog. The service road watches this workflow, so a release van shows
 # from the moment it starts.
 #
-# Every write to erp-namthuan (the commit, the tag, the Release, the Deployment)
+# Every write to erp-namthuan (the tag, the Release, the Deployment)
 # uses the pooled/App token resolved below, never ppap's own GITHUB_TOKEN, which
-# has no access to the private repo. The commit goes through GraphQL
-# createCommitOnBranch so it stays Verified, and scripts/ci/ppap/gh-write.sh retries
-# a write on GitHub's secondary rate limit.
+# has no access to the private repo. scripts/ci/ppap/gh-write.sh retries a write on
+# GitHub's secondary rate limit.
 #
 # FILENAME: must NOT start with `ci-` — deploy repo only, never mirrored to the CI
 # fleet (same reason as erp-db-snapshot.yml).
-run-name: "ERP · Release ${{ inputs.bump_type }} — triggered by @${{ inputs.triggered_by || github.actor }}"
+run-name: "ERP · Release ${{ inputs.bump_type }} from ${{ inputs.source || 'staging' }} — triggered by @${{ inputs.triggered_by || github.actor }}"
 
 on:
   workflow_dispatch:
@@ -34,6 +34,14 @@ on:
           - patch
           - minor
           - major
+      source:
+        description: "What to release: staging = the commit staging last deployed successfully (tested); latest = main's head now"
+        type: choice
+        required: false
+        default: staging
+        options:
+          - staging
+          - latest
       confirm:
         description: 'Type PRODUCTION to confirm.'
         required: true
@@ -183,43 +191,33 @@ jobs:
           fetch-depth: 0
           token: ${{ env.RESOLVED_PAT }}
 
-      # pnpm from its own release binary — see scripts/ci/pnpm-binary.sh.
-      - name: Setup pnpm
-        run: |
-          set -euo pipefail
-          bin="$(bash scripts/ci/pnpm-binary.sh install "$HOME/.cache/pnpm-bin")"
-          bash scripts/ci/pnpm-binary.sh path-entry "$(dirname "$bin")" >> "$GITHUB_PATH"
-          echo "pnpm $("$bin" --version) → $bin"
-
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
 
-      # The number is computed HERE from package.json at run time. A preview the
-      # dialog showed earlier is only a preview: if main moved, this number wins.
+      # The commit a release tags, resolved HERE at run time: main's head, or the
+      # staging SHA ppap recorded after the last fully successful staging deploy.
+      - name: Resolve the release commit
+        id: src
+        env:
+          SOURCE: ${{ inputs.source || 'staging' }}
+          STAGING_SHA: ${{ vars.STAGING_LAST_DEPLOYED_SHA }}
+        run: node scripts/ci/release-flow.mjs source "$SOURCE" "$STAGING_SHA"
+
+      # The number is computed HERE from the highest vX.Y.Z tag at run time. A preview
+      # the dialog showed earlier is only a preview: if a tag landed, this number wins.
       - name: Compute next version
         id: ver
         env:
           BUMP_TYPE: ${{ inputs.bump_type }}
         run: node scripts/ci/release-flow.mjs next "$BUMP_TYPE"
 
-      - name: Bump all package.json files (lockstep)
-        run: node scripts/ci/release-flow.mjs bump "${{ steps.ver.outputs.next }}"
-
-      - name: Refresh pnpm lockfile
-        run: pnpm install --lockfile-only
-
-      - name: Commit (signed via API), tag, push
-        id: push
+      # Pushes with the checkout's persisted RESOLVED_PAT, never ppap's GITHUB_TOKEN.
+      - name: Tag the release commit
         env:
-          GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           TAG: ${{ steps.ver.outputs.tag }}
-        run: |
-          set -euo pipefail
-          node scripts/ci/release-flow.mjs commit --repo "$PRIVATE_REPO" --tag "$TAG" | tee /tmp/commit.out
-          SHA=$(sed -n 's/^sha=//p' /tmp/commit.out)
-          node scripts/ci/release-flow.mjs tag "$TAG" "$SHA"
+          SHA: ${{ steps.src.outputs.sha }}
+        run: node scripts/ci/release-flow.mjs tag "$TAG" "$SHA"
 
       # The private repo's write, so the pooled/App token and not ppap's GITHUB_TOKEN.
       - name: Create GitHub Release
@@ -227,11 +225,12 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           TAG: ${{ steps.ver.outputs.tag }}
+          SHA: ${{ steps.src.outputs.sha }}
         run: |
           bash scripts/ci/ppap/gh-write.sh release create "$TAG" \
             --repo "$PRIVATE_REPO" \
             --title "$TAG" \
-            --target main \
+            --target "$SHA" \
             --generate-notes
 
       # Register a pending Deployment on erp-namthuan so its Environments tab shows
@@ -242,7 +241,7 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           TAG: ${{ steps.ver.outputs.tag }}
-          SHA: ${{ steps.push.outputs.sha }}
+          SHA: ${{ steps.src.outputs.sha }}
           ACTOR: ${{ inputs.triggered_by || github.actor }}
         run: |
           set -euo pipefail
@@ -264,7 +263,7 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           TAG: ${{ steps.ver.outputs.tag }}
-          SHA: ${{ steps.push.outputs.sha }}
+          SHA: ${{ steps.src.outputs.sha }}
           ACTOR: ${{ inputs.triggered_by || github.actor }}
           DEPLOY_ID: ${{ steps.deploy.outputs.id }}
           TITLE: ${{ steps.deploy.outputs.title }}
@@ -289,7 +288,7 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
           TAG: ${{ steps.ver.outputs.tag }}
-          SHA: ${{ steps.push.outputs.sha }}
+          SHA: ${{ steps.src.outputs.sha }}
         run: |
           set -euo pipefail
           bash scripts/ci/ppap/gh-write.sh api "repos/${{ github.repository }}/dispatches" \
