@@ -1065,7 +1065,13 @@ jobs:
           CLAUDE_VERSION: 'latest'
         run: |
           set -euo pipefail
-          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
+          # A PR branch that conflicted with main above runs its own older
+          # tree, which may predate the script — fall back to the bare installer.
+          if [ -f scripts/agent/run/install-claude.sh ]; then
+            bash scripts/agent/run/install-claude.sh "$CLAUDE_VERSION"
+          else
+            curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
+          fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/claude" --version
 

@@ -258,7 +258,7 @@ jobs:
         if: steps.plangate.outputs.proceed == 'true'
         run: |
           set -euo pipefail
-          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
+          bash scripts/agent/run/install-claude.sh "$CLAUDE_VERSION"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/claude" --version
 
