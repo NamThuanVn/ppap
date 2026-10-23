@@ -297,38 +297,6 @@ jobs:
             -f client_payload[tag]="$TAG"
           echo "✓ Dispatched db-snapshot for $TAG ($SHA)"
 
-      # A failed release is high-stakes silence: the tag + Release may exist with no
-      # deploy dispatched. Failure-only alert; `!cancelled()` keeps a cancel silent.
-      - name: Notify Telegram on failure
-        if: failure() && !cancelled()
-        env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
-          TAG: ${{ steps.ver.outputs.tag }}
-          ACTOR: ${{ inputs.triggered_by || github.actor }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-            echo "Telegram not configured — skipping notify."
-            exit 0
-          fi
-          TEXT=$(printf '🚨 <b>Production release failed</b>%s\nby @%s\nThe tag/GitHub Release may exist with no production deploy dispatched; it may need manual cleanup.\n<a href="%s">View run</a>' \
-            "${TAG:+ — $TAG}" "$ACTOR" "$RUN_URL")
-          THREAD_ARGS=()
-          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
-          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${CHAT_ID}" \
-            "${THREAD_ARGS[@]}" \
-            --data-urlencode "text=${TEXT}" \
-            -d parse_mode=HTML \
-            -d disable_web_page_preview=true; then
-            echo "✓ Telegram failure alert sent."
-          else
-            echo "::warning::Telegram notify failed."
-          fi
-
       - name: GitHub calls (NT / PAT)
         if: always()
         run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true

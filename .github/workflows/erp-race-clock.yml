@@ -221,9 +221,6 @@ jobs:
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
           ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
           VARS_JSON: ${{ toJSON(vars) }}
           AGENT_CAR_HOSTS: ${{ vars.AGENT_CAR_HOSTS }}
           DECIDER_OUTCOME: ${{ steps.decider.outcome }}

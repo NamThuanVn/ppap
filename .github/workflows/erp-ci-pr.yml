@@ -841,8 +841,8 @@ jobs:
           # rule two lines up, and a described failure is what actually lets the
           # waiting agent (or a human) act on it.
           DESC="${REPORT_STATUS:-CI reporting failed before it could summarize the run (see the run log) — treating as failure}"
-          # Exposed for the Telegram notify step below — computed before the
-          # head_sha guard so manual workflow_dispatch re-runs still notify.
+          # Exposed for the sticky-comment step below — computed before the
+          # head_sha guard so manual workflow_dispatch re-runs still report.
           echo "state=$STATE" >> "$GITHUB_OUTPUT"
           echo "desc=$DESC"  >> "$GITHUB_OUTPUT"
           if [ -z "${HEAD_SHA:-}" ]; then

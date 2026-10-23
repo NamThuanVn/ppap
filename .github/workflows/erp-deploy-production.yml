@@ -72,8 +72,6 @@ jobs:
       deployment_id: ${{ github.event.client_payload.deployment_id }}
       commit_sha: ${{ github.event.client_payload.sha }}
       status_context: deploy-production
-      triggered_by: ${{ github.event.client_payload.triggered_by || inputs.triggered_by || github.actor }}
-      run_title: ${{ github.event.client_payload.title }}
       # release.yml forwards PPAP_CI_REPOS so the gate's full-suite e2e fans out
       # instead of collapsing onto this repo's 14-shard fallback.
       fleet: ${{ github.event.client_payload.fleet || inputs.fleet }}
@@ -82,9 +80,6 @@ jobs:
       PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
       FLEET_APP_ID: ${{ secrets.FLEET_APP_ID }}
       FLEET_APP_PRIVATE_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
       ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
       ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
       ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}

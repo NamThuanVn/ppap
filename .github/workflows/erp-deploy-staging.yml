@@ -50,8 +50,6 @@ jobs:
       deployment_id: ${{ github.event.client_payload.deployment_id }}
       commit_sha: ${{ github.event.client_payload.sha }}
       status_context: deploy-staging
-      triggered_by: ${{ github.event.client_payload.triggered_by || inputs.triggered_by || github.actor }}
-      run_title: ${{ github.event.client_payload.title }}
       # Skip the pre-deploy CI gate entirely on staging — the source PR already
       # ran the full CI (biome/typecheck/lint/vitest + e2e) on refs/pull/N/merge
       # (= main + PR) before it could merge, so re-checking the same code on the
@@ -66,6 +64,3 @@ jobs:
       PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
       FLEET_APP_ID: ${{ secrets.FLEET_APP_ID }}
       FLEET_APP_PRIVATE_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}

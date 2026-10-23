@@ -76,16 +76,6 @@ on:
         description: 'Commit-status context name (deploy-staging | deploy-production).'
         type: string
         required: true
-      triggered_by:
-        description: 'Actor handle that initiated the deploy (forwarded from the dispatcher). Used in the Telegram failure alert.'
-        type: string
-        required: false
-        default: ''
-      run_title:
-        description: 'Human title for the deploy (merge-commit subject for staging, release title for production). Used in the Telegram failure alert.'
-        type: string
-        required: false
-        default: ''
       run_e2e_gate:
         description: 'Whether the pre-deploy CI gate runs the full Playwright e2e suite. Staging passes false (the merged PR already ran e2e on refs/pull/N/merge = main + PR); production keeps the default true.'
         type: boolean
@@ -120,14 +110,6 @@ on:
       FLEET_APP_ID:
         required: false
       FLEET_APP_PRIVATE_KEY:
-        required: false
-      # Telegram failure alerts — all optional so a partially-configured or
-      # manual run degrades to "skip notify" instead of failing the report job.
-      TELEGRAM_BOT_TOKEN:
-        required: false
-      TELEGRAM_CHAT_ID:
-        required: false
-      TELEGRAM_BUILD_THREAD_ID:
         required: false
       # The ERP fleet hub's client credentials, forwarded to the ci-gate's
       # erp-ci-checks.yml. `fanout.mjs run` finds the fanned-out batch runs
@@ -1547,7 +1529,7 @@ jobs:
     #
     # `!cancelled()` (not `always()`): a run cancelled by concurrency
     # (superseded staging deploy — expected, not an error) skips reporting
-    # entirely — no Telegram alert, and its pending GitHub Deployment is
+    # entirely — its pending GitHub Deployment is
     # auto-marked inactive when the superseding deploy posts `success`.
     needs: [changes, ci-gate, build-workers, build-zones, deploy]
     if: ${{ !cancelled() }}
@@ -1655,7 +1637,7 @@ jobs:
           # A plan that selected nothing skips the deploy job by design — staging
           # already matches this commit, so that is a SUCCESS. Without this branch
           # the `deploy.result = success` test below would read the deliberate
-          # skip as a failed deploy and fire the Telegram alert.
+          # skip as a failed deploy.
           if [ "$NOTHING" = "true" ]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
             echo "nothing=true" >> "$GITHUB_OUTPUT"
@@ -1727,64 +1709,6 @@ jobs:
           echo "Tag: ${{ inputs.release_tag }}"
           echo "Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "URL: https://${{ inputs.domain }}"
-
-      # Failure-only Telegram alert to the build topic of the team supergroup
-      # (same bot as the runtime error alerts; secrets live in this repo's
-      # Actions secrets). Last step + non-fatal so a Telegram outage can never
-      # disturb the Deployment/commit-status pingbacks above.
-      - name: Notify Telegram on failure
-        if: steps.outcome.outputs.state == 'failure'
-        env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
-          ENVIRONMENT: ${{ inputs.environment }}
-          CHECKOUT_REF: ${{ inputs.checkout_ref }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-          TRIGGERED_BY: ${{ inputs.triggered_by }}
-          RUN_TITLE: ${{ inputs.run_title }}
-          COMMIT_SHA: ${{ inputs.commit_sha }}
-          R_CI: ${{ needs.ci-gate.result }}
-          R_BUILD_WORKERS: ${{ needs.build-workers.result }}
-          R_BUILD_ZONES: ${{ needs.build-zones.result }}
-          R_DEPLOY: ${{ needs.deploy.result }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-            echo "Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID empty) — skipping notify."
-            exit 0
-          fi
-          TAG_SUFFIX=""
-          if [ -n "${RELEASE_TAG:-}" ]; then TAG_SUFFIX=" (${RELEASE_TAG})"; fi
-          ENV_UPPER=$(printf '%s' "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
-          # Commit subjects are user-controlled text inside parse_mode=HTML — escape.
-          SAFE_TITLE=$(printf '%s' "${RUN_TITLE:-}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
-          # Context line: actor · commit. Both optional (empty on a manual
-          # workflow_dispatch) so the line collapses gracefully.
-          META=""
-          if [ -n "${TRIGGERED_BY:-}" ]; then META="by @${TRIGGERED_BY}"; fi
-          if [ -n "${COMMIT_SHA:-}" ]; then
-            META="${META:+$META · }commit <a href=\"https://github.com/${{ env.PRIVATE_REPO }}/commit/${COMMIT_SHA}\">${COMMIT_SHA:0:7}</a>"
-          fi
-          TEXT="🚨 <b>Deploy failed</b> — <b>${ENV_UPPER}</b>${TAG_SUFFIX}"
-          if [ -n "$SAFE_TITLE" ]; then TEXT="${TEXT}: ${SAFE_TITLE}"; fi
-          if [ -n "$META" ]; then TEXT="${TEXT}"$'\n'"${META}"; fi
-          TEXT="${TEXT}"$'\n'"Ref: <code>${CHECKOUT_REF}</code>"
-          TEXT="${TEXT}"$'\n'"Jobs: ci-gate ${R_CI} · build-workers ${R_BUILD_WORKERS} · build-zones ${R_BUILD_ZONES} · deploy ${R_DEPLOY}"
-          TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
-          THREAD_ARGS=()
-          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
-          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${CHAT_ID}" \
-            "${THREAD_ARGS[@]}" \
-            --data-urlencode "text=${TEXT}" \
-            -d parse_mode=HTML \
-            -d disable_web_page_preview=true; then
-            echo "✓ Telegram failure alert sent."
-          else
-            echo "::warning::Telegram notify failed (deploy failure alert not delivered)."
-          fi
 
       # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
       # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.

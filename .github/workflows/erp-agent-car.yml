@@ -58,7 +58,7 @@ name: ERP · Car
 # PAT_TOKEN_POOL and none of the control repo's variables, so the dispatch
 # carries them SEALED (client_payload.bundle, scripts/agent/run/secret-bundle.mjs)
 # plus client_payload.controller_repo, and "Load lane config" below unpacks them.
-# Never read `vars.*` or a Claude/Telegram `secrets.*` directly in this file: on a
+# Never read `vars.*` or a Claude `secrets.*` directly in this file: on a
 # fleet repo they are empty. NOTE the transcript + session artifacts and logs are
 # PUBLIC (accepted trade-off — see docs/engineering/platform/ppap-agent-runs.md
 # § Agent runs).
@@ -420,8 +420,8 @@ jobs:
       # dispatching lanes entirely until a window reopens.
       #
       # Exit 78 (whole pool at its limit) is NOT a job failure: a closed usage
-      # window is a normal operating condition, and failing here would fire
-      # Telegram on every tick. The step goes green, the bootstrap and the agent
+      # window is a normal operating condition, and failing here would crash a lane
+      # on every tick. The step goes green, the bootstrap and the agent
       # are skipped, and the always() salvage path hands the claimed item back to
       # Todo untouched.
       - name: Probe Claude pool
@@ -972,63 +972,6 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
-
-      # Failure-only Telegram to the build topic — same bot/secrets/shape as
-      # erp-deploy-reusable.yml's notify step; non-fatal, skips when unset.
-      #
-      # `held_first != 'false'` suppresses the duplicates: a shared harness fault
-      # kills every in-flight lane within minutes, and the hold coalesces them by
-      # fingerprint, so only the lane that FIRST tripped it has news. Without
-      # this, one broken worktree:init pages six times per tick. Note a pool-
-      # exhausted run is green and never reaches here at all.
-      - name: Notify Telegram on failure
-        if: failure() && steps.failure.outputs.held_first != 'false'
-        env:
-          GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          # A fleet lane has no Telegram secrets of its own — they came forwarded.
-          if [ -n "${LANE_SECRETS:-}" ]; then
-            # shellcheck source=/dev/null — written by "Load lane config"
-            . "$LANE_SECRETS"
-            BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-$BOT_TOKEN}"
-            CHAT_ID="${TELEGRAM_CHAT_ID:-$CHAT_ID}"
-            THREAD_ID="${TELEGRAM_BUILD_THREAD_ID:-$THREAD_ID}"
-          fi
-          # Suppress false alarms: if the claimed item already SHIPPED (issue
-          # closed = its PR merged — e.g. an async auto-merge that landed after
-          # the agent's turn, or a premature-verdict finalize refusal), the run
-          # "failed" but the work is done. Don't page for it.
-          if [ -s "${AGENT_STATE_DIR}/claim.json" ]; then
-            ISSUE=$(jq -r '.issue // empty' "${AGENT_STATE_DIR}/claim.json" 2>/dev/null || true)
-            if [ -n "${ISSUE:-}" ] && \
-               [ "$(gh issue view "$ISSUE" --repo "$PRIVATE_REPO" --json state --jq .state 2>/dev/null)" = "CLOSED" ]; then
-              echo "::notice::claimed #$ISSUE is CLOSED (work shipped) — suppressing false-failure alert"
-              exit 0
-            fi
-          fi
-          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-            echo "Telegram not configured — skipping notify."
-            exit 0
-          fi
-          TEXT="🤖🚨 <b>Agent run failed</b> — clear-todo-issue"
-          TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
-          THREAD_ARGS=()
-          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
-          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${CHAT_ID}" \
-            "${THREAD_ARGS[@]}" \
-            --data-urlencode "text=${TEXT}" \
-            -d parse_mode=HTML \
-            -d disable_web_page_preview=true; then
-            echo "✓ Telegram failure alert sent."
-          else
-            echo "::warning::Telegram notify failed."
-          fi
 
       # Self-perpetuation (LAST step on purpose). Chains ONLY when this
       # loop-spawned run EXECUTED a verdict: a typed verdict (never NONE) + no

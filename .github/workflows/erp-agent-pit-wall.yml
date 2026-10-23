@@ -457,39 +457,6 @@ jobs:
           AGENT_CRASH_LOOKBACK_H: ${{ vars.AGENT_CRASH_LOOKBACK_H || '3' }}
         run: node scripts/agent/board/recover/sweep-crashed-cars.mjs
 
-      # The alert the dead lane could not send for itself. Gated on held_first so
-      # a teardown that kills six lanes at once pages once — the hold coalesces
-      # them by fingerprint, exactly as the in-lane notify does.
-      - name: Notify Telegram on a torn-down lane
-        if: steps.dead.outputs.held_first == 'true'
-        continue-on-error: true
-        env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
-          CLASSES: ${{ steps.dead.outputs.classes }}
-          DEAD_RUN_URL: ${{ steps.dead.outputs.run_url }}
-        run: |
-          set -uo pipefail
-          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-            echo "Telegram not configured — skipping notify."
-            exit 0
-          fi
-          TEXT="🤖🚨 <b>Agent lane torn down by the runner</b> — ${CLASSES:-unknown}"
-          TEXT="${TEXT}"$'\n'"The loop is held; an ambulance is being dispatched."
-          TEXT="${TEXT}"$'\n'"<a href=\"${DEAD_RUN_URL}\">View the killed run</a>"
-          THREAD_ARGS=()
-          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
-          curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${CHAT_ID}" \
-            "${THREAD_ARGS[@]}" \
-            --data-urlencode "text=${TEXT}" \
-            -d parse_mode=HTML \
-            -d disable_web_page_preview=true \
-            && echo "✓ Telegram torn-down alert sent." \
-            || echo "::warning::Telegram notify failed."
-          exit 0
-
       - name: Reclaim stranded items
         if: steps.sweep.outputs.due != 'false'
         continue-on-error: true
@@ -755,7 +722,7 @@ jobs:
         run: node scripts/agent/board/pit-wall/qualifying-gate.mjs
 
       # The sealed bundle a FLEET lane opens in its "Load lane config" step: this
-      # repo's Claude pool + Telegram secrets + the AGENT_* settings, encrypted
+      # repo's Claude pool + hub credentials + the AGENT_* settings, encrypted
       # with a key derived from PAT_TOKEN_POOL (identical on every fleet repo), so
       # no fleet repo ever has to hold them. Sealed only when lanes go to the
       # fleet: with AGENT_CAR_HOSTS unset the lanes run here and read this
@@ -770,9 +737,6 @@ jobs:
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
           ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
           VARS_JSON: ${{ toJSON(vars) }}
         run: |
           set -euo pipefail
@@ -824,39 +788,6 @@ jobs:
           # counts them and can't over-provision past the cap.
           echo "settling 20s for run-creation visibility…"
           sleep 20
-
-      # The controller's own death used to be the quietest failure in the system:
-      # no lane is dispatched, no hold is written (the hold step may never have
-      # run), and every board and dashboard stays green. The NEXT tick's
-      # control-plane sweep holds the fleet and calls an ambulance for it; this
-      # step is the immediate human-facing half, because "the fleet stopped" is
-      # worth knowing before the next tick.
-      - name: Notify Telegram on controller failure
-        if: failure()
-        continue-on-error: true
-        env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -uo pipefail
-          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-            echo "Telegram not configured — skipping notify."
-            exit 0
-          fi
-          TEXT="🤖🚨 <b>Agent loop CONTROLLER failed</b>"
-          TEXT="${TEXT}"$'\n'"No lanes can be dispatched until this clears."
-          TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
-          THREAD_ARGS=()
-          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
-          curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${CHAT_ID}" "${THREAD_ARGS[@]}" \
-            --data-urlencode "text=${TEXT}" -d parse_mode=HTML \
-            -d disable_web_page_preview=true >/dev/null \
-            && echo "✓ Telegram controller-failure alert sent." \
-            || echo "::warning::Telegram notify failed."
-          exit 0
 
       # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
       # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
@@ -978,9 +909,6 @@ jobs:
           ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
           ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_BUILD_THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
           VARS_JSON: ${{ toJSON(vars) }}
         run: |
           set -euo pipefail

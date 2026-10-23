@@ -9,7 +9,7 @@ name: ERP · Agent · ambulance
 # Before this workflow existed the harness filed that as an item fault, released
 # the untouched item to Todo, and agent-pit-wall's `workflow_run: [completed]`
 # trigger re-probed on the very failure — so the fleet re-spun at bootstrap pace
-# until a human noticed Telegram and flipped AGENT_CAR_LIMIT=0.
+# until a human noticed and flipped AGENT_CAR_LIMIT=0.
 #
 # Now capture-failure.mjs writes a `harness-broken` hold, the controller stops
 # dispatching lanes, and dispatches ONE of these instead. Fix the problem before
@@ -471,39 +471,6 @@ jobs:
             echo
             printf '%s\n' "${DIAGNOSIS:-}"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      # Alert only when the loop is genuinely stuck — the repair budget is gone
-      # and no lane will run again until someone looks. A STUCK attempt with
-      # budget left is not news: the controller sends an escalated ambulance.
-      - name: Notify Telegram when parked
-        if: always() && steps.execute.outputs.parked == 'true'
-        env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          THREAD_ID: ${{ secrets.TELEGRAM_BUILD_THREAD_ID }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          FINGERPRINT: ${{ steps.hold.outputs.fingerprint }}
-        run: |
-          set -euo pipefail
-          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-            echo "Telegram not configured — skipping notify."
-            exit 0
-          fi
-          TEXT="🚑🛑 <b>Agent loop PARKED</b> — the harness could not be repaired automatically"
-          TEXT="${TEXT}"$'\n'"fingerprint <code>${FINGERPRINT}</code> · no lanes will be dispatched until the hold is cleared"
-          TEXT="${TEXT}"$'\n'"<a href=\"${RUN_URL}\">View run</a>"
-          THREAD_ARGS=()
-          if [ -n "${THREAD_ID:-}" ]; then THREAD_ARGS=(-d "message_thread_id=${THREAD_ID}"); fi
-          if curl -sS --fail-with-body "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${CHAT_ID}" \
-            "${THREAD_ARGS[@]}" \
-            --data-urlencode "text=${TEXT}" \
-            -d parse_mode=HTML \
-            -d disable_web_page_preview=true; then
-            echo "✓ Telegram parked alert sent."
-          else
-            echo "::warning::Telegram notify failed."
-          fi
 
       # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
       # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
