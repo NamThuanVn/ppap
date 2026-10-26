@@ -1356,7 +1356,7 @@ jobs:
         if: ${{ contains(fromJSON(needs.changes.outputs.workers), 'monitor') }}
         run: |
           pnpm --filter @namthuanvn/monitor --if-present db:migrate:remote
-          pnpm --filter @namthuanvn/monitor exec wrangler deploy dist/index.js --no-bundle --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
+          pnpm --filter @namthuanvn/monitor exec wrangler deploy dist/index.js --no-bundle --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}" --var "APP_VERSION:${{ needs.changes.outputs.app_version }}"
 
       # Leaves (tier 1) — independent of one another, so deploy concurrently.
       # Each: apply its D1 migrations (needs resolved binding + remote DB), then
@@ -1365,6 +1365,7 @@ jobs:
       - name: Deploy leaves (tier 1)
         env:
           WORKERS: ${{ needs.changes.outputs.workers_list }}
+          APP_VERSION: ${{ needs.changes.outputs.app_version }}
         run: |
           set -uo pipefail
           SHA='${{ steps.sha.outputs.value }}'
@@ -1376,7 +1377,7 @@ jobs:
             (
               set -e
               pnpm --filter "@namthuanvn/$svc" --if-present db:migrate:remote
-              pnpm --filter "@namthuanvn/$svc" exec wrangler deploy dist/index.js --no-bundle --var "SENTRY_RELEASE:$SHA"
+              pnpm --filter "@namthuanvn/$svc" exec wrangler deploy dist/index.js --no-bundle --var "SENTRY_RELEASE:$SHA" --var "APP_VERSION:$APP_VERSION"
             ) > "/tmp/leaf-$svc.log" 2>&1 &
             pids="$pids $!:$svc"
           done
@@ -1392,6 +1393,7 @@ jobs:
       - name: Deploy composers (tier 1.5)
         env:
           WORKERS: ${{ needs.changes.outputs.workers_list }}
+          APP_VERSION: ${{ needs.changes.outputs.app_version }}
         run: |
           set -uo pipefail
           SHA='${{ steps.sha.outputs.value }}'
@@ -1401,7 +1403,7 @@ jobs:
             (
               set -e
               pnpm --filter "@namthuanvn/$svc" --if-present db:migrate:remote
-              pnpm --filter "@namthuanvn/$svc" exec wrangler deploy dist/index.js --no-bundle --var "SENTRY_RELEASE:$SHA"
+              pnpm --filter "@namthuanvn/$svc" exec wrangler deploy dist/index.js --no-bundle --var "SENTRY_RELEASE:$SHA" --var "APP_VERSION:$APP_VERSION"
             ) > "/tmp/tier15-$svc.log" 2>&1 &
             pids="$pids $!:$svc"
           done
@@ -1419,7 +1421,7 @@ jobs:
       # only redeploys when its own package changed.
       - name: Deploy gateway (router)
         if: ${{ contains(fromJSON(needs.changes.outputs.workers), 'gateway') }}
-        run: pnpm --filter @namthuanvn/gateway exec wrangler deploy --env ${{ inputs.environment }} dist/index.js --no-bundle --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}"
+        run: pnpm --filter @namthuanvn/gateway exec wrangler deploy --env ${{ inputs.environment }} dist/index.js --no-bundle --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}" --var "APP_VERSION:${{ needs.changes.outputs.app_version }}"
 
       # Zones — each service-binds to gateway; deploy the prebuilt .open-next via
       # their deploy:<env> script (no rebuild). Independent → concurrent.
