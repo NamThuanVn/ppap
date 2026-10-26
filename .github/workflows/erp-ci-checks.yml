@@ -770,7 +770,7 @@ jobs:
         id: keys
         run: |
           echo "zonetar=zonetar-v2-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'apps/*/src/app/**', 'apps/shell/src/styles/**', 'scripts/ci/remote/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
-          echo "next=next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('apps/{0}/**', matrix.zone.name), 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
+          echo "next=next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('apps/{0}/**', matrix.zone.name), 'apps/*/src/app/**', 'apps/shell/src/styles/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
 
       # OUTPUT cache — the packaged bundle itself, not just the compiler cache.
       # On a hit this job does checkout → restore → upload (~10s) and skips
@@ -829,17 +829,18 @@ jobs:
       # source. Keyed per-zone so the matrix legs don't clobber one another's
       # cache. Scoped to this zone's own inputs for the same reason as the
       # bundle cache above — an `apps/**` key made every zone miss on any app
-      # change. Unlike the bundle cache this one KEEPS restore-keys: a stale
-      # compiler cache is only a slower build, never a wrong one.
+      # change. The key also names every zone's `src/app` and the shell styles:
+      # the shell's Tailwind CSS scans those via `@source`, and a restored
+      # compiler cache does not notice a class added outside `apps/shell` — the
+      # shell served CSS without `min-w-39` (PR #7825, OMS po-list-po-total). So
+      # there are NO restore-keys either: a stale compiler cache is NOT only a
+      # slower build.
       - name: Cache Next build
         if: steps.zonetar.outputs.cache-hit != 'true'
         uses: actions/cache@v6
         with:
           path: apps/${{ matrix.zone.name }}/.next/cache
           key: ${{ steps.keys.outputs.next }}
-          restore-keys: |
-            next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-
-            next-${{ runner.os }}-${{ matrix.zone.name }}-
 
       # Generic relative `/api` build — no host/port baked, so the same bundle
       # boots on every shard's free port.
