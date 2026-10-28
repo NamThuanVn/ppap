@@ -201,7 +201,7 @@ jobs:
         run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
 
   # Run the CI graph. erp-ci-checks.yml lives in the same repo and exposes one
-  # verdict per suite (gates, typecheck, lint, test, e2e) as a workflow_call
+  # verdict per suite (gates, typecheck, lint, test, e2e, native) as a workflow_call
   # output, so the report job below can build a per-suite summary without
   # re-querying the API. Every suite runs as shards fanned out to the fleet.
   #
@@ -257,6 +257,12 @@ jobs:
       # "assert the precondition" pattern that fixed the first one), NOT to
       # re-narrow the scope — re-narrowing restores the exact hole this closes.
       e2e_changed_only: false
+      # The one narrow exception to the above: a PR whose every changed file is
+      # under apps/mobile/ has no web or backend code to break, so it skips the
+      # checks fan-out and e2e (both report success) and runs the native iOS /
+      # Android jobs for the platforms it touches instead. One file anywhere
+      # else and the full graph runs as above. See scripts/ci/native/scope.sh.
+      run_native: true
     secrets:
       PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
       FLEET_APP_ID: ${{ secrets.FLEET_APP_ID }}
@@ -644,6 +650,7 @@ jobs:
           R_LINT: ${{ needs.checks.outputs.lint }}
           R_TEST: ${{ needs.checks.outputs.test }}
           R_E2E: ${{ needs.checks.outputs.e2e }}
+          R_NATIVE: ${{ needs.checks.outputs.native }}
         run: |
           set +e -uo pipefail   # errexit OFF — zero-match greps below exit non-zero by design
           # EVERY fanned-out run, e2e and checks alike: the gates, lint,
@@ -746,7 +753,7 @@ jobs:
           fi
           echo "▶ rich e2e sites: ${SITES_FLAG:-none collected}"
 
-          JOBS="gates=${R_BIOME:-},typecheck=${R_TYPE:-},lint=${R_LINT:-},vitest=${R_TEST:-},e2e=${R_E2E:-}"
+          JOBS="gates=${R_BIOME:-},typecheck=${R_TYPE:-},lint=${R_LINT:-},vitest=${R_TEST:-},e2e=${R_E2E:-},mobile=${R_NATIVE:-}"
           out="$tmp/report"
           SCAN_FLAG=""
           [ "$scan_ok" = true ] || SCAN_FLAG="--scan-unavailable"
@@ -805,6 +812,7 @@ jobs:
           R_LINT: ${{ needs.checks.outputs.lint }}
           R_TEST: ${{ needs.checks.outputs.test }}
           R_E2E: ${{ needs.checks.outputs.e2e }}
+          R_NATIVE: ${{ needs.checks.outputs.native }}
           REPORT_STATE: ${{ steps.noise.outputs.state }}
           REPORT_STATUS: ${{ steps.noise.outputs.status }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -891,6 +899,7 @@ jobs:
           R_LINT: ${{ needs.checks.outputs.lint }}
           R_TEST: ${{ needs.checks.outputs.test }}
           R_E2E: ${{ needs.checks.outputs.e2e }}
+          R_NATIVE: ${{ needs.checks.outputs.native }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): the parts clear there.
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
@@ -1064,7 +1073,7 @@ jobs:
           SITES_FLAG=""
           [ -s "$RUNNER_TEMP/ci-sites.json" ] && SITES_FLAG="--sites $RUNNER_TEMP/ci-sites.json"
           BODY=$(node scripts/ci/report.mjs --dir "$LOGDIR" $SCAN_FLAG $SITES_FLAG \
-            --jobs "gates=${R_BIOME:-},typecheck=${R_TYPE:-},lint=${R_LINT:-},vitest=${R_TEST:-},e2e=${R_E2E:-}" \
+            --jobs "gates=${R_BIOME:-},typecheck=${R_TYPE:-},lint=${R_LINT:-},vitest=${R_TEST:-},e2e=${R_E2E:-},mobile=${R_NATIVE:-}" \
             --run-url "$RUN_URL" --ready-line "$READY_LINE" --merge-line "$MERGE_LINE" \
             --out-dir "$LOGDIR/report2" --print)
           if [ -z "$BODY" ]; then
