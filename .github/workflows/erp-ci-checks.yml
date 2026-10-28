@@ -1772,6 +1772,8 @@ jobs:
             waited=$((waited + 2))
           done
           echo "✓ /api/health → up after ${waited}s"
+          # Health answers before the first login and feed do; warm them so the journeys' waits time the app.
+          bash scripts/ci/native/warm-stack.sh
 
       - name: Install the iOS toolchain
         run: |
@@ -1965,6 +1967,8 @@ jobs:
             waited=$((waited + 2))
           done
           echo "✓ /api/health → up after ${waited}s"
+          # Health answers before the first login and feed do; warm them so the journeys' waits time the app.
+          bash scripts/ci/native/warm-stack.sh
 
       # Launches Gradle only; the daemon's own JDK comes from
       # gradle/gradle-daemon-jvm.properties, provisioned by the toolchain resolver.

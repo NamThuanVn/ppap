@@ -12,7 +12,10 @@ name: ERP · Mobile · Staging builds (TestFlight + Play internal)
 # MOBILE_STG_ANDROID_LAST_BUILT_SHA: its next diff base, and what a mobile release
 # ships); a run whose every planned platform built records its head as
 # MOBILE_STG_LAST_BUILT_SHA, the hub's counter anchor. The develop variant is never
-# built here: it is local + CI tests only.
+# built here: it is local + CI tests only. "Run workflow" with variant=prod builds the
+# production apps instead, to the same internal tracks, from the mobile-production
+# environment, and records nothing: a check that production signing and uploads work,
+# never a release (that is erp-mobile-release.yml).
 #
 # Signing secrets live on the `mobile-staging` GitHub environment of this repo
 # (docs/engineering/services/mobile/mobile-build-and-release.md §5); only the job
@@ -20,7 +23,7 @@ name: ERP · Mobile · Staging builds (TestFlight + Play internal)
 #
 # FILENAME: must NOT start with `erp-ci-` — deploy repo only, never mirrored to the
 # CI fleet.
-run-name: "ERP · Mobile staging ${{ github.event.client_payload.sha || inputs.sha || 'main' }} · ${{ github.event.client_payload.title || format('{0} — triggered by @{1}', inputs.platforms || 'auto', github.actor) }}"
+run-name: "ERP · Mobile ${{ inputs.variant == 'prod' && 'prod internal' || 'staging' }} ${{ github.event.client_payload.sha || inputs.sha || 'main' }} · ${{ github.event.client_payload.title || format('{0} — triggered by @{1}', inputs.platforms || 'auto', github.actor) }}"
 
 on:
   repository_dispatch:
@@ -41,6 +44,14 @@ on:
           - both
           - ios
           - android
+      variant:
+        description: 'stg = the staging apps (records the build); prod = the production apps to internal testing only (records nothing)'
+        type: choice
+        required: false
+        default: stg
+        options:
+          - stg
+          - prod
 
 permissions: read-all
 
@@ -189,7 +200,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.ios == 'true'
     runs-on: macos-26
-    environment: mobile-staging
+    environment: ${{ inputs.variant == 'prod' && 'mobile-production' || 'mobile-staging' }}
     timeout-minutes: 90
     steps:
       - name: Resolve PAT from pool
@@ -295,16 +306,26 @@ jobs:
           NOTES_HEAD: ${{ needs.plan.outputs.sha }}
         run: bash scripts/ci/native/release-notes.sh | tee "$RUNNER_TEMP/notes.txt"
 
-      - name: fastlane ios beta variant:stg
+      # The one environment secret unlocks the encrypted NamThuanVn/mobile-secrets repo (its README).
+      - name: Unlock the ios credentials
+        env:
+          MOBILE_SECRETS_PASSWORD: ${{ secrets.MOBILE_SECRETS_PASSWORD }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: bash scripts/ci/native/unlock-secrets.sh ios
+
+      - name: fastlane ios beta
         working-directory: apps/mobile
         env:
-          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
-          MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
-          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          VARIANT: ${{ inputs.variant || 'stg' }}
           NT_RELEASE_NOTES_FILE: ${{ runner.temp }}/notes.txt
-        run: bundle exec fastlane ios beta variant:stg
+        run: bundle exec fastlane ios beta "variant:$VARIANT"
+
+      - name: Delete the decrypted credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/mobile-secrets"
 
       - name: Record the built commit
+        if: ${{ inputs.variant != 'prod' }}
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           SHA: ${{ needs.plan.outputs.sha }}
@@ -317,7 +338,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.android == 'true'
     runs-on: ubuntu-latest
-    environment: mobile-staging
+    environment: ${{ inputs.variant == 'prod' && 'mobile-production' || 'mobile-staging' }}
     timeout-minutes: 60
     steps:
       - name: Resolve PAT from pool
@@ -428,18 +449,26 @@ jobs:
         run: bash scripts/ci/native/release-notes.sh | tee "$RUNNER_TEMP/notes.txt"
 
       # The Fastfile writes the base64 keystore to a temp file and deletes it after the build.
-      - name: fastlane android beta variant:stg
+      # The one environment secret unlocks the encrypted NamThuanVn/mobile-secrets repo (its README).
+      - name: Unlock the android credentials
+        env:
+          MOBILE_SECRETS_PASSWORD: ${{ secrets.MOBILE_SECRETS_PASSWORD }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: bash scripts/ci/native/unlock-secrets.sh android
+
+      - name: fastlane android beta
         working-directory: apps/mobile
         env:
-          ANDROID_UPLOAD_KEYSTORE: ${{ secrets.ANDROID_UPLOAD_KEYSTORE }}
-          ANDROID_UPLOAD_STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_STORE_PASSWORD }}
-          ANDROID_UPLOAD_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
-          ANDROID_UPLOAD_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
-          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          VARIANT: ${{ inputs.variant || 'stg' }}
           NT_RELEASE_NOTES_FILE: ${{ runner.temp }}/notes.txt
-        run: bundle exec fastlane android beta variant:stg
+        run: bundle exec fastlane android beta "variant:$VARIANT"
+
+      - name: Delete the decrypted credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/mobile-secrets"
 
       - name: Record the built commit
+        if: ${{ inputs.variant != 'prod' }}
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           SHA: ${{ needs.plan.outputs.sha }}
@@ -453,7 +482,7 @@ jobs:
   record:
     name: Record the batch
     needs: [plan, ios, android]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.ios.result != 'failure' && needs.android.result != 'failure' }}
+    if: ${{ !cancelled() && inputs.variant != 'prod' && needs.plan.result == 'success' && needs.ios.result != 'failure' && needs.android.result != 'failure' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

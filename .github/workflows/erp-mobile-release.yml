@@ -327,13 +327,20 @@ jobs:
       - name: Install XcodeGen
         run: command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
 
+      # The one environment secret unlocks the encrypted NamThuanVn/mobile-secrets repo (its README).
+      - name: Unlock the ios credentials
+        env:
+          MOBILE_SECRETS_PASSWORD: ${{ secrets.MOBILE_SECRETS_PASSWORD }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: bash scripts/ci/native/unlock-secrets.sh ios
+
       - name: fastlane ios release
         working-directory: apps/mobile
-        env:
-          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
-          MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
-          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
         run: bundle exec fastlane ios release
+
+      - name: Delete the decrypted credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/mobile-secrets"
 
   android:
     name: Android → Google Play (staged)
@@ -453,17 +460,23 @@ jobs:
           NOTES_HEAD: ${{ needs.prepare.outputs.sha }}
         run: bash scripts/ci/native/release-notes.sh | tee "$RUNNER_TEMP/notes.txt"
 
+      # The one environment secret unlocks the encrypted NamThuanVn/mobile-secrets repo (its README).
+      - name: Unlock the android credentials
+        env:
+          MOBILE_SECRETS_PASSWORD: ${{ secrets.MOBILE_SECRETS_PASSWORD }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: bash scripts/ci/native/unlock-secrets.sh android
+
       - name: fastlane android release
         working-directory: apps/mobile
         env:
-          ANDROID_UPLOAD_KEYSTORE: ${{ secrets.ANDROID_UPLOAD_KEYSTORE }}
-          ANDROID_UPLOAD_STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_STORE_PASSWORD }}
-          ANDROID_UPLOAD_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
-          ANDROID_UPLOAD_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
-          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
           NT_RELEASE_NOTES_FILE: ${{ runner.temp }}/notes.txt
           ROLLOUT: ${{ inputs.rollout }}
         run: bundle exec fastlane android release "rollout:$ROLLOUT"
+
+      - name: Delete the decrypted credentials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/mobile-secrets"
 
   tag:
     name: Tag mobile-vX.Y.Z · VERSION PR to main
