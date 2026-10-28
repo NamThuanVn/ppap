@@ -1639,7 +1639,9 @@ jobs:
     name: 1 · CI · Mobile (iOS)
     needs: native-plan
     if: ${{ needs.native-plan.outputs.ios == 'true' }}
-    runs-on: macos-15
+    # macos-26: its default Xcode is 26.x (Swift 6.2), which the Swift packages
+    # need — macos-15 defaults to Xcode 16 and cannot resolve them.
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
@@ -1785,16 +1787,22 @@ jobs:
           swiftformat --lint .
           swiftlint --strict
 
-      # The first available iPhone Simulator on this image, by id, so a runner
-      # image that renames its devices does not break the destination.
+      # An iPhone on the NEWEST installed iOS runtime, by id, so a runner image
+      # that renames its devices does not break the destination: a plain
+      # "iPhone <n>" when there is one, else any iPhone on that runtime.
       - name: Build + test (unit + XCUITest) on a Simulator
         working-directory: apps/mobile/ios
         run: |
           set -euo pipefail
+          xcodebuild -version
           xcodegen generate
-          UDID="$(xcrun simctl list devices available -j |
-            jq -r '[.devices | to_entries[] | select(.key | test("SimRuntime.iOS")) | .value[] | select(.name | startswith("iPhone"))] | last | .udid // empty')"
-          [ -n "$UDID" ] || { echo "::error::no available iPhone Simulator on this runner"; xcrun simctl list devices available; exit 1; }
+          UDID="$(xcrun simctl list devices available -j | jq -r '
+            [.devices | to_entries[] | select(.key | test("SimRuntime\\.iOS-"))
+              | {v: (.key | capture("iOS-(?<v>[0-9-]+)$").v | split("-") | map(tonumber)), d: .value}]
+            | sort_by(.v) | last | .d // []
+            | (map(select(.name | test("^iPhone [0-9]+$"))) + map(select(.name | startswith("iPhone"))))
+            | first | .udid // empty')"
+          [ -n "$UDID" ] || { echo "::error::no available iPhone Simulator on the newest iOS runtime"; xcrun simctl list devices available; exit 1; }
           echo "▶ Simulator: $(xcrun simctl list devices available | grep "$UDID")"
           xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$UDID" \
             -derivedDataPath "$RUNNER_TEMP/dd" -resultBundlePath "$RUNNER_TEMP/NamThuan.xcresult" \
@@ -1988,6 +1996,18 @@ jobs:
           emulator-options: -no-window -no-snapshot-save -gpu swiftshader_indirect -noaudio -no-boot-anim
           working-directory: apps/mobile/android
           script: ./gradlew :app:connectedDevDebugAndroidTest
+
+      # Gradle reports success when the device ran nothing, so count the
+      # results: a UI-test step that ran zero tests is red, not green.
+      - name: Count the UI tests that ran
+        run: |
+          set -euo pipefail
+          DIR=apps/mobile/android/app/build/outputs/androidTest-results/connected
+          XML="$(find "$DIR" -name '*.xml' -print 2>/dev/null || true)"
+          count() { [ -z "$XML" ] && echo 0 || printf '%s\n' "$XML" | xargs cat | { grep -o "$1" || true; } | wc -l | tr -d ' '; }
+          RAN=$(count '<testcase'); FAILED=$(count '<failure'); SKIPPED=$(count '<skipped')
+          echo "UI tests: $RAN ran, $FAILED failed, $SKIPPED skipped"
+          [ "$((RAN - SKIPPED))" -gt 0 ] || { echo "::error::no Compose UI test ran on the emulator (results under $DIR)"; exit 1; }
 
       - name: Upload test results
         if: ${{ failure() }}
