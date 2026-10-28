@@ -1,0 +1,545 @@
+name: ERP · Mobile · Staging builds (TestFlight + Play internal)
+
+# The native apps' staging CD, run on ppap. The fleet hub (apis/utilities,
+# services/staging-batch.ts MOBILE_BATCH) dispatches `mobile-staging` every
+# MOBILE_STAGING_BATCH merges that change a native build, or after
+# MOBILE_STAGING_MAX_WAIT_H hours; race control's "Build mobile staging" sends the
+# same dispatch; "Run workflow" here takes a commit and the platforms by hand.
+#
+# Only the platform(s) whose files changed since that platform's last successful
+# staging build are built (scripts/ci/native/build-plan.sh). Each built platform
+# records the commit it built (MOBILE_STG_IOS_LAST_BUILT_SHA /
+# MOBILE_STG_ANDROID_LAST_BUILT_SHA: its next diff base, and what a mobile release
+# ships); a run whose every planned platform built records its head as
+# MOBILE_STG_LAST_BUILT_SHA, the hub's counter anchor. The develop variant is never
+# built here: it is local + CI tests only.
+#
+# Signing secrets live on the `mobile-staging` GitHub environment of this repo
+# (docs/engineering/services/mobile/mobile-build-and-release.md §5); only the job
+# that runs fastlane names it. Secrets are never echoed or uploaded.
+#
+# FILENAME: must NOT start with `erp-ci-` — deploy repo only, never mirrored to the
+# CI fleet.
+run-name: "ERP · Mobile staging ${{ github.event.client_payload.sha || inputs.sha || 'main' }} · ${{ github.event.client_payload.title || format('{0} — triggered by @{1}', inputs.platforms || 'auto', github.actor) }}"
+
+on:
+  repository_dispatch:
+    types: [mobile-staging]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'erp-namthuan commit to build (empty = main head)'
+        required: false
+        default: ''
+      platforms:
+        description: 'auto = only the platform(s) whose files changed since their last staging build'
+        type: choice
+        required: false
+        default: auto
+        options:
+          - auto
+          - both
+          - ios
+          - android
+
+permissions: read-all
+
+# One build at a time, and never cancel one half-way: a cancelled upload leaves the
+# store with a build number used and the recorded commit unchanged.
+concurrency:
+  group: mobile-staging
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
+jobs:
+  plan:
+    name: Plan the platforms
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+      ios: ${{ steps.plan.outputs.ios }}
+      android: ${{ steps.plan.outputs.android }}
+      ios_base: ${{ steps.base.outputs.ios }}
+      android_base: ${{ steps.base.outputs.android }}
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          # A batch job's PAT budgets from its coordinator (scripts/ci/ppap/fleet-token.sh hint); empty otherwise.
+          FLEET_PAT_HINT: ${{ github.event.client_payload.ctx.pat_hint }}
+        run: |
+          set -uo pipefail
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            # raw.githubusercontent.com costs no REST quota; the contents API costs one NT call per job
+            # (about 80 jobs per PR). The contents API stays as the fallback.
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -o "$D/fleet-token.sh" \
+              'https://raw.githubusercontent.com/NamThuanVn/erp-namthuan/main/scripts/ci/ppap/fleet-token.sh' \
+              || curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            # actions/checkout spends one GET /repos/{owner}/{repo}/hash-algorithm per checkout of a
+            # branch, on the token it is given. A checkout that persists no credentials only reads,
+            # so it takes a pooled PAT (CHECKOUT_PAT) for that call; git writes stay on the App.
+            CO=$(FLEET_APP_DIR="$D" "$D/bin/fleet-token" spill NamThuanVn api repos/NamThuanVn/erp-namthuan/hash-algorithm 2>/dev/null) || CO=''
+            if [ -n "$CO" ]; then echo "::add-mask::$CO"; echo "CHECKOUT_PAT=$CO" >> "$GITHUB_ENV"; fi
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
+          fi
+          exit 0
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
+          ref: ${{ github.event.client_payload.sha || inputs.sha || 'main' }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The signing secrets reach this build, so it builds only what main already holds.
+      - name: Pin the commit
+        id: sha
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$SHA" origin/main \
+            || { echo "::error::$SHA is not on main — staging builds only merged commits"; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      # The hub sends the bases it holds; ppap's own variables are the truth when it sends none.
+      - name: Each platform's last staging build
+        id: base
+        env:
+          IOS: ${{ github.event.client_payload.ios_base_sha || vars.MOBILE_STG_IOS_LAST_BUILT_SHA }}
+          ANDROID: ${{ github.event.client_payload.android_base_sha || vars.MOBILE_STG_ANDROID_LAST_BUILT_SHA }}
+        run: |
+          echo "ios=$IOS" >> "$GITHUB_OUTPUT"
+          echo "android=$ANDROID" >> "$GITHUB_OUTPUT"
+
+      - name: Plan
+        id: plan
+        env:
+          PLAN_HEAD: ${{ steps.sha.outputs.sha }}
+          IOS_BASE: ${{ steps.base.outputs.ios }}
+          ANDROID_BASE: ${{ steps.base.outputs.android }}
+          PLAN_PLATFORMS: ${{ inputs.platforms || 'auto' }}
+        run: bash scripts/ci/native/build-plan.sh
+
+  ios:
+    name: iOS → TestFlight
+    needs: plan
+    if: needs.plan.outputs.ios == 'true'
+    runs-on: macos-26
+    environment: mobile-staging
+    timeout-minutes: 90
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          # A batch job's PAT budgets from its coordinator (scripts/ci/ppap/fleet-token.sh hint); empty otherwise.
+          FLEET_PAT_HINT: ${{ github.event.client_payload.ctx.pat_hint }}
+        run: |
+          set -uo pipefail
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            # raw.githubusercontent.com costs no REST quota; the contents API costs one NT call per job
+            # (about 80 jobs per PR). The contents API stays as the fallback.
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -o "$D/fleet-token.sh" \
+              'https://raw.githubusercontent.com/NamThuanVn/erp-namthuan/main/scripts/ci/ppap/fleet-token.sh' \
+              || curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            # actions/checkout spends one GET /repos/{owner}/{repo}/hash-algorithm per checkout of a
+            # branch, on the token it is given. A checkout that persists no credentials only reads,
+            # so it takes a pooled PAT (CHECKOUT_PAT) for that call; git writes stay on the App.
+            CO=$(FLEET_APP_DIR="$D" "$D/bin/fleet-token" spill NamThuanVn api repos/NamThuanVn/erp-namthuan/hash-algorithm 2>/dev/null) || CO=''
+            if [ -n "$CO" ]; then echo "::add-mask::$CO"; echo "CHECKOUT_PAT=$CO" >> "$GITHUB_ENV"; fi
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
+          fi
+          exit 0
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+          working-directory: apps/mobile
+
+      - name: Install XcodeGen
+        run: command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+
+      - name: Release notes
+        env:
+          NOTES_PLATFORM: ios
+          NOTES_BASE: ${{ needs.plan.outputs.ios_base }}
+          NOTES_HEAD: ${{ needs.plan.outputs.sha }}
+        run: bash scripts/ci/native/release-notes.sh | tee "$RUNNER_TEMP/notes.txt"
+
+      - name: fastlane ios beta variant:stg
+        working-directory: apps/mobile
+        env:
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          NT_RELEASE_NOTES_FILE: ${{ runner.temp }}/notes.txt
+        run: bundle exec fastlane ios beta variant:stg
+
+      - name: Record the built commit
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          gh variable set MOBILE_STG_IOS_LAST_BUILT_SHA --body "$SHA" -R "$GITHUB_REPOSITORY"
+          echo "✓ MOBILE_STG_IOS_LAST_BUILT_SHA = $SHA"
+
+  android:
+    name: Android → Play internal testing
+    needs: plan
+    if: needs.plan.outputs.android == 'true'
+    runs-on: ubuntu-latest
+    environment: mobile-staging
+    timeout-minutes: 60
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          # A batch job's PAT budgets from its coordinator (scripts/ci/ppap/fleet-token.sh hint); empty otherwise.
+          FLEET_PAT_HINT: ${{ github.event.client_payload.ctx.pat_hint }}
+        run: |
+          set -uo pipefail
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            # raw.githubusercontent.com costs no REST quota; the contents API costs one NT call per job
+            # (about 80 jobs per PR). The contents API stays as the fallback.
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -o "$D/fleet-token.sh" \
+              'https://raw.githubusercontent.com/NamThuanVn/erp-namthuan/main/scripts/ci/ppap/fleet-token.sh' \
+              || curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            # actions/checkout spends one GET /repos/{owner}/{repo}/hash-algorithm per checkout of a
+            # branch, on the token it is given. A checkout that persists no credentials only reads,
+            # so it takes a pooled PAT (CHECKOUT_PAT) for that call; git writes stay on the App.
+            CO=$(FLEET_APP_DIR="$D" "$D/bin/fleet-token" spill NamThuanVn api repos/NamThuanVn/erp-namthuan/hash-algorithm 2>/dev/null) || CO=''
+            if [ -n "$CO" ]; then echo "::add-mask::$CO"; echo "CHECKOUT_PAT=$CO" >> "$GITHUB_ENV"; fi
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
+          fi
+          exit 0
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Launches Gradle only; the daemon's own JDK comes from
+      # gradle/gradle-daemon-jvm.properties, provisioned by the toolchain resolver.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+          working-directory: apps/mobile
+
+      - name: Release notes
+        env:
+          NOTES_PLATFORM: android
+          NOTES_BASE: ${{ needs.plan.outputs.android_base }}
+          NOTES_HEAD: ${{ needs.plan.outputs.sha }}
+        run: bash scripts/ci/native/release-notes.sh | tee "$RUNNER_TEMP/notes.txt"
+
+      # The Fastfile writes the base64 keystore to a temp file and deletes it after the build.
+      - name: fastlane android beta variant:stg
+        working-directory: apps/mobile
+        env:
+          ANDROID_UPLOAD_KEYSTORE: ${{ secrets.ANDROID_UPLOAD_KEYSTORE }}
+          ANDROID_UPLOAD_STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_STORE_PASSWORD }}
+          ANDROID_UPLOAD_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+          ANDROID_UPLOAD_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          NT_RELEASE_NOTES_FILE: ${{ runner.temp }}/notes.txt
+        run: bundle exec fastlane android beta variant:stg
+
+      - name: Record the built commit
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          gh variable set MOBILE_STG_ANDROID_LAST_BUILT_SHA --body "$SHA" -R "$GITHUB_REPOSITORY"
+          echo "✓ MOBILE_STG_ANDROID_LAST_BUILT_SHA = $SHA"
+
+  # The hub's batch counter restarts here: every planned platform built (or none was
+  # needed — nothing native changed, so nothing waits). A failed platform keeps the
+  # batch, and the hub retries it once on the next trigger.
+  record:
+    name: Record the batch
+    needs: [plan, ios, android]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.ios.result != 'failure' && needs.android.result != 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          # A batch job's PAT budgets from its coordinator (scripts/ci/ppap/fleet-token.sh hint); empty otherwise.
+          FLEET_PAT_HINT: ${{ github.event.client_payload.ctx.pat_hint }}
+        run: |
+          set -uo pipefail
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            # raw.githubusercontent.com costs no REST quota; the contents API costs one NT call per job
+            # (about 80 jobs per PR). The contents API stays as the fallback.
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -o "$D/fleet-token.sh" \
+              'https://raw.githubusercontent.com/NamThuanVn/erp-namthuan/main/scripts/ci/ppap/fleet-token.sh' \
+              || curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            # actions/checkout spends one GET /repos/{owner}/{repo}/hash-algorithm per checkout of a
+            # branch, on the token it is given. A checkout that persists no credentials only reads,
+            # so it takes a pooled PAT (CHECKOUT_PAT) for that call; git writes stay on the App.
+            CO=$(FLEET_APP_DIR="$D" "$D/bin/fleet-token" spill NamThuanVn api repos/NamThuanVn/erp-namthuan/hash-algorithm 2>/dev/null) || CO=''
+            if [ -n "$CO" ]; then echo "::add-mask::$CO"; echo "CHECKOUT_PAT=$CO" >> "$GITHUB_ENV"; fi
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
+          fi
+          exit 0
+
+      - name: Record the batch head
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          gh variable set MOBILE_STG_LAST_BUILT_SHA --body "$SHA" -R "$GITHUB_REPOSITORY"
+          echo "✓ MOBILE_STG_LAST_BUILT_SHA = $SHA"

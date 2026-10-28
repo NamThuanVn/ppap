@@ -2003,8 +2003,7 @@ jobs:
         run: |
           set -euo pipefail
           DIR=apps/mobile/android/app/build/outputs/androidTest-results/connected
-          XML="$(find "$DIR" -name '*.xml' -print 2>/dev/null || true)"
-          count() { [ -z "$XML" ] && echo 0 || printf '%s\n' "$XML" | xargs cat | { grep -o "$1" || true; } | wc -l | tr -d ' '; }
+          count() { { find "$DIR" -name '*.xml' -exec cat {} + 2>/dev/null || true; } | { grep -o "$1" || true; } | wc -l | tr -d ' '; }
           RAN=$(count '<testcase'); FAILED=$(count '<failure'); SKIPPED=$(count '<skipped')
           echo "UI tests: $RAN ran, $FAILED failed, $SKIPPED skipped"
           [ "$((RAN - SKIPPED))" -gt 0 ] || { echo "::error::no Compose UI test ran on the emulator (results under $DIR)"; exit 1; }
