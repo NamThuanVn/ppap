@@ -102,6 +102,12 @@ on:
         required: false
         default: ''
         type: string
+      platform:
+        description: 'Which items this lane claims: web (default), ios (runs on macOS) or android. A native lane claims only its platform:* label.'
+        required: false
+        default: 'web'
+        type: choice
+        options: [web, ios, android]
 
 permissions: read-all
 
@@ -124,7 +130,9 @@ env:
 jobs:
   agent:
     name: Agent
-    runs-on: ubuntu-latest
+    # A native lane builds what it claims: Xcode is macOS-only, so an iOS lane
+    # runs there (the same image as erp-ci-checks.yml's native-ios job).
+    runs-on: ${{ (github.event.client_payload.platform || inputs.platform) == 'ios' && 'macos-26' || 'ubuntu-latest' }}
     # 30 min under GitHub's 360-min hard cap: leave room for the always-steps
     # (a timeout-killed run still executes tow-in-or-revert).
     timeout-minutes: 330
@@ -134,6 +142,9 @@ jobs:
       ITEM_ARG: ${{ github.event.client_payload.item || inputs.item || '' }}
       CLAUDE_MODEL: ${{ github.event.client_payload.model || inputs.model || '' }}
       CLAUDE_VERSION: ${{ github.event.client_payload.claude_version || inputs.claude_version || 'latest' }}
+      # web | ios | android — the claim sweep takes only this platform's items
+      # (claim/claimable.mjs platformOf). Absent on every web dispatch.
+      AGENT_LANE_PLATFORM: ${{ github.event.client_payload.platform || inputs.platform || 'web' }}
       # The pool-probe tuning vars (AGENT_FUEL_PROBE, AGENT_FUEL_MAX_*/WARN_*)
       # used to be declared here as `vars.X || 'default'`. They now come from "Load lane
       # config", and they CANNOT stay here as well: a job-level `env:` key
@@ -385,6 +396,15 @@ jobs:
       # The CLI install moved up here because the probe below needs `claude` in
       # PATH. It is cheap (a curl + one --version) next to what it now guards,
       # and worktree:init's hard requirement that the CLI precede it still holds.
+      # The harness scripts are written against GNU coreutils (claude.sh's pool
+      # probe calls `timeout`), which macOS does not ship. Before the probe.
+      - name: GNU coreutils (macOS lane)
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew list coreutils >/dev/null 2>&1 || brew install coreutils
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+
       - name: Install Claude Code CLI
         if: env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true'
         run: |
@@ -514,13 +534,17 @@ jobs:
       # the kernel real swap to fall back on, is what lets a lane survive its own
       # peak. Swapping is slow; being killed is slower. Best-effort throughout —
       # a runner image that has moved things around must not fail the lane.
+      # Linux only (swap, fallocate). An Android lane keeps the preinstalled
+      # Android SDK it builds with.
       - name: Give the runner headroom (disk + swap)
-        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true' && runner.os == 'Linux'
         continue-on-error: true
         run: |
           set -uo pipefail
           echo "· before"; df -h / /mnt 2>/dev/null | sed 's/^/  /'; free -h | sed 's/^/  /'
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+          ANDROID_SDK=/usr/local/lib/android
+          [ "$AGENT_LANE_PLATFORM" = android ] && ANDROID_SDK=
+          sudo rm -rf /usr/share/dotnet /opt/ghc $ANDROID_SDK \
                       /opt/hostedtoolcache/CodeQL /usr/local/share/powershell 2>/dev/null || true
           # The image ships a 4 GB swapfile on /mnt (the large temp disk). A
           # lane's peak needs more than that sitting on top of the runner's RAM.
@@ -542,6 +566,36 @@ jobs:
         if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true'
         uses: ./.github/actions/install
 
+      # ── Native toolchains (a platform lane only) — the same tools as
+      # erp-ci-checks.yml's native-ios / native-android jobs, so a lane runs the
+      # checks PR CI runs. scripts/dev/mobile/ui-journey.sh boots the stack (and the
+      # emulator) for the journeys the change touched.
+      - name: Install the iOS toolchain
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true' && env.AGENT_LANE_PLATFORM == 'ios'
+        run: |
+          set -euo pipefail
+          for t in xcodegen swiftlint swiftformat; do
+            command -v "$t" >/dev/null 2>&1 || brew install "$t"
+          done
+
+      # Launches Gradle only; the daemon's own JDK comes from
+      # gradle/gradle-daemon-jvm.properties, provisioned by the toolchain resolver.
+      - name: Set up Java (Android lane)
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true' && env.AGENT_LANE_PLATFORM == 'android'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The emulator needs hardware acceleration, which the runner only grants
+      # once /dev/kvm is opened to the runner user.
+      - name: Enable KVM (Android lane)
+        if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true' && env.AGENT_LANE_PLATFORM == 'android'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
       # Same Chromium cache pattern as erp-ci-checks.yml — /verify-in-browser (headless) and
       # any e2e the agent runs need it.
       - name: Resolve Playwright version
@@ -557,7 +611,7 @@ jobs:
         uses: actions/cache@v6
         id: pw-cache
         with:
-          path: ~/.cache/ms-playwright
+          path: ${{ runner.os == 'macOS' && '~/Library/Caches/ms-playwright' || '~/.cache/ms-playwright' }}
           key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
 
       # NOT `--with-deps`, and NOT unconditional. Both are deliberate.

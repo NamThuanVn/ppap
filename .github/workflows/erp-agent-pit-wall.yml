@@ -663,11 +663,18 @@ jobs:
         id: probe
         if: steps.cap.outputs.proceed == 'true' && steps.hold.outputs.proceed == 'true'
         env:
-          TOTAL: ${{ steps.count.outputs.eligible || '0' }}
+          # `eligible` is web; native items count apart (platform:ios /
+          # platform:android, claim/claimable.mjs platformOf). One shared cap.
+          WEB: ${{ steps.count.outputs.eligible || '0' }}
+          IOS: ${{ steps.count.outputs.eligible_ios || '0' }}
+          ANDROID: ${{ steps.count.outputs.eligible_android || '0' }}
           CRITICAL: ${{ steps.count.outputs.critical }}
         run: |
           set -euo pipefail
+          TOTAL=$((WEB + IOS + ANDROID))
           echo "candidates=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "candidates_ios=$IOS" >> "$GITHUB_OUTPUT"
+          echo "candidates_android=$ANDROID" >> "$GITHUB_OUTPUT"
           echo "critical=$CRITICAL" >> "$GITHUB_OUTPUT"
           if [ "$TOTAL" -eq 0 ]; then
             echo "::notice::backlog empty (no Todo · unassigned · unblocked leaf) — dispatching nothing"
@@ -760,6 +767,9 @@ jobs:
           CAP: ${{ steps.thermostat.outputs.cap || steps.cap.outputs.cap }}
           MODE: ${{ steps.cap.outputs.mode }}
           CANDIDATES: ${{ steps.probe.outputs.candidates }}
+          # Of those, the native ones (dispatch-k.mjs splitByPlatform).
+          CANDIDATES_IOS: ${{ steps.probe.outputs.candidates_ios }}
+          CANDIDATES_ANDROID: ${{ steps.probe.outputs.candidates_android }}
           # The Critical Todo leaves among them, and how many extra cars (above the
           # cap, pinned, Critical only) may take them: unset = 2, 0 = off.
           CRITICAL_ITEMS: ${{ steps.probe.outputs.critical }}
