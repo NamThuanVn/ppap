@@ -454,7 +454,8 @@ jobs:
         env:
           MOBILE_SECRETS_PASSWORD: ${{ secrets.MOBILE_SECRETS_PASSWORD }}
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: bash scripts/ci/native/unlock-secrets.sh android
+          VARIANT: ${{ inputs.variant || 'stg' }}
+        run: bash scripts/ci/native/unlock-secrets.sh android "$VARIANT"
 
       - name: fastlane android beta
         working-directory: apps/mobile
@@ -465,7 +466,7 @@ jobs:
 
       - name: Delete the decrypted credentials
         if: always()
-        run: rm -rf "$RUNNER_TEMP/mobile-secrets"
+        run: rm -rf "$RUNNER_TEMP/mobile-secrets" apps/mobile/android/app/src/*/google-services.json
 
       - name: Record the built commit
         if: ${{ inputs.variant != 'prod' }}

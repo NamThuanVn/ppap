@@ -1343,6 +1343,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       web: ${{ steps.plan.outputs.web }}
+      bash_tests: ${{ steps.plan.outputs.bash_tests }}
       ios: ${{ steps.plan.outputs.ios }}
       android: ${{ steps.plan.outputs.android }}
       sha: ${{ steps.pin.outputs.sha }}
@@ -1619,10 +1620,13 @@ jobs:
           terraform_version: '1.9.0'
           terraform_wrapper: false
 
+      # The shell suite runs only the changed mobile scripts' suites (scope.sh bash_tests);
+      # every other gate runs whole.
       - name: Run gates shard 1/1
         env:
           FLEET_AUTH_MODE: ''
           FLEET_APP_DIR: ''
+          BASH_TESTS_ONLY: ${{ needs.native-plan.outputs.bash_tests }}
         run: bash ./scripts/ci/checks/run-shard.sh gates 1/1
 
       # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh

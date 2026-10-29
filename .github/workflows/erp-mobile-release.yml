@@ -465,7 +465,7 @@ jobs:
         env:
           MOBILE_SECRETS_PASSWORD: ${{ secrets.MOBILE_SECRETS_PASSWORD }}
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-        run: bash scripts/ci/native/unlock-secrets.sh android
+        run: bash scripts/ci/native/unlock-secrets.sh android prod
 
       - name: fastlane android release
         working-directory: apps/mobile
@@ -476,7 +476,7 @@ jobs:
 
       - name: Delete the decrypted credentials
         if: always()
-        run: rm -rf "$RUNNER_TEMP/mobile-secrets"
+        run: rm -rf "$RUNNER_TEMP/mobile-secrets" apps/mobile/android/app/src/*/google-services.json
 
   tag:
     name: Tag mobile-vX.Y.Z · VERSION PR to main
