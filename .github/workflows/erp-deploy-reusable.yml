@@ -1427,6 +1427,10 @@ jobs:
       # their deploy:<env> script (no rebuild). Independent → concurrent.
       # SENTRY_DSN is a runtime var for the zone's @sentry/cloudflare worker wrap
       # (apps/<zone>/worker.ts); empty in envs without a DSN → Sentry disabled.
+      # A zone whose asset upload dies with Cloudflare's generic 10013 retries
+      # with backoff: during the 2026-10-29 Workers incident a random 1–3 of the
+      # 13 concurrent `assets-upload-session` calls failed on every attempt, so
+      # a whole-job rerun never went green. Any other failure fails at once.
       - name: Deploy zones (Next.js)
         env:
           ZONES: ${{ needs.changes.outputs.zones_list }}
@@ -1439,7 +1443,15 @@ jobs:
           # deploy). Empty → deploys no zone.
           for entry in $ZONES; do
             name=${entry%%:*}; pkg=${entry##*:}
-            ( pnpm --filter "$pkg" run "deploy$SUFFIX" -- --var "SENTRY_DSN:$DSN" ) > "/tmp/zone-$name.log" 2>&1 &
+            (
+              for attempt in 1 2 3 4; do
+                pnpm --filter "$pkg" run "deploy$SUFFIX" -- --var "SENTRY_DSN:$DSN" > "/tmp/zone-$name.try" 2>&1 && { cat "/tmp/zone-$name.try"; exit 0; }
+                cat "/tmp/zone-$name.try"
+                grep -q 'code: 10013\]' "/tmp/zone-$name.try" && [ "$attempt" -lt 4 ] || exit 1
+                echo "::warning::zone $name: Cloudflare 10013 on attempt $attempt — retrying in $((attempt * 20))s"
+                sleep $((attempt * 20))
+              done
+            ) > "/tmp/zone-$name.log" 2>&1 &
             pids="$pids $!:$name"
           done
           fail=0
