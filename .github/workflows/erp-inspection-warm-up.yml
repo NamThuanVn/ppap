@@ -274,7 +274,7 @@ jobs:
           if [ -n "$HTOK" ] && curl -sf -m 30 -X POST \
                -H "Authorization: Bearer $HTOK" -H 'Content-Type: application/json' \
                -d "{\"ceiling\": $MAX}" \
-               "$HUB/utilities/fleet/_system/hosts/${{ github.repository }}/ceiling" >/dev/null; then
+               "$HUB/worklog/_system/hosts/${{ github.repository }}/ceiling" >/dev/null; then
             echo "✓ fleet hub: ceiling $MAX posted"
           else
             echo "fleet hub ceiling post skipped — the hourly fleet-warmup sweep retries it"
