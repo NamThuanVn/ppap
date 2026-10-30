@@ -805,8 +805,8 @@ jobs:
       - name: Cache keys
         id: keys
         run: |
-          echo "zonetar=zonetar-v2-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'apps/*/src/app/**', 'apps/shell/src/styles/**', 'scripts/ci/remote/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
-          echo "next=next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('apps/{0}/**', matrix.zone.name), 'apps/*/src/app/**', 'apps/shell/src/styles/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
+          echo "zonetar=zonetar-v2-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'apps/*/src/app/**', 'apps/*/src/components/scpms/**', 'apps/shell/src/styles/**', 'scripts/ci/remote/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
+          echo "next=next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('apps/{0}/**', matrix.zone.name), 'apps/*/src/app/**', 'apps/*/src/components/scpms/**', 'apps/shell/src/styles/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
 
       # OUTPUT cache — the packaged bundle itself, not just the compiler cache.
       # On a hit this job does checkout → restore → upload (~10s) and skips
@@ -865,7 +865,7 @@ jobs:
       # source. Keyed per-zone so the matrix legs don't clobber one another's
       # cache. Scoped to this zone's own inputs for the same reason as the
       # bundle cache above — an `apps/**` key made every zone miss on any app
-      # change. The key also names every zone's `src/app` and the shell styles:
+      # change. The key also names every zone's `src/app`, every zone's `src/components/scpms` and the shell styles:
       # the shell's Tailwind CSS scans those via `@source`, and a restored
       # compiler cache does not notice a class added outside `apps/shell` — the
       # shell served CSS without `min-w-39` (PR #7825, OMS po-list-po-total). So
@@ -883,6 +883,15 @@ jobs:
       - name: Build zone (OpenNext shell / zone remote)
         if: steps.zonetar.outputs.cache-hit != 'true'
         run: pnpm --filter ${{ matrix.zone.pkg }} run build:pages
+
+      # The shell's built stylesheet must hold every utility its @source scan
+      # produces — a stale compiler cache otherwise ships an old sheet with a green
+      # build. Skipped on a ref older than the check (a rollback to an earlier tag).
+      - name: Check the shell stylesheet
+        if: steps.zonetar.outputs.cache-hit != 'true' && matrix.zone.name == 'shell'
+        run: |
+          if [ ! -f scripts/ci/shell-css.mjs ]; then echo "::notice::scripts/ci/shell-css.mjs is not in this ref — skipped"; exit 0; fi
+          node scripts/ci/shell-css.mjs apps/shell/.open-next
 
       # tar (not a raw many-small-files upload) so the file count doesn't make
       # upload/download slow. The bundle is already minified, so skip artifact

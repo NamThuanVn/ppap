@@ -962,18 +962,19 @@ jobs:
           name: tf-outputs
           path: /tmp
 
-      # Warm THIS zone's Next compiler cache across runs. build:pages still runs
-      # (always re-evaluates source — no stale-build risk) but reuses prior
-      # compilation work. Keyed per-zone so the matrix legs don't clobber one
-      # another's cache.
+      # Warm THIS zone's Next compiler cache across runs — on an EXACT key only.
+      # The key hashes every path the shell's Tailwind `@source` globs scan
+      # (apps/**, packages/**), and there are NO restore-keys: a warm Webpack
+      # cache does not rebuild the shell stylesheet when only a scanned file
+      # changed, so a partial-match restore shipped Staging a sheet without six
+      # 2026-10-29 utilities and Production v1.1.14 one without two. Same rule as
+      # erp-ci-checks.yml's `Cache Next build`. Keyed per-zone so the matrix legs
+      # don't clobber one another's cache.
       - name: Cache Next build
         uses: actions/cache@v6
         with:
           path: apps/${{ matrix.zone.name }}/.next/cache
           key: ${{ steps.keys.outputs.next }}
-          restore-keys: |
-            next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-
-            next-${{ runner.os }}-${{ matrix.zone.name }}-
 
       # VAPID public key (Web Push) — lives in HCP, surfaced via tf-outputs.
       - name: Load VAPID public key from tf-outputs
@@ -1005,6 +1006,15 @@ jobs:
           SENTRY_AUTH_TOKEN: ${{ steps.sentry.outputs.auth_token }}
           SENTRY_ORG: ${{ steps.sentry.outputs.org }}
           SENTRY_PROJECT: ${{ steps.sentry.outputs.project }}
+
+      # The shell's built stylesheet must hold every utility its @source scan
+      # produces — a stale compiler cache otherwise ships an old sheet with a green
+      # build. Skipped on a ref older than the check (a rollback to an earlier tag).
+      - name: Check the shell stylesheet
+        if: matrix.zone.name == 'shell'
+        run: |
+          if [ ! -f scripts/ci/shell-css.mjs ]; then echo "::notice::scripts/ci/shell-css.mjs is not in this ref — skipped"; exit 0; fi
+          node scripts/ci/shell-css.mjs apps/shell/.open-next
 
       # tar (not a raw many-small-files upload) so the .open-next file count
       # doesn't make upload/download slow. Already minified → skip artifact gzip.
