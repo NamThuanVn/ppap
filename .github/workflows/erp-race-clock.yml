@@ -434,7 +434,7 @@ jobs:
       # The fleet's GitHub API budget, measured: one GET /user per pooled
       # account, plus one token mint and GET /rate_limit per GitHub App
       # installation, posted to the ERP fleet hub
-      # (docs/engineering/services/utilities/fleet-hub.md § Measuring). Never
+      # (docs/engineering/services/worklog/fleet-hub.md § Measuring). Never
       # fails the tick — the script warns and exits 0 on a dead token or a hub
       # outage, and `continue-on-error` covers anything else.
       - name: Record pool usage
