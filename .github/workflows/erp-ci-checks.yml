@@ -1822,6 +1822,8 @@ jobs:
           path: |
             ${{ runner.temp }}/NamThuan.xcresult
             .wrangler/dev-lite.log
+            .wrangler/state/api.log
+            .wrangler/state/next.log
           retention-days: 7
           if-no-files-found: ignore
 
@@ -2027,6 +2029,8 @@ jobs:
             apps/mobile/android/app/build/reports/androidTests
             apps/mobile/android/app/build/outputs/androidTest-results
             .wrangler/dev-lite.log
+            .wrangler/state/api.log
+            .wrangler/state/next.log
           retention-days: 7
           if-no-files-found: ignore
 
