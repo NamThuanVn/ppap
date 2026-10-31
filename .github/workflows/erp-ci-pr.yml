@@ -257,11 +257,12 @@ jobs:
       # "assert the precondition" pattern that fixed the first one), NOT to
       # re-narrow the scope — re-narrowing restores the exact hole this closes.
       e2e_changed_only: false
-      # The one narrow exception to the above: a PR whose every changed file is
-      # under apps/mobile/ has no web or backend code to break, so it skips the
-      # checks fan-out and e2e (both report success) and runs the native iOS /
-      # Android jobs for the platforms it touches instead. One file anywhere
-      # else and the full graph runs as above. See scripts/ci/native/scope.sh.
+      # The two narrow exceptions to the above: a PR whose every changed file is
+      # under apps/mobile/, or is markdown (no build, typecheck or e2e reads it),
+      # has no web or backend code to break, so it skips the checks fan-out and
+      # e2e (both report success) and runs only the repo gates, plus the native
+      # iOS / Android jobs for the platforms it touches. One file anywhere else
+      # and the full graph runs as above. See scripts/ci/native/scope.sh.
       run_native: true
     secrets:
       PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}

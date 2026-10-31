@@ -56,7 +56,7 @@ on:
         type: boolean
         default: false
       run_native:
-        description: 'Plan the change with scripts/ci/native/scope.sh: run the native iOS / Android jobs for the platforms it touches, and skip the web/backend checks and e2e (reported as success) when every changed file is under apps/mobile/. Only PR CI passes true; the deploy gate keeps the default (false), so none of this runs there and every web suite runs as before.'
+        description: 'Plan the change with scripts/ci/native/scope.sh: run the native iOS / Android jobs for the platforms it touches, and skip the web/backend checks and e2e (reported as success) when every changed file is under apps/mobile/ or is markdown. Only PR CI passes true; the deploy gate keeps the default (false), so none of this runs there and every web suite runs as before.'
         type: boolean
         default: false
     outputs:
@@ -291,9 +291,10 @@ jobs:
         id: pin
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # A PR whose every changed file is under apps/mobile/ has no web code for
-      # these suites to check: scripts/ci/native/scope.sh answers web=false, no
-      # shard is planned or dispatched, and every suite reports success. PR CI
+      # A PR whose every changed file is under apps/mobile/ or is markdown has no
+      # web code for these suites to check: scripts/ci/native/scope.sh answers
+      # web=false, no shard is planned or dispatched, and every suite reports
+      # success; the repo gates still run in the native-gates job. PR CI
       # only (run_native), and only on a PR merge ref — a manual run on `main`
       # smoke-tests the whole graph. A ref without the script runs everything.
       - name: Plan mobile-only skip
@@ -402,7 +403,7 @@ jobs:
           set -euo pipefail
           # Anything but a literal `success` is red — including an empty value
           # from a dispatch that failed or a collect that never ran. The one
-          # exception is a mobile-only change, which had nothing to check.
+          # exception is a mobile-only or markdown-only change, which had nothing to check.
           for s in gates lint typecheck test; do
             var="R_$(printf '%s' "$s" | tr '[:lower:]' '[:upper:]')"
             v="${!var:-}"
@@ -581,8 +582,8 @@ jobs:
         env:
           CHANGED_ONLY: ${{ inputs.e2e_changed_only }}
           TOTAL: ${{ inputs.e2e_shards }}
-          # The checks job's mobile-only rule, applied here too: a PR whose every
-          # changed file is under apps/mobile/ has no web surface to test.
+          # The checks job's web=false rule, applied here too: a PR whose every
+          # changed file is under apps/mobile/ or is markdown has no web surface to test.
           NATIVE: ${{ inputs.run_native && startsWith(inputs.checkout_ref, 'refs/pull/') }}
         run: |
           set -euo pipefail
@@ -1505,7 +1506,7 @@ jobs:
   # Simulator against the develop variant (NamThuan-Dev → localhost:3008). The
   # backend is the local stack booted on this runner, never staging, so a
   # journey sees the migration-seeded accounts and the fixed local OTP.
-  # A mobile-only PR skips the checks fan-out, but the repo gates read apps/mobile too
+  # A mobile-only or markdown-only PR skips the checks fan-out, but the repo gates read those files too
   # (no-suppressions over Swift/Kotlin, doc-links, Biome over the contract JSON, layout,
   # the mobile contract gates), so they still run — here, as ONE shard. Its own job so a
   # red gate never hides the native jobs' signal, and named like a gates batch leg
