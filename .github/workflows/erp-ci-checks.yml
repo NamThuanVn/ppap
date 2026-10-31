@@ -2009,6 +2009,23 @@ jobs:
         working-directory: apps/mobile/android
         run: ./gradlew :app:assembleDevDebug :app:testDevDebugUnitTest ktlintCheck detekt :app:lintDevDebug
 
+      # The emulator runner below downloads the emulator and its system image on every run, once:
+      # one corrupt download (`Error on ZipFile unknown archive`, after 9 min on #8320) failed the
+      # job with no test run. Install both here with a bounded retry; the runner's own install
+      # then finds them present and downloads nothing.
+      - name: Install the emulator and its system image
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          PKGS=(emulator 'system-images;android-35;aosp_atd;x86_64')
+          yes | timeout 60 "$SDKM" --licenses > /dev/null || true
+          for i in 1 2 3; do
+            timeout 300 "$SDKM" --install "${PKGS[@]}" --channel=0 > /dev/null && exit 0
+            echo "sdkmanager install attempt $i of 3 failed" >&2
+            rm -rf "$ANDROID_HOME/.temp"
+          done
+          echo "::error::installing ${PKGS[*]} failed 3 times"
+          exit 1
+
       - name: Compose UI tests on an emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
