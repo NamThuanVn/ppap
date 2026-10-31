@@ -1764,30 +1764,18 @@ jobs:
       # The develop variant's backend: `pnpm dev:lite` on :3008, as in local
       # development (the boot itself is the one erp-local-stack-matrix.yml
       # proves on every OS). nohup, because the stack must outlive this step.
+      # Started here and waited for only before the journeys, so its ~80 s boot
+      # overlaps the Xcode build instead of preceding it.
       # Dependency verification is off for the same reason as scripts/ci/e2e/ci-boot.sh:
       # the install action's cache already holds the lockfile's node_modules.
-      - name: Boot the local stack (pnpm dev:lite → :3008)
-        timeout-minutes: 15
+      - name: Start the local stack (pnpm dev:lite → :3008)
         env:
           pnpm_config_verify_deps_before_run: 'false'
         run: |
           set -uo pipefail
           mkdir -p .wrangler
           nohup pnpm dev:lite > .wrangler/dev-lite.log 2>&1 &
-          BOOT_PID=$!
-          waited=0
-          until curl -sf -o /dev/null --max-time 20 http://127.0.0.1:3008/api/health; do
-            if ! kill -0 "$BOOT_PID" 2>/dev/null || [ "$waited" -ge 600 ]; then
-              echo "::error::pnpm dev:lite did not answer /api/health within ${waited}s"
-              tail -80 .wrangler/dev-lite.log
-              exit 1
-            fi
-            sleep 2
-            waited=$((waited + 2))
-          done
-          echo "✓ /api/health → up after ${waited}s"
-          # Health answers before the first login and feed do; warm them so the journeys' waits time the app.
-          bash scripts/ci/native/warm-stack.sh
+          echo $! > .wrangler/dev-lite.pid
 
       - name: Install the iOS toolchain
         run: |
@@ -1803,17 +1791,35 @@ jobs:
           swiftformat --lint .
           swiftlint --strict
 
+      # Package checkouts and their build products. The key names only what pins
+      # them (project.yml's package versions, NTAPI's manifest), so it changes
+      # rarely; the app's own sources are newer than anything restored and always
+      # recompile, so a hit can never test stale app code. Hashed in a step of its
+      # own: actions/cache re-evaluates `key:` in its post step too (see the zone
+      # build's `Cache keys`).
+      - name: DerivedData cache key
+        id: ddkey
+        run: echo "key=ios-dd-v1-${{ runner.os }}-${{ hashFiles('apps/mobile/ios/project.yml', 'apps/mobile/ios/Packages/NTAPI/Package.swift') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache DerivedData
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ runner.temp }}/dd/SourcePackages
+            ${{ runner.temp }}/dd/Build
+          key: ${{ steps.ddkey.outputs.key }}
+
       # An iPhone on the NEWEST installed iOS runtime, by id, so a runner image
       # that renames its devices does not break the destination: a plain
-      # "iPhone <n>" when there is one, else any iPhone on that runtime.
+      # "iPhone <n>" when there is one, else any iPhone on that runtime. It boots
+      # while the app builds, so the first journey no longer pays a cold boot.
       # scripts/ci/native/xcode-log.sh prints one line per test plus a failed journey's
-      # raw steps; the full raw log is uploaded with the results.
-      - name: Build + test (unit + XCUITest) on a Simulator
+      # raw steps; the full raw logs are uploaded with the results.
+      - name: Boot a Simulator + build for testing
         working-directory: apps/mobile/ios
         run: |
           set -euo pipefail
           xcodebuild -version
-          xcodegen generate
           UDID="$(xcrun simctl list devices available -j | jq -r '
             [.devices | to_entries[] | select(.key | test("SimRuntime\\.iOS-"))
               | {v: (.key | capture("iOS-(?<v>[0-9-]+)$").v | split("-") | map(tonumber)), d: .value}]
@@ -1822,9 +1828,42 @@ jobs:
             | first | .udid // empty')"
           [ -n "$UDID" ] || { echo "::error::no available iPhone Simulator on the newest iOS runtime"; xcrun simctl list devices available; exit 1; }
           echo "▶ Simulator: $(xcrun simctl list devices available | grep "$UDID")"
+          echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
+          nohup xcrun simctl bootstatus "$UDID" -b > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
+          xcodegen generate
+          # No index store: nothing on CI reads it, and writing it slows every compile.
           xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath "$RUNNER_TEMP/dd" -skipPackagePluginValidation \
+            COMPILER_INDEX_STORE_ENABLE=NO build-for-testing 2>&1 |
+            bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild-build.log"
+
+      - name: Wait for the local stack
+        timeout-minutes: 15
+        run: |
+          set -uo pipefail
+          BOOT_PID=$(cat .wrangler/dev-lite.pid)
+          waited=0
+          until curl -sf -o /dev/null --max-time 20 http://127.0.0.1:3008/api/health; do
+            if ! kill -0 "$BOOT_PID" 2>/dev/null || [ "$waited" -ge 600 ]; then
+              echo "::error::pnpm dev:lite did not answer /api/health within ${waited}s"
+              tail -80 .wrangler/dev-lite.log
+              exit 1
+            fi
+            sleep 2
+            waited=$((waited + 2))
+          done
+          echo "✓ /api/health → up after another ${waited}s"
+          # Health answers before the first login and feed do; warm them so the journeys' waits time the app.
+          bash scripts/ci/native/warm-stack.sh
+
+      - name: Test (unit + XCUITest) on the Simulator
+        working-directory: apps/mobile/ios
+        run: |
+          set -euo pipefail
+          xcrun simctl bootstatus "$SIM_UDID" -b > /dev/null
+          xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$SIM_UDID" \
             -derivedDataPath "$RUNNER_TEMP/dd" -resultBundlePath "$RUNNER_TEMP/NamThuan.xcresult" \
-            -skipPackagePluginValidation build test 2>&1 |
+            -skipPackagePluginValidation test-without-building 2>&1 |
             bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild.log"
 
       - name: Upload test results
@@ -1835,6 +1874,7 @@ jobs:
           path: |
             ${{ runner.temp }}/NamThuan.xcresult
             ${{ runner.temp }}/xcodebuild.log
+            ${{ runner.temp }}/xcodebuild-build.log
             .wrangler/dev-lite.log
             .wrangler/state/api.log
             .wrangler/state/next.log
