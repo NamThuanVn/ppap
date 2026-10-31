@@ -664,7 +664,7 @@ jobs:
           export BATCH_RUNS
           tmp="$(mktemp -d)"
           : > "$tmp/e2e.log"; : > "$tmp/biome.log"; : > "$tmp/test.log"
-          : > "$tmp/typecheck.log"; : > "$tmp/eslint.log"
+          : > "$tmp/typecheck.log"; : > "$tmp/eslint.log"; : > "$tmp/native.log"
           : > "$tmp/runs.tsv"
           printf '%s\t%s\n' "$GITHUB_REPOSITORY" "$RUN_ID" >> "$tmp/runs.tsv"
           if [ -n "${BATCH_RUNS:-}" ] && [ "$BATCH_RUNS" != "[]" ]; then
@@ -691,6 +691,7 @@ jobs:
                     *"Unit tests"*)  dest="$tmp/test.log" ;;
                     *"Typecheck"*)   dest="$tmp/typecheck.log" ;;
                     *"ESLint"*)      dest="$tmp/eslint.log" ;;
+                    *"Mobile (iOS)"*|*"Mobile (Android)"*) dest="$tmp/native.log" ;;
                     *)               continue ;;
                   esac
                   # GITHUB_TOKEN for this repo, pooled PAT for the fanned-out
@@ -718,7 +719,7 @@ jobs:
           # run — which is NOT the same as a clean run, and must never be
           # reported as one.
           bytes=0
-          for f in e2e biome test typecheck eslint; do
+          for f in e2e biome test typecheck eslint native; do
             bytes=$(( bytes + $(wc -c < "$tmp/$f.log") ))
           done
           scan_ok=true
@@ -766,7 +767,7 @@ jobs:
           fi
           [ -s "$tmp/sites.json" ] && cp "$tmp/sites.json" "$RUNNER_TEMP/ci-sites.json" || true
           clean=$(jq -r '.clean' "$out/report.json")
-          summary=$(node -e 'const r=require(process.argv[1]);console.log(["flaky","dup_testid","hydration","i18n_missing","font_preload","http_4xx","biome_warnings","vitest_stderr"].map(k=>k+" "+r[k]).join(" · "))' "$out/report.json")
+          summary=$(node -e 'const r=require(process.argv[1]);console.log(["flaky","dup_testid","hydration","i18n_missing","font_preload","http_4xx","biome_warnings","vitest_stderr","native_warnings"].map(k=>k+" "+r[k]).join(" · "))' "$out/report.json")
           {
             echo "clean=$clean"
             echo "summary=$summary"
