@@ -1791,7 +1791,7 @@ jobs:
       - name: Install the iOS toolchain
         run: |
           set -euo pipefail
-          for t in xcodegen swiftlint swiftformat; do
+          for t in xcodegen swiftlint swiftformat xcbeautify; do
             command -v "$t" >/dev/null 2>&1 || brew install "$t"
           done
 
@@ -1805,6 +1805,8 @@ jobs:
       # An iPhone on the NEWEST installed iOS runtime, by id, so a runner image
       # that renames its devices does not break the destination: a plain
       # "iPhone <n>" when there is one, else any iPhone on that runtime.
+      # scripts/ci/native/xcode-log.sh prints one line per test plus a failed journey's
+      # raw steps; the full raw log is uploaded with the results.
       - name: Build + test (unit + XCUITest) on a Simulator
         working-directory: apps/mobile/ios
         run: |
@@ -1821,7 +1823,8 @@ jobs:
           echo "▶ Simulator: $(xcrun simctl list devices available | grep "$UDID")"
           xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$UDID" \
             -derivedDataPath "$RUNNER_TEMP/dd" -resultBundlePath "$RUNNER_TEMP/NamThuan.xcresult" \
-            -skipPackagePluginValidation build test
+            -skipPackagePluginValidation build test 2>&1 |
+            bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild.log"
 
       - name: Upload test results
         if: ${{ failure() }}
@@ -1830,6 +1833,7 @@ jobs:
           name: mobile-ios-results
           path: |
             ${{ runner.temp }}/NamThuan.xcresult
+            ${{ runner.temp }}/xcodebuild.log
             .wrangler/dev-lite.log
             .wrangler/state/api.log
             .wrangler/state/next.log

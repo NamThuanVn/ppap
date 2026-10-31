@@ -574,7 +574,7 @@ jobs:
         if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true' && env.AGENT_LANE_PLATFORM == 'ios'
         run: |
           set -euo pipefail
-          for t in xcodegen swiftlint swiftformat; do
+          for t in xcodegen swiftlint swiftformat xcbeautify; do
             command -v "$t" >/dev/null 2>&1 || brew install "$t"
           done
 
