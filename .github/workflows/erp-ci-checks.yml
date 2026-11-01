@@ -1791,24 +1791,6 @@ jobs:
           swiftformat --lint .
           swiftlint --strict
 
-      # Package checkouts and their build products. The key names only what pins
-      # them (project.yml's package versions, NTAPI's manifest), so it changes
-      # rarely; the app's own sources are newer than anything restored and always
-      # recompile, so a hit can never test stale app code. Hashed in a step of its
-      # own: actions/cache re-evaluates `key:` in its post step too (see the zone
-      # build's `Cache keys`).
-      - name: DerivedData cache key
-        id: ddkey
-        run: echo "key=ios-dd-v1-${{ runner.os }}-${{ hashFiles('apps/mobile/ios/project.yml', 'apps/mobile/ios/Packages/NTAPI/Package.swift') }}" >> "$GITHUB_OUTPUT"
-
-      - name: Cache DerivedData
-        uses: actions/cache@v6
-        with:
-          path: |
-            ${{ runner.temp }}/dd/SourcePackages
-            ${{ runner.temp }}/dd/Build
-          key: ${{ steps.ddkey.outputs.key }}
-
       # An iPhone on the NEWEST installed iOS runtime, by id, so a runner image
       # that renames its devices does not break the destination: a plain
       # "iPhone <n>" when there is one, else any iPhone on that runtime. It boots
@@ -1831,10 +1813,12 @@ jobs:
           echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
           nohup xcrun simctl bootstatus "$UDID" -b > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
           xcodegen generate
-          # No index store: nothing on CI reads it, and writing it slows every compile.
+          # No index store: nothing on CI reads it, and writing it slows every compile. arm64 only: the runner
+          # and its Simulator are Apple silicon, and a second architecture doubled every host-built package.
+          # No DerivedData cache: each fleet repo held its own, so it almost always missed (#8362).
           xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$UDID" \
             -derivedDataPath "$RUNNER_TEMP/dd" -skipPackagePluginValidation \
-            COMPILER_INDEX_STORE_ENABLE=NO build-for-testing 2>&1 |
+            COMPILER_INDEX_STORE_ENABLE=NO ARCHS=arm64 build-for-testing 2>&1 |
             bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild-build.log"
 
       - name: Wait for the local stack
