@@ -1813,13 +1813,23 @@ jobs:
           echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
           nohup xcrun simctl bootstatus "$UDID" -b > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
           xcodegen generate
+          # Fetching the packages and compiling are timed apart, with the runner's load beside each, so a
+          # slow build step says which of the two it was (#8362: 6.6–13.6 min here vs ~1 min locally).
+          SECONDS=0
+          xcodebuild -resolvePackageDependencies -scheme NamThuan-Dev -derivedDataPath "$RUNNER_TEMP/dd" \
+            -skipPackagePluginValidation > "$RUNNER_TEMP/xcodebuild-resolve.log" 2>&1 ||
+            { tail -40 "$RUNNER_TEMP/xcodebuild-resolve.log"; exit 1; }
+          echo "⏱ packages resolved in ${SECONDS}s · load: $(uptime | sed 's/.*load averages*: //')"
+          SECONDS=0
           # No index store: nothing on CI reads it, and writing it slows every compile. arm64 only: the runner
           # and its Simulator are Apple silicon, and a second architecture doubled every host-built package.
           # No DerivedData cache: each fleet repo held its own, so it almost always missed (#8362).
           xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$UDID" \
-            -derivedDataPath "$RUNNER_TEMP/dd" -skipPackagePluginValidation \
+            -derivedDataPath "$RUNNER_TEMP/dd" -skipPackagePluginValidation -showBuildTimingSummary \
             COMPILER_INDEX_STORE_ENABLE=NO ARCHS=arm64 build-for-testing 2>&1 |
             bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild-build.log"
+          echo "⏱ built in ${SECONDS}s · load: $(uptime | sed 's/.*load averages*: //')"
+          awk '/Build Timing Summary/ { on = 1 } on && /\| [0-9.]+ seconds/ && n++ < 8' "$RUNNER_TEMP/xcodebuild-build.log"
 
       - name: Wait for the local stack
         timeout-minutes: 15
