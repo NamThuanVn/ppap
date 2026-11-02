@@ -1791,6 +1791,18 @@ jobs:
           swiftformat --lint .
           swiftlint --strict
 
+      # The Swift packages only: Sentry's and Lottie's zips (135 MB, 565 MB unpacked) and four git
+      # repos took 118–266 s to fetch here, against 0 s from a filled SourcePackages. Keyed on what
+      # declares them, so a key holds for weeks — unlike the DerivedData cache, whose source-keyed
+      # entry each fleet repo almost always missed (#8362). A stale restore is safe: xcodebuild
+      # fetches only what the declarations changed.
+      - name: Cache Swift packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/dd/SourcePackages
+          key: ios-spm-v1-${{ hashFiles('apps/mobile/ios/project.yml', 'apps/mobile/ios/Packages/*/Package.swift') }}
+          restore-keys: ios-spm-v1-
+
       # An iPhone on the NEWEST installed iOS runtime, by id, so a runner image
       # that renames its devices does not break the destination: a plain
       # "iPhone <n>" when there is one, else any iPhone on that runtime. It boots
