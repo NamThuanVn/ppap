@@ -2081,6 +2081,7 @@ jobs:
           exit 1
 
       - name: Compose UI tests on an emulator
+        id: ui
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
@@ -2093,14 +2094,17 @@ jobs:
           script: ./gradlew :app:connectedDevDebugAndroidTest
 
       # Gradle reports success when the device ran nothing, so count the
-      # results: a UI-test step that ran zero tests is red, not green.
+      # results: a UI-test step that ran zero tests is red, not green. It also runs after
+      # a failed UI-test step, to name each failed test: Gradle's log names none of them.
       - name: Count the UI tests that ran
+        if: ${{ !cancelled() && steps.ui.outcome != 'skipped' }}
         run: |
           set -euo pipefail
           DIR=apps/mobile/android/app/build/outputs/androidTest-results/connected
           count() { { find "$DIR" -name '*.xml' -exec cat {} + 2>/dev/null || true; } | { grep -o "$1" || true; } | wc -l | tr -d ' '; }
           RAN=$(count '<testcase'); FAILED=$(count '<failure'); SKIPPED=$(count '<skipped')
           echo "UI tests: $RAN ran, $FAILED failed, $SKIPPED skipped"
+          bash scripts/ci/native/android-test-log.sh "$DIR"
           [ "$((RAN - SKIPPED))" -gt 0 ] || { echo "::error::no Compose UI test ran on the emulator (results under $DIR)"; exit 1; }
 
       - name: Upload test results
