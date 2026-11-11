@@ -260,10 +260,18 @@ jobs:
           # from hold.json; this line is so a human reading the run sees it too.
           jq -r '(.repairs // [])[] | "· prior attempt \(.attempt): \(.outcome)\(if .pr then " on PR #\(.pr)" else "" end)\(if .merged then " (merged)" else "" end)"' \
             "${AGENT_STATE_DIR}/hold.json"
-          if [ "$REASON" != "harness-broken" ]; then
-            echo "::error::the standing hold is '$REASON', not 'harness-broken' — a timed pool-exhausted hold needs a clock, not a repair"
-            exit 1
-          fi
+          SCOPE=$(jq -r '.scope // "fleet"' "${AGENT_STATE_DIR}/hold.json")
+          # harness-broken is a repair at any scope. ci-unfixable is a repair only
+          # item-scoped, as execute-garage.mjs callAmbulance sends it; the session's
+          # procedure for it is .claude/commands/repair-harness.md. Timed holds
+          # (pool-exhausted, upstream-unavailable) need a clock, not a repair.
+          case "$REASON/$SCOPE" in
+            harness-broken/* | ci-unfixable/item) ;;
+            *)
+              echo "::error::the standing hold is '$REASON' (scope $SCOPE) — only harness-broken, or an item-scoped ci-unfixable, is a repair; a timed hold needs a clock, not a repair"
+              exit 1
+              ;;
+          esac
           # The repair branch is chosen HERE, not by the session, so the wrapper
           # can own the PR-CI wait on it (REPAIR_BRANCH → open_pr_for_claim,
           # for the turn that ends with no verdict at all; a turn that emitted
