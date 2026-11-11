@@ -1768,12 +1768,18 @@ jobs:
       # overlaps the Xcode build instead of preceding it.
       # Dependency verification is off for the same reason as scripts/ci/e2e/ci-boot.sh:
       # the install action's cache already holds the lockfile's node_modules.
+      # PAGES=0: API only. The app calls /api alone, and `next dev` cost CPU and ~1 GB on a 3-core,
+      # 7 GB runner that also builds and runs the Simulator (load averages of 150–560, #8362).
+      # scripts/ci/native/load-sampler.sh logs the top CPU users every 30 s; the job prints it last,
+      # so a slow step says what it was waiting behind.
       - name: Start the local stack (pnpm dev:lite → :3008)
         env:
           pnpm_config_verify_deps_before_run: 'false'
+          PAGES: '0'
         run: |
           set -uo pipefail
           mkdir -p .wrangler
+          nohup bash scripts/ci/native/load-sampler.sh 30 > "$RUNNER_TEMP/load.log" 2>&1 &
           nohup pnpm dev:lite > .wrangler/dev-lite.log 2>&1 &
           echo $! > .wrangler/dev-lite.pid
 
@@ -1828,9 +1834,10 @@ jobs:
           # Fetching the packages and compiling are timed apart, with the runner's load beside each, so a
           # slow build step says which of the two it was (#8362: 6.6–13.6 min here vs ~1 min locally).
           SECONDS=0
+          # Streamed, not hidden in a file: the log's per-line timestamps show where the step waits —
+          # it took 173–360 s with every package already restored from the cache.
           xcodebuild -resolvePackageDependencies -scheme NamThuan-Dev -derivedDataPath "$RUNNER_TEMP/dd" \
-            -skipPackagePluginValidation > "$RUNNER_TEMP/xcodebuild-resolve.log" 2>&1 ||
-            { tail -40 "$RUNNER_TEMP/xcodebuild-resolve.log"; exit 1; }
+            -skipPackagePluginValidation 2>&1 | tee "$RUNNER_TEMP/xcodebuild-resolve.log"
           echo "⏱ packages resolved in ${SECONDS}s · load: $(uptime | sed 's/.*load averages*: //')"
           SECONDS=0
           # No index store: nothing on CI reads it, and writing it slows every compile. arm64 only: the runner
@@ -1871,6 +1878,10 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/dd" -resultBundlePath "$RUNNER_TEMP/NamThuan.xcresult" \
             -skipPackagePluginValidation test-without-building 2>&1 |
             bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Runner load, every 30 s
+        if: always()
+        run: cat "$RUNNER_TEMP/load.log" 2>/dev/null || true
 
       - name: Upload test results
         if: ${{ failure() }}
@@ -2013,10 +2024,12 @@ jobs:
       # proves on every OS). nohup, because the stack must outlive this step.
       # Dependency verification is off for the same reason as scripts/ci/e2e/ci-boot.sh:
       # the install action's cache already holds the lockfile's node_modules.
+      # PAGES=0: API only — the app never loads a page, so `next dev` was boot time and RAM for nothing.
       - name: Boot the local stack (pnpm dev:lite → :3008)
         timeout-minutes: 15
         env:
           pnpm_config_verify_deps_before_run: 'false'
+          PAGES: '0'
         run: |
           set -uo pipefail
           mkdir -p .wrangler
