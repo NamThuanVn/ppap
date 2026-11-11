@@ -1809,27 +1809,17 @@ jobs:
           key: ios-spm-v1-${{ hashFiles('apps/mobile/ios/project.yml', 'apps/mobile/ios/Packages/*/Package.swift') }}
           restore-keys: ios-spm-v1-
 
-      # An iPhone on the NEWEST installed iOS runtime, by id, so a runner image
-      # that renames its devices does not break the destination: a plain
-      # "iPhone <n>" when there is one, else any iPhone on that runtime. It boots
-      # while the app builds, so the first journey no longer pays a cold boot.
-      # scripts/ci/native/xcode-log.sh prints one line per test plus a failed journey's
-      # raw steps; the full raw logs are uploaded with the results.
+      # The Simulator comes from scripts/ci/native/simulator.sh: an iPhone on the
+      # NEWEST installed iOS runtime, checked against what xcodebuild offers and,
+      # on a runner image where xcodebuild does not see it, repaired (it says how).
+      # It needs the generated project and the resolved packages, so it runs after
+      # both; the boot still overlaps the build. scripts/ci/native/xcode-log.sh
+      # prints one line per test plus a failed journey's raw steps; the full raw
+      # logs are uploaded with the results.
       - name: Boot a Simulator + build for testing
         working-directory: apps/mobile/ios
         run: |
           set -euo pipefail
-          xcodebuild -version
-          UDID="$(xcrun simctl list devices available -j | jq -r '
-            [.devices | to_entries[] | select(.key | test("SimRuntime\\.iOS-"))
-              | {v: (.key | capture("iOS-(?<v>[0-9-]+)$").v | split("-") | map(tonumber)), d: .value}]
-            | sort_by(.v) | last | .d // []
-            | (map(select(.name | test("^iPhone [0-9]+$"))) + map(select(.name | startswith("iPhone"))))
-            | first | .udid // empty')"
-          [ -n "$UDID" ] || { echo "::error::no available iPhone Simulator on the newest iOS runtime"; xcrun simctl list devices available; exit 1; }
-          echo "▶ Simulator: $(xcrun simctl list devices available | grep "$UDID")"
-          echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
-          nohup xcrun simctl bootstatus "$UDID" -b > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
           xcodegen generate
           # Fetching the packages and compiling are timed apart, with the runner's load beside each, so a
           # slow build step says which of the two it was (#8362: 6.6–13.6 min here vs ~1 min locally).
@@ -1839,6 +1829,11 @@ jobs:
           xcodebuild -resolvePackageDependencies -scheme NamThuan-Dev -derivedDataPath "$RUNNER_TEMP/dd" \
             -skipPackagePluginValidation 2>&1 | tee "$RUNNER_TEMP/xcodebuild-resolve.log"
           echo "⏱ packages resolved in ${SECONDS}s · load: $(uptime | sed 's/.*load averages*: //')"
+          UDID="$(bash "$GITHUB_WORKSPACE/scripts/ci/native/simulator.sh" "$RUNNER_TEMP/dd")"
+          echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
+          # After the check: names the Xcode the build really uses, if it switched.
+          xcodebuild -version
+          nohup xcrun simctl bootstatus "$UDID" -b > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
           SECONDS=0
           # No index store: nothing on CI reads it, and writing it slows every compile. arm64 only: the runner
           # and its Simulator are Apple silicon, and a second architecture doubled every host-built package.
