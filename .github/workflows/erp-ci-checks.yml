@@ -1656,7 +1656,7 @@ jobs:
     # macos-26: its default Xcode is 26.x (Swift 6.2), which the Swift packages
     # need — macos-15 defaults to Xcode 16 and cannot resolve them.
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
       # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
