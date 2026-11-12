@@ -1759,17 +1759,6 @@ jobs:
           ref: ${{ needs.native-plan.outputs.sha }}
           persist-credentials: false
 
-      # A fresh Simulator's first boot is heavy. Booted inside the build step it fought the compile
-      # for the 3 cores: 370 s at load 256–442, the 204 KB asset catalog alone 116 s. Booted here,
-      # right after the checkout that brings the picker, it overlaps the network-bound install.
-      # --pick only: whether xcodebuild offers the device is checked once the project exists.
-      - name: Boot the Simulator early
-        run: |
-          set -euo pipefail
-          UDID="$(bash scripts/ci/native/simulator.sh --pick)"
-          echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
-          nohup xcrun simctl bootstatus "$UDID" -b > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
-
       - uses: ./.github/actions/install
 
       # The develop variant's backend: `pnpm dev:lite` on :3008, as in local
@@ -1823,11 +1812,13 @@ jobs:
       # The Simulator comes from scripts/ci/native/simulator.sh: an iPhone on the
       # NEWEST installed iOS runtime, checked against what xcodebuild offers and,
       # on a runner image where xcodebuild does not see it, repaired (it says how).
-      # The check needs the generated project and the resolved packages, so it runs
-      # after both, on the device booted early. scripts/ci/native/xcode-log.sh
+      # It needs the generated project and the resolved packages, so it runs after
+      # both; the boot still overlaps the build. Booting before the install was tried
+      # (#9371) and dropped: it slowed the install to ~180 s and once sent the check
+      # into its repair path. scripts/ci/native/xcode-log.sh
       # prints one line per test plus a failed journey's raw steps; the full raw
       # logs are uploaded with the results.
-      - name: Check the Simulator + build for testing
+      - name: Boot a Simulator + build for testing
         working-directory: apps/mobile/ios
         run: |
           set -euo pipefail
@@ -1840,16 +1831,17 @@ jobs:
           xcodebuild -resolvePackageDependencies -scheme NamThuan-Dev -derivedDataPath "$RUNNER_TEMP/dd" \
             -skipPackagePluginValidation 2>&1 | tee "$RUNNER_TEMP/xcodebuild-resolve.log"
           echo "⏱ packages resolved in ${SECONDS}s · load: $(uptime | sed 's/.*load averages*: //')"
-          CHECKED="$(bash "$GITHUB_WORKSPACE/scripts/ci/native/simulator.sh" "$RUNNER_TEMP/dd")"
-          [ "$CHECKED" = "$SIM_UDID" ] || { echo "::error::checked Simulator $CHECKED is not the one booted early ($SIM_UDID)"; exit 1; }
+          UDID="$(bash "$GITHUB_WORKSPACE/scripts/ci/native/simulator.sh" "$RUNNER_TEMP/dd")"
+          echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
           # After the check: names the Xcode the build really uses, if it switched.
           xcodebuild -version
+          nohup xcrun simctl bootstatus "$UDID" -b > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
           SECONDS=0
           # No index store: nothing on CI reads it, and writing it slows every compile. arm64 only: the runner
           # and its Simulator are Apple silicon, and a second architecture doubled every host-built package.
           # No DerivedData cache: each fleet repo held its own, so it almost always missed (#8362).
           # Whole-module: one compile job per module instead of one per file, fewer to share 3 cores.
-          xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$SIM_UDID" \
+          xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$UDID" \
             -derivedDataPath "$RUNNER_TEMP/dd" -skipPackagePluginValidation -showBuildTimingSummary \
             COMPILER_INDEX_STORE_ENABLE=NO ARCHS=arm64 SWIFT_COMPILATION_MODE=wholemodule build-for-testing 2>&1 |
             bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild-build.log"
