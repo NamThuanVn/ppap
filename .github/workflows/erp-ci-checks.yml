@@ -1786,11 +1786,14 @@ jobs:
           echo $! > .wrangler/dev-lite.pid
 
       - name: Install the iOS toolchain
+        id: toolchain
         run: |
           set -euo pipefail
           for t in xcodegen swiftlint swiftformat xcbeautify; do
             command -v "$t" >/dev/null 2>&1 || brew install "$t"
           done
+          # The compiled-packages cache below is only worth restoring to the Xcode that built it.
+          echo "xcode=$(xcodebuild -version | awk '/Build version/ { print $3 }')" >> "$GITHUB_OUTPUT"
 
       - name: SwiftFormat + SwiftLint
         working-directory: apps/mobile/ios
@@ -1811,6 +1814,22 @@ jobs:
           key: ios-spm-v1-${{ hashFiles('apps/mobile/ios/project.yml', 'apps/mobile/ios/Packages/*/Package.swift') }}
           restore-keys: ios-spm-v1-
 
+      # The compiled Swift packages: NTAPI (50,000 generated lines), swift-openapi-*, swift-http-types and
+      # swift-collections are about half of the compile and change in about 1 iOS commit in 13. The app's own
+      # targets are left out of the cache and always rebuild. xcodebuild reuses a restored product only while its
+      # sources keep the modification time it was built against: the checkouts in SourcePackages keep theirs
+      # through the cache above, and the build step stamps one fixed time on Packages/, which a checkout dates
+      # now. That fixed time is why the key hashes every file in Packages/ and there are no restore-keys: an
+      # entry restores only onto the exact sources it was built from, so an edited package is never skipped.
+      - name: Cache compiled Swift packages
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ runner.temp }}/dd/Build
+            !${{ runner.temp }}/dd/Build/Intermediates.noindex/NamThuan.build
+            !${{ runner.temp }}/dd/Build/Products/*/NamThuan*
+          key: ios-dd-packages-v1-${{ steps.toolchain.outputs.xcode }}-${{ hashFiles('apps/mobile/ios/project.yml', 'apps/mobile/ios/Config/**', 'apps/mobile/ios/Packages/**') }}
+
       # The Simulator comes from scripts/ci/native/simulator.sh: an iPhone on the
       # NEWEST installed iOS runtime, checked against what xcodebuild offers and,
       # on a runner image where xcodebuild does not see it, repaired (it says how).
@@ -1825,6 +1844,8 @@ jobs:
         run: |
           set -euo pipefail
           xcodegen generate
+          # One fixed modification time on the local packages, so the compiled-packages cache matches them.
+          find Packages ! -type l -exec touch -t 202001010000 {} +
           # Fetching the packages and compiling are timed apart, with the runner's load beside each, so a
           # slow build step says which of the two it was (#8362: 6.6–13.6 min here vs ~1 min locally).
           SECONDS=0
@@ -1841,7 +1862,7 @@ jobs:
           SECONDS=0
           # No index store: nothing on CI reads it, and writing it slows every compile. arm64 only: the runner
           # and its Simulator are Apple silicon, and a second architecture doubled every host-built package.
-          # No DerivedData cache: each fleet repo held its own, so it almost always missed (#8362).
+          # Only the packages' part of DerivedData is cached (above): the whole of it, keyed on the source, missed (#8362).
           # Whole-module: one compile job per module instead of one per file, fewer to share 3 cores.
           xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$UDID" \
             -derivedDataPath "$RUNNER_TEMP/dd" -skipPackagePluginValidation -showBuildTimingSummary \
