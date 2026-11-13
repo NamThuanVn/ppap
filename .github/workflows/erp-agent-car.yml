@@ -674,7 +674,7 @@ jobs:
       - name: Cache keys
         id: keys
         run: |
-          echo "mononext=mono-next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/*/src/**', 'packages/*/src/**') }}" >> "$GITHUB_OUTPUT"
+          echo "mononext=mono-next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/web/*/*/src/**', 'packages/*/src/**') }}" >> "$GITHUB_OUTPUT"
           echo "codegraph=codegraph-v1-${{ hashFiles('apps/**', 'apis/**', 'packages/**') }}" >> "$GITHUB_OUTPUT"
 
       - name: Cache monolith Next build

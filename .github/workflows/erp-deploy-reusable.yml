@@ -820,8 +820,9 @@ jobs:
         run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
 
   # ───────────────────────────────────────────────────────────────────────────
-  # 3. Build every Next.js zone (OpenNext → Cloudflare Workers) in parallel.
-  #    `build:pages` writes apps/<zone>/.open-next, which the deploy job uploads
+  # 3. Build the two zone workers in parallel: the shell (OpenNext → Cloudflare
+  #    Workers) and `remotes` (every service zone's remote, assets-only).
+  #    `build:pages` writes apps/web/core/shell/.open-next (or apps/web/core/remotes/.remote), which the deploy job uploads
   #    via `wrangler deploy --env` WITHOUT rebuilding. All NEXT_PUBLIC_* +
   #    Sentry source-map config is baked HERE at build time (the client always
   #    calls same-origin /api/*). This matrix needs NOTHING from the worker
@@ -830,14 +831,14 @@ jobs:
   #    the long pole; overlapping it with everything else is the main win.
   # ───────────────────────────────────────────────────────────────────────────
   build-zones:
-    name: 4 · Build · ${{ matrix.zone.name }} (Next.js zone)
+    name: 4 · Build · ${{ matrix.zone.name }} (shell or remotes)
     needs: [tf-outputs, changes]
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.zones != '[]' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # The changed zone subset ({name,pkg} objects; full canonical list on a
+        # The changed zone subset ({name,pkg,dir} objects; full canonical list on a
         # full/production deploy) — computed by the `changes` job.
         zone: ${{ fromJSON(needs.changes.outputs.zones) }}
 
@@ -948,12 +949,12 @@ jobs:
         run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       # Hashed HERE, once, on the fresh checkout: actions/cache re-evaluates its
-      # `key:` in its post step, after the build filled apps/ with .next/ and
+      # `key:` in its post step, after the build filled apps/web/ with .next/ and
       # .open-next/, and hashFiles has a hard 120s limit the shell zone crossed
       # (ppap run 39392805280). Same fix as erp-ci-checks.yml (#7131).
       - name: Cache keys
         id: keys
-        run: echo "next=next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/**', 'packages/**') }}" >> "$GITHUB_OUTPUT"
+        run: echo "next=next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('apps/web/**', 'packages/**') }}" >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/install
 
@@ -964,7 +965,7 @@ jobs:
 
       # Warm THIS zone's Next compiler cache across runs — on an EXACT key only.
       # The key hashes every path the shell's Tailwind `@source` globs scan
-      # (apps/**, packages/**), and there are NO restore-keys: a warm Webpack
+      # (apps/web/**, packages/**), and there are NO restore-keys: a warm Webpack
       # cache does not rebuild the shell stylesheet when only a scanned file
       # changed, so a partial-match restore shipped Staging a sheet without six
       # 2026-10-29 utilities and Production v1.1.14 one without two. Same rule as
@@ -973,7 +974,7 @@ jobs:
       - name: Cache Next build
         uses: actions/cache@v6
         with:
-          path: apps/${{ matrix.zone.name }}/.next/cache
+          path: ${{ matrix.zone.dir }}/.next/cache
           key: ${{ steps.keys.outputs.next }}
 
       # VAPID public key (Web Push) — lives in HCP, surfaced via tf-outputs.
@@ -1014,16 +1015,17 @@ jobs:
         if: matrix.zone.name == 'shell'
         run: |
           if [ ! -f scripts/ci/shell-css.mjs ]; then echo "::notice::scripts/ci/shell-css.mjs is not in this ref — skipped"; exit 0; fi
-          node scripts/ci/shell-css.mjs apps/shell/.open-next
+          node scripts/ci/shell-css.mjs apps/web/core/shell/.open-next
 
       # tar (not a raw many-small-files upload) so the .open-next file count
       # doesn't make upload/download slow. Already minified → skip artifact gzip.
       # tar preserves the app-relative path so the deploy job reassembles the
-      # tree verbatim by untarring. The shell builds `.open-next` (OpenNext); a
-      # service zone builds `.remote` (its client bundle — scripts/ci/remote/build.mjs).
+      # tree verbatim by untarring. The shell builds `.open-next` (OpenNext);
+      # `remotes` builds `.remote` (every service zone's client bundle, packed —
+      # scripts/ci/remote/build.mjs --pack).
       - name: Package zone build
         run: |
-          app=apps/${{ matrix.zone.name }}
+          app=${{ matrix.zone.dir }}
           if [ -d "$app/.open-next" ]; then out="$app/.open-next"; else out="$app/.remote"; fi
           tar -cf zone-${{ matrix.zone.name }}.tar "$out"
 
@@ -1055,15 +1057,15 @@ jobs:
   #      • leaves          — base tier 1 APIs.
   #      • tier-1.5         — orchestrator/aggregator service-bind to leaves (error 10143).
   #      • gateway          — service-binds to every worker.
-  #      • zones            — each service-binds to gateway for SSR prefetch.
-  #      • dispatcher       — apex ingress; service-binds gateway + all zones.
+  #      • zones            — shell and remotes; neither service-binds another worker (shell: ASSETS + IMAGES only).
+  #      • dispatcher       — apex ingress; service-binds gateway + shell + remotes.
   #    Within a tier order is irrelevant, so leaves / tier-1.5 / zones deploy
   #    their members concurrently (background + wait) for speed; the tiers
   #    themselves stay sequential steps.
   #
   #    API workers upload prebuilt bundles via `wrangler deploy dist/index.js
   #    --no-bundle`. Zones run their `deploy:<env>` script on the prebuilt
-  #    .open-next (no rebuild). The dispatcher is a tiny plain Worker — it
+  #    .open-next / .remote (no rebuild). The dispatcher is a tiny plain Worker — it
   #    bundles inline at deploy (no prebuilt artifact).
   #
   #    Terraform applies HERE (not in its own job ahead of the builds) so the
@@ -1202,7 +1204,7 @@ jobs:
       - uses: ./.github/actions/install
 
       # Pull every prebuilt bundle/zone artifact into one dir, then untar from
-      # the repo root so each tar's `apis/<svc>/dist` and `apps/<zone>/.open-next`
+      # the repo root so each tar's `apis/<svc>/dist` and `apps/web/core/<zone>/.open-next`
       # path is restored verbatim.
       - name: Download prebuilt bundles
         uses: actions/download-artifact@v8
@@ -1433,10 +1435,10 @@ jobs:
         if: ${{ contains(fromJSON(needs.changes.outputs.workers), 'gateway') }}
         run: pnpm --filter @namthuanvn/gateway exec wrangler deploy --env ${{ inputs.environment }} dist/index.js --no-bundle --var "SENTRY_RELEASE:${{ steps.sha.outputs.value }}" --var "APP_VERSION:${{ needs.changes.outputs.app_version }}"
 
-      # Zones — each service-binds to gateway; deploy the prebuilt .open-next via
+      # Zones (shell + remotes) — deploy the prebuilt .open-next / .remote via
       # their deploy:<env> script (no rebuild). Independent → concurrent.
-      # SENTRY_DSN is a runtime var for the zone's @sentry/cloudflare worker wrap
-      # (apps/<zone>/worker.ts); empty in envs without a DSN → Sentry disabled.
+      # SENTRY_DSN is a runtime var for the shell's @sentry/cloudflare worker wrap
+      # (apps/web/core/shell/worker.ts); remotes ignores it. Empty in envs without a DSN → Sentry disabled.
       - name: Deploy zones (Next.js)
         env:
           ZONES: ${{ needs.changes.outputs.zones_list }}
@@ -1461,9 +1463,9 @@ jobs:
           exit "$fail"
 
       # Apex dispatcher — a tiny plain Worker fronting the public custom_domain,
-      # routing /api/* → gateway and each page/asset prefix → its zone over
-      # service bindings. Deploys LAST: its bindings target the gateway + all six
-      # zone workers, which must already exist (Cloudflare error 10143). No
+      # routing /api/* → gateway, every `/<zone>-static/remote/*` → remotes and
+      # the rest → shell over service bindings. Deploys LAST: its bindings target
+      # the gateway, shell and remotes workers, which must already exist (Cloudflare error 10143). No
       # Next.js build — it bundles inline at deploy. SENTRY_DSN is its only
       # runtime var (its worker wraps `withSentry` with a dispatcher service tag).
       # Redeploys only when its own package changed (its bindings resolve the

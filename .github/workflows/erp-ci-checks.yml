@@ -613,7 +613,7 @@ jobs:
               # DIRECTORIES as well as files, and the directories are uneven.
               # It used to be far worse — `sourcing` mapped to a single
               # 232-spec `scpms` folder shared by four zones — but even now
-              # apps/procurement/e2e is ~99 specs against apps/mail/e2e's 1,
+              # apps/web/zones/procurement/e2e is ~99 specs against apps/web/zones/mail/e2e's 1,
               # and the big ones ran serially in ONE job, so the most common
               # kind of PR in this repo got the slowest possible e2e.
               #
@@ -648,11 +648,13 @@ jobs:
           echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
           echo "▶ e2e plan: mode=$MODE targets=[$TARGETS]" >&2
 
-      # Which zones to build, DISCOVERED from apps/*/wrangler.jsonc — the same
+      # Which zones to build, DISCOVERED from apps/web/*/*/wrangler.jsonc — the same
       # scan serve-parity.sh and ci-boot.sh use to decide which zones to BOOT.
+      # Today that is two: `shell` and `remotes` (one assets-only worker whose
+      # build:pages builds and packs EVERY service zone's remote).
       #
       # This used to be a hardcoded matrix below, and the two drifted the moment
-      # a zone was added: apps/mail was booted but never built, so under BUILD=0
+      # a zone was added: apps/web/zones/mail was booted but never built, so under BUILD=0
       # it crashed and took the whole stack down — every shard red. Worse, the
       # fix could not reach the PR that caused it, because this file only
       # arrives in the satellite repos on a push to main. Deriving it means
@@ -675,7 +677,7 @@ jobs:
   # `src/` so there's no prebuild step), so a per-zone matrix turns the old
   # ~258s serial "build all 6 on one 2-core runner" step into ~6 concurrent
   # ~60–90s builds — the dominant PR-CI / deploy-gate cost. Each leg tars its own
-  # `apps/<zone>/.open-next` and uploads it; the shards download every zone tar
+  # `apps/web/<bucket>/<zone>/.open-next` and uploads it; the shards download every zone tar
   # and reassemble the tree. `fail-fast: false` so one zone's build failure
   # doesn't mask the others. Free on public-repo minutes — fan out wide.
   e2e-build-zones:
@@ -689,7 +691,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # DERIVED from apps/*/wrangler.jsonc by scripts/ci/e2e/zones.mjs — the
+        # DERIVED from apps/web/*/*/wrangler.jsonc by scripts/ci/e2e/zones.mjs — the
         # same discovery serve-parity.sh and ci-boot.sh use to decide which
         # zones to BOOT. Never hardcode this list again: a zone booted but not
         # built crashes the whole e2e stack, and the fix cannot reach the PR
@@ -799,15 +801,15 @@ jobs:
 
       # Both cache keys are hashed HERE, once, on the freshly checked-out tree.
       # actions/cache re-evaluates its `key:` input in its post step too, after
-      # the build has filled apps/<zone>/ with .next/ and .open-next/ — and
+      # the build has filled apps/web/<bucket>/<zone>/ with .next/ and .open-next/ — and
       # hashFiles has a hard 120s limit. The shell zone crossed it, failing a
       # green build in `Post Cache Next build` (ppap run 39360182925). A key
       # read from a step output costs the post step nothing.
       - name: Cache keys
         id: keys
         run: |
-          echo "zonetar=zonetar-v2-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('apps/{0}/**', matrix.zone.name), 'apps/*/src/app/**', 'apps/*/src/components/scpms/**', 'apps/shell/src/styles/**', 'scripts/ci/remote/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
-          echo "next=next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('apps/{0}/**', matrix.zone.name), 'apps/*/src/app/**', 'apps/*/src/components/scpms/**', 'apps/shell/src/styles/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
+          echo "zonetar=zonetar-v2-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.base.json', '.github/actions/install/action.yml', format('{0}/**', matrix.zone.dir), 'apps/web/*/*/src/app/**', 'apps/web/*/*/src/components/scpms/**', 'apps/web/core/shell/src/styles/**', matrix.zone.name == 'remotes' && 'apps/web/zones/*/src/**' || 'apps/web/core/shell/src/styles/**', 'scripts/ci/remote/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
+          echo "next=next-${{ runner.os }}-${{ matrix.zone.name }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles(format('{0}/**', matrix.zone.dir), 'apps/web/*/*/src/app/**', 'apps/web/*/*/src/components/scpms/**', 'apps/web/core/shell/src/styles/**', 'packages/api-types/**', 'packages/utils/**', 'packages/dashboard-shell/**') }}" >> "$GITHUB_OUTPUT"
 
       # OUTPUT cache — the packaged bundle itself, not just the compiler cache.
       # On a hit this job does checkout → restore → upload (~10s) and skips
@@ -819,12 +821,12 @@ jobs:
       # nothing that can't — a false hit ships a stale bundle into e2e, which
       # is far worse than a miss. A zone depends on its own source, the shared
       # packages it transpiles (`transpilePackages: api-types, utils,
-      # dashboard-shell` — see apps/<zone>/next.config.ts) and the root
+      # dashboard-shell` — see apps/web/<bucket>/<zone>/next.config.ts) and the root
       # compile/dependency config. Zones are mutually independent (no
       # cross-zone imports; they share code only through packages/*), which is
       # what makes the PER-ZONE scope sound — and it matters: keying on the
-      # whole of `apps/**` busts all ten zones whenever any one app changes,
-      # i.e. on almost every PR. Scoped this way, a PR touching apps/quotation
+      # whole of `apps/web/**` busts all ten zones whenever any one app changes,
+      # i.e. on almost every PR. Scoped this way, a PR touching apps/web/zones/quotation
       # rebuilds quotation and restores the other nine.
       #
       # The package side is scoped for the same reason, and it was NOT: the key
@@ -865,10 +867,10 @@ jobs:
       # compilation work, cutting a cold ~60–120s build to ~20–40s on unchanged
       # source. Keyed per-zone so the matrix legs don't clobber one another's
       # cache. Scoped to this zone's own inputs for the same reason as the
-      # bundle cache above — an `apps/**` key made every zone miss on any app
+      # bundle cache above — an `apps/web/**` key made every zone miss on any app
       # change. The key also names every zone's `src/app`, every zone's `src/components/scpms` and the shell styles:
       # the shell's Tailwind CSS scans those via `@source`, and a restored
-      # compiler cache does not notice a class added outside `apps/shell` — the
+      # compiler cache does not notice a class added outside `apps/web/core/shell` — the
       # shell served CSS without `min-w-39` (PR #7825, OMS po-list-po-total). So
       # there are NO restore-keys either: a stale compiler cache is NOT only a
       # slower build.
@@ -876,7 +878,7 @@ jobs:
         if: steps.zonetar.outputs.cache-hit != 'true'
         uses: actions/cache@v6
         with:
-          path: apps/${{ matrix.zone.name }}/.next/cache
+          path: ${{ matrix.zone.dir }}/.next/cache
           key: ${{ steps.keys.outputs.next }}
 
       # Generic relative `/api` build — no host/port baked, so the same bundle
@@ -892,17 +894,17 @@ jobs:
         if: steps.zonetar.outputs.cache-hit != 'true' && matrix.zone.name == 'shell'
         run: |
           if [ ! -f scripts/ci/shell-css.mjs ]; then echo "::notice::scripts/ci/shell-css.mjs is not in this ref — skipped"; exit 0; fi
-          node scripts/ci/shell-css.mjs apps/shell/.open-next
+          node scripts/ci/shell-css.mjs apps/web/core/shell/.open-next
 
       # tar (not a raw many-small-files upload) so the file count doesn't make
       # upload/download slow. The bundle is already minified, so skip artifact
-      # gzip. tar preserves the `apps/<zone>/.open-next` (shell) or
-      # `apps/<zone>/.remote` (zone remote) path so the shard reassembles the
+      # gzip. tar preserves the `apps/web/<bucket>/<zone>/.open-next` (shell) or
+      # `apps/web/<bucket>/<zone>/.remote` (zone remote) path so the shard reassembles the
       # tree verbatim by untarring every zone tar.
       - name: Package zone build
         if: steps.zonetar.outputs.cache-hit != 'true'
         run: |
-          app=apps/${{ matrix.zone.name }}
+          app=${{ matrix.zone.dir }}
           if [ -d "$app/.open-next" ]; then out="$app/.open-next"; else out="$app/.remote"; fi
           tar -cf zone-${{ matrix.zone.name }}.tar "$out"
 
