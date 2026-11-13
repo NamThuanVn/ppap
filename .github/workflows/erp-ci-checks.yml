@@ -1834,9 +1834,11 @@ jobs:
       # NEWEST installed iOS runtime, checked against what xcodebuild offers and,
       # on a runner image where xcodebuild does not see it, repaired (it says how).
       # It needs the generated project and the resolved packages, so it runs after
-      # both; the boot still overlaps the build. Booting before the install was tried
-      # (#9371) and dropped: it slowed the install to ~180 s and once sent the check
-      # into its repair path. scripts/ci/native/xcode-log.sh
+      # both, while the device is still shut down. It boots only after the build, in the
+      # background, so the boot overlaps the stack wait instead of the compile: the
+      # whole-module compile slowed from 162–226 s to ~640 s sharing the 3 cores with the
+      # boot (#9446), and booting before the install slowed the install to ~180 s
+      # (#9371). The test step waits for the boot. scripts/ci/native/xcode-log.sh
       # prints one line per test plus a failed journey's raw steps; the full raw
       # logs are uploaded with the results.
       - name: Boot a Simulator + build for testing
@@ -1858,7 +1860,6 @@ jobs:
           echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
           # After the check: names the Xcode the build really uses, if it switched.
           xcodebuild -version
-          nohup xcrun simctl bootstatus "$UDID" -b > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
           SECONDS=0
           # No index store: nothing on CI reads it, and writing it slows every compile. arm64 only: the runner
           # and its Simulator are Apple silicon, and a second architecture doubled every host-built package.
@@ -1870,6 +1871,7 @@ jobs:
             bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild-build.log"
           echo "⏱ built in ${SECONDS}s · load: $(uptime | sed 's/.*load averages*: //')"
           awk '/Build Timing Summary/ { on = 1 } on && /\| [0-9.]+ seconds/ && n++ < 8' "$RUNNER_TEMP/xcodebuild-build.log"
+          nohup xcrun simctl bootstatus "$UDID" -b > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
 
       - name: Wait for the local stack
         timeout-minutes: 15
