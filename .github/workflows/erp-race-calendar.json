@@ -81,6 +81,15 @@
       "start": "0700",
       "end": "0900",
       "inputs": {}
+    },
+    {
+      "id": "native-journeys",
+      "workflow": "erp-ci-pr.yml",
+      "enabled": true,
+      "mode": "slot",
+      "start": "1600",
+      "end": "1900",
+      "inputs": {}
     }
   ],
   "claudeWorkflows": [

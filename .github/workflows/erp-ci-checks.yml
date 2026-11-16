@@ -1358,6 +1358,10 @@ jobs:
       bash_tests: ${{ steps.plan.outputs.bash_tests }}
       ios: ${{ steps.plan.outputs.ios }}
       android: ${{ steps.plan.outputs.android }}
+      ios_tests: ${{ steps.plan.outputs.ios_tests }}
+      ios_journeys: ${{ steps.plan.outputs.ios_journeys }}
+      android_tests: ${{ steps.plan.outputs.android_tests }}
+      android_journeys: ${{ steps.plan.outputs.android_journeys }}
       sha: ${{ steps.pin.outputs.sha }}
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
@@ -1486,8 +1490,13 @@ jobs:
         id: pin
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      # Which UI journeys each native job runs: scripts/ci/native/journeys.sh (empty = all of them).
+      # A run on main — the nightly `native-journeys` race-calendar job, or a manual one — is the
+      # full-coverage run: both platforms, every journey.
       - name: Plan native jobs
         id: plan
+        env:
+          ON_PR: ${{ startsWith(inputs.checkout_ref, 'refs/pull/') }}
         run: |
           set -euo pipefail
           # Fail safe toward today's CI: without the script, plan the web CI and no native job.
@@ -1496,7 +1505,13 @@ jobs:
             printf 'ios=false\nandroid=false\ncontract=false\nweb=true\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          NATIVE_SCOPE_BASE=HEAD^1 bash scripts/ci/native/scope.sh
+          if [ "$ON_PR" = true ]; then
+            NATIVE_SCOPE_BASE=HEAD^1 bash scripts/ci/native/scope.sh
+            NATIVE_SCOPE_BASE=HEAD^1 bash scripts/ci/native/journeys.sh
+          else
+            printf 'ios=true\nandroid=true\ncontract=false\nweb=true\nbash_tests=\n' >> "$GITHUB_OUTPUT"
+            NATIVE_JOURNEYS_ALL=true bash scripts/ci/native/journeys.sh
+          fi
 
       # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
       # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
@@ -1892,14 +1907,20 @@ jobs:
           # Health answers before the first login and feed do; warm them so the journeys' waits time the app.
           bash scripts/ci/native/warm-stack.sh
 
+      # Every unit test, and the journeys the plan picked (-only-testing flags; none = all of them).
       - name: Test (unit + XCUITest) on the Simulator
         working-directory: apps/mobile/ios
+        env:
+          ONLY_TESTING: ${{ needs.native-plan.outputs.ios_tests }}
+          JOURNEYS: ${{ needs.native-plan.outputs.ios_journeys }}
         run: |
           set -euo pipefail
+          echo "::notice title=iOS journeys::${JOURNEYS:-all classes (no plan)}"
+          read -ra ONLY <<< "$ONLY_TESTING"
           xcrun simctl bootstatus "$SIM_UDID" -b > /dev/null
           xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$SIM_UDID" \
             -derivedDataPath "$RUNNER_TEMP/dd" -resultBundlePath "$RUNNER_TEMP/NamThuan.xcresult" \
-            -skipPackagePluginValidation test-without-building 2>&1 |
+            -skipPackagePluginValidation ${ONLY[@]+"${ONLY[@]}"} test-without-building 2>&1 |
             bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild.log"
 
       - name: Runner load, every 30 s
@@ -2113,9 +2134,13 @@ jobs:
           echo "::error::installing ${PKGS[*]} failed 3 times"
           exit 1
 
+      # The journeys the plan picked (a class filter; none = all of them).
       - name: Compose UI tests on an emulator
         id: ui
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          ANDROID_TESTS: ${{ needs.native-plan.outputs.android_tests }}
+          JOURNEYS: ${{ needs.native-plan.outputs.android_journeys }}
         with:
           api-level: 35
           arch: x86_64
@@ -2124,7 +2149,9 @@ jobs:
           disable-animations: true
           emulator-options: -no-window -no-snapshot-save -gpu swiftshader_indirect -noaudio -no-boot-anim
           working-directory: apps/mobile/android
-          script: ./gradlew :app:connectedDevDebugAndroidTest
+          script: |
+            echo "::notice title=Android journeys::${JOURNEYS:-all classes (no plan)}"
+            ./gradlew :app:connectedDevDebugAndroidTest $ANDROID_TESTS
 
       # Gradle reports success when the device ran nothing, so count the
       # results: a UI-test step that ran zero tests is red, not green. It also runs after
