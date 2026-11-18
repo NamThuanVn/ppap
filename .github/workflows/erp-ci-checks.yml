@@ -16,9 +16,9 @@ on:
         type: string
         required: true
       e2e_shards:
-        description: 'DESIRED number of parallel Playwright shards. The effective count is min(this, available capacity) — see the e2e job. 48 = 4 workers x 12 shards at the default WORKER_SLOTS on an idle fleet, more workers with smaller batches on a busy one. Both PR CI and the deploy gate inherit it.'
+        description: 'DESIRED number of parallel Playwright shards. The effective count is min(this, available capacity) — see the e2e job. 64 = 6 workers (5 x 12 + 4) at the default WORKER_SLOTS on an idle fleet, more workers with smaller batches on a busy one. Raised from 48 when the Playwright count-based split left the slowest (sourcing) shard at 21-23 min against the 22-min globalTimeout (production deploy 44224150620). Both PR CI and the deploy gate inherit it.'
         type: number
-        default: 48
+        default: 64
       fleet:
         description: 'Comma-separated owner/repo list of ppap CI repos this run may borrow idle capacity from, for the check shards and the e2e shards alike (the erp-namthuan variable PPAP_CI_REPOS). Empty ⇒ scripts/ci/fanout.mjs reads PPAP_CI_REPOS from erp-namthuan itself; only an unreadable variable keeps every shard on this repo.'
         type: string
@@ -1269,8 +1269,8 @@ jobs:
           # (fanout counts in-flight JOBS, so a host running someone else's
           # batch lends its remainder rather than being skipped). 12 shards plus
           # the worker's own `plan` job sits at 13 of the org's 20, so one PR
-          # still cannot monopolise a host. Paired with the 48-shard default it
-          # fans out over four workers — for PR CI and the production deploy
+          # still cannot monopolise a host. Paired with the 64-shard default it
+          # fans out over six workers — for PR CI and the production deploy
           # gate alike, which scripts/gate/ci/e2e-shards.mjs holds in step.
           WORKER_SLOTS: '12'
           # TIMEOUT_S bounds the whole step (inside the job's timeout-minutes);
