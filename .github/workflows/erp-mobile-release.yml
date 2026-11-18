@@ -1,18 +1,22 @@
 name: ERP · Mobile · Release to the stores
 
-# The native apps' production release, run on ppap: race control's "Release mobile"
-# (super_admin + a typed PRODUCTION) or "Run workflow" here. Never on a schedule.
+# The native apps' production run, on ppap: race control's "Production build" / "Store
+# release" (super_admin + a typed PRODUCTION) or "Run workflow" here. Never on a schedule.
+# `mode` picks the half: build, release, or build-and-release (both in one run).
 #
-#   1. prepare — the tripwire; the commit to ship = the newest of the chosen platforms'
-#      last staging builds, every other chosen platform's build already matching it, so
-#      each store gets what testers tested (scripts/ci/native/release.mjs source);
-#      backend first: refuse unless PRODUCTION_LAST_DEPLOYED_SHA contains it (guard);
-#      the next marketing version, a bump over apps/mobile/VERSION / the highest
-#      mobile-vX.Y.Z tag (version).
-#   2. ios / android — build that commit with VERSION set to the new version:
-#      `ios release` (App Store Connect; submitting for review stays manual) and
-#      `android release rollout:<r>` (Play production, staged).
-#   3. tag — only once every chosen platform uploaded: the release commit (the shipped
+#   1. prepare — the tripwire; for a build, the commit to ship = the newest of the chosen
+#      platforms' last staging builds, every other chosen platform's build already matching
+#      it, so each store gets what testers tested (scripts/ci/native/release.mjs source);
+#      backend first: refuse unless PRODUCTION_LAST_DEPLOYED_SHA contains it (guard), or
+#      warn when the dialog opted in (allow_backend_behind); the next marketing version, a
+#      bump over apps/mobile/VERSION / the highest mobile-vX.Y.Z tag (version).
+#   2. ios / android — build: that commit with VERSION set to the new version, signed and
+#      uploaded by `beta variant:prod` (TestFlight, Play internal testing of the production
+#      app). release: `ios release` submits the newest production TestFlight build for
+#      review and `android release rollout:<r>` sends the newest production internal-testing
+#      build to Play production (staged; a draft release while the Play app is still a
+#      draft), both with the typed What's new (whats_new_vi / whats_new_en).
+#   3. tag (a build) — only once every chosen platform uploaded: the release commit (the shipped
 #      commit + the VERSION bump) is tagged mobile-vX.Y.Z, so the tag holds exactly what
 #      was built, and a failed build leaves no tag and the same version for a re-run. The
 #      same commit goes to main as an auto-merge PR, so main's VERSION stays the version
@@ -24,11 +28,20 @@ name: ERP · Mobile · Release to the stores
 #
 # FILENAME: must NOT start with `erp-ci-` — deploy repo only, never mirrored to the CI
 # fleet.
-run-name: "ERP · Mobile release ${{ inputs.bump }} (${{ inputs.platforms }}) — triggered by @${{ inputs.triggered_by || github.actor }}"
+run-name: "ERP · Mobile ${{ inputs.mode }} ${{ inputs.mode != 'release' && inputs.bump || '' }} (${{ inputs.platforms }}) — triggered by @${{ inputs.triggered_by || github.actor }}"
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'build = sign and upload to TestFlight / Play internal; release = submit the newest production build to the stores; build-and-release = both'
+        type: choice
+        required: true
+        default: build
+        options:
+          - build
+          - release
+          - build-and-release
       bump:
         description: 'Which part of apps/mobile/VERSION to increment?'
         type: choice
@@ -51,6 +64,19 @@ on:
         description: 'Google Play staged-rollout fraction (0.1 = 10 %)'
         required: false
         default: '0.1'
+      whats_new_vi:
+        description: "Store What's new in Vietnamese, up to 500 characters (a release needs it)"
+        required: false
+        default: ''
+      whats_new_en:
+        description: "Store What's new in English, up to 500 characters (a release needs it)"
+        required: false
+        default: ''
+      allow_backend_behind:
+        description: 'Build even if production has not deployed the commit (warns instead of refusing)'
+        type: boolean
+        required: false
+        default: false
       confirm:
         description: 'Type PRODUCTION to confirm.'
         required: true
@@ -81,17 +107,27 @@ jobs:
       sha: ${{ steps.src.outputs.sha }}
       next: ${{ steps.ver.outputs.next }}
       tag: ${{ steps.ver.outputs.tag }}
-      previous: ${{ steps.prev.outputs.tag }}
     steps:
       - name: Guard — confirm tripwire
         env:
           CONFIRM: ${{ inputs.confirm }}
           ROLLOUT: ${{ inputs.rollout }}
+          WHATS_NEW_VI: ${{ inputs.whats_new_vi }}
+          WHATS_NEW_EN: ${{ inputs.whats_new_en }}
+          MODE: ${{ inputs.mode }}
         run: |
           if [ "$CONFIRM" != "PRODUCTION" ]; then
             echo "::error::Confirmation input must be exactly 'PRODUCTION' (got '$CONFIRM')."
             exit 1
           fi
+          # Play's cap per language; trimmed like the dialog and the route. A build carries none.
+          [ "$MODE" = build ] || for N in "$WHATS_NEW_VI" "$WHATS_NEW_EN"; do
+            T="$(printf '%s' "$N" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [ -z "$T" ] || [ "$(printf '%s' "$T" | wc -m)" -gt 500 ]; then
+              echo "::error::whats_new_vi and whats_new_en are required, up to 500 characters each."
+              exit 1
+            fi
+          done
           if ! awk -v r="$ROLLOUT" 'BEGIN { exit !(r + 0 > 0 && r + 0 <= 1) }'; then
             echo "::error::rollout must be a fraction above 0, up to 1 (got '$ROLLOUT')."
             exit 1
@@ -177,6 +213,7 @@ jobs:
           exit 0
 
       - uses: actions/checkout@v7
+        if: inputs.mode != 'release'
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
@@ -185,11 +222,13 @@ jobs:
           persist-credentials: false
 
       - uses: actions/setup-node@v7
+        if: inputs.mode != 'release'
         with:
           node-version: '22'
 
       - name: Resolve the release commit
         id: src
+        if: inputs.mode != 'release'
         env:
           PLATFORMS: ${{ inputs.platforms }}
           IOS: ${{ vars.MOBILE_STG_IOS_LAST_BUILT_SHA }}
@@ -197,29 +236,23 @@ jobs:
         run: node scripts/ci/native/release.mjs source "$PLATFORMS" "$IOS" "$ANDROID"
 
       - name: Guard — production backend first
+        if: inputs.mode != 'release'
         env:
           SHA: ${{ steps.src.outputs.sha }}
           PRODUCTION: ${{ vars.PRODUCTION_LAST_DEPLOYED_SHA }}
-        run: node scripts/ci/native/release.mjs guard "$SHA" "$PRODUCTION"
+          ALLOW: ${{ inputs.allow_backend_behind }}
+        run: node scripts/ci/native/release.mjs guard "$SHA" "$PRODUCTION" "$ALLOW"
 
       - name: Compute next version
         id: ver
+        if: inputs.mode != 'release'
         env:
           BUMP: ${{ inputs.bump }}
           SHA: ${{ steps.src.outputs.sha }}
         run: node scripts/ci/native/release.mjs version "$BUMP" "$SHA"
 
-      # A tag holds the VERSION commit on its mobile-release/ branch, never an ancestor of main
-      # (squash merge), so the base is the newest tag's parent: the main commit that release shipped.
-      - name: Previous release (the release notes' base)
-        id: prev
-        run: |
-          set -euo pipefail
-          TAG="$(git tag -l 'mobile-v*' --sort=-v:refname | head -1)"
-          echo "tag=${TAG:+$(git rev-parse "$TAG^")}" >> "$GITHUB_OUTPUT"
-
   ios:
-    name: iOS → App Store Connect
+    name: iOS → TestFlight · App Store review
     needs: prepare
     if: inputs.platforms != 'android'
     runs-on: macos-26
@@ -309,11 +342,12 @@ jobs:
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
-          ref: ${{ needs.prepare.outputs.sha }}
+          ref: ${{ needs.prepare.outputs.sha || 'main' }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set the release version
+        if: inputs.mode != 'release'
         env:
           NEXT: ${{ needs.prepare.outputs.next }}
         run: printf '%s\n' "$NEXT" > apps/mobile/VERSION
@@ -325,6 +359,7 @@ jobs:
           working-directory: apps/mobile
 
       - name: Install XcodeGen
+        if: inputs.mode != 'release'
         run: command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
 
       # The one environment secret unlocks the encrypted NamThuanVn/mobile-secrets repo (its README).
@@ -334,16 +369,27 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: bash scripts/ci/native/unlock-secrets.sh ios
 
-      - name: fastlane ios release
+      - name: fastlane ios beta variant:prod (build → TestFlight)
+        if: inputs.mode != 'release'
         working-directory: apps/mobile
-        run: bundle exec fastlane ios release
+        run: bundle exec fastlane ios beta variant:prod
+
+      # A build-and-release names the version it just uploaded, so deliver waits for that build.
+      - name: fastlane ios release (submit for review)
+        if: inputs.mode != 'build'
+        working-directory: apps/mobile
+        env:
+          NT_WHATS_NEW_VI: ${{ inputs.whats_new_vi }}
+          NT_WHATS_NEW_EN: ${{ inputs.whats_new_en }}
+          NEXT: ${{ needs.prepare.outputs.next }}
+        run: bundle exec fastlane ios release ${NEXT:+"version:$NEXT"}
 
       - name: Delete the decrypted credentials
         if: always()
         run: rm -rf "$RUNNER_TEMP/mobile-secrets"
 
   android:
-    name: Android → Google Play (staged)
+    name: Android → Play internal · production
     needs: prepare
     if: inputs.platforms != 'ios'
     runs-on: ubuntu-latest
@@ -433,16 +479,18 @@ jobs:
         with:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
-          ref: ${{ needs.prepare.outputs.sha }}
+          ref: ${{ needs.prepare.outputs.sha || 'main' }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set the release version
+        if: inputs.mode != 'release'
         env:
           NEXT: ${{ needs.prepare.outputs.next }}
         run: printf '%s\n' "$NEXT" > apps/mobile/VERSION
 
       - uses: actions/setup-java@v5
+        if: inputs.mode != 'release'
         with:
           distribution: temurin
           java-version: '17'
@@ -453,13 +501,6 @@ jobs:
           bundler-cache: true
           working-directory: apps/mobile
 
-      - name: Release notes
-        env:
-          NOTES_PLATFORM: android
-          NOTES_BASE: ${{ needs.prepare.outputs.previous }}
-          NOTES_HEAD: ${{ needs.prepare.outputs.sha }}
-        run: bash scripts/ci/native/release-notes.sh | tee "$RUNNER_TEMP/notes.txt"
-
       # The one environment secret unlocks the encrypted NamThuanVn/mobile-secrets repo (its README).
       - name: Unlock the android credentials
         env:
@@ -467,10 +508,17 @@ jobs:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
         run: bash scripts/ci/native/unlock-secrets.sh android prod
 
-      - name: fastlane android release
+      - name: fastlane android beta variant:prod (build → Play internal)
+        if: inputs.mode != 'release'
+        working-directory: apps/mobile
+        run: bundle exec fastlane android beta variant:prod
+
+      - name: fastlane android release (Play production)
+        if: inputs.mode != 'build'
         working-directory: apps/mobile
         env:
-          NT_RELEASE_NOTES_FILE: ${{ runner.temp }}/notes.txt
+          NT_WHATS_NEW_VI: ${{ inputs.whats_new_vi }}
+          NT_WHATS_NEW_EN: ${{ inputs.whats_new_en }}
           ROLLOUT: ${{ inputs.rollout }}
         run: bundle exec fastlane android release "rollout:$ROLLOUT"
 
@@ -481,7 +529,7 @@ jobs:
   tag:
     name: Tag mobile-vX.Y.Z · VERSION PR to main
     needs: [prepare, ios, android]
-    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.ios.result != 'failure' && needs.android.result != 'failure' }}
+    if: ${{ !cancelled() && inputs.mode != 'release' && needs.prepare.result == 'success' && needs.ios.result != 'failure' && needs.android.result != 'failure' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
