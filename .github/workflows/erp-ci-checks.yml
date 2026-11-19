@@ -2068,12 +2068,11 @@ jobs:
       # proves on every OS). nohup, because the stack must outlive this step.
       # Dependency verification is off for the same reason as scripts/ci/e2e/ci-boot.sh:
       # the install action's cache already holds the lockfile's node_modules.
-      # PAGES=0: API only — the app never loads a page, so `next dev` was boot time and RAM for nothing.
+      # Pages on: WebFallbackJourneyTest opens real /vi/auth/handoff and /vi/pages in the in-app web view.
       - name: Boot the local stack (pnpm dev:lite → :3008)
         timeout-minutes: 15
         env:
           pnpm_config_verify_deps_before_run: 'false'
-          PAGES: '0'
         run: |
           set -uo pipefail
           mkdir -p .wrangler
