@@ -1360,7 +1360,6 @@ jobs:
       android: ${{ steps.plan.outputs.android }}
       ios_tests: ${{ steps.plan.outputs.ios_tests }}
       ios_journeys: ${{ steps.plan.outputs.ios_journeys }}
-      ios_pages: ${{ steps.plan.outputs.ios_pages }}
       android_tests: ${{ steps.plan.outputs.android_tests }}
       android_journeys: ${{ steps.plan.outputs.android_journeys }}
       sha: ${{ steps.pin.outputs.sha }}
@@ -1788,15 +1787,12 @@ jobs:
       # the install action's cache already holds the lockfile's node_modules.
       # PAGES=0: API only. The app calls /api alone, and `next dev` cost CPU and ~1 GB on a 3-core,
       # 7 GB runner that also builds and runs the Simulator (load averages of 150–560, #8362).
-      # The exception: a run whose plan includes a journey that opens a real web page (the web
-      # fallback; journeys.sh IOS_PAGES) boots `next dev`, and warm-stack.sh compiles the page
-      # before the tests start.
       # scripts/ci/native/load-sampler.sh logs the top CPU users every 30 s; the job prints it last,
       # so a slow step says what it was waiting behind.
       - name: Start the local stack (pnpm dev:lite → :3008)
         env:
           pnpm_config_verify_deps_before_run: 'false'
-          PAGES: ${{ needs.native-plan.outputs.ios_pages == '1' && '1' || '0' }}
+          PAGES: '0'
         run: |
           set -uo pipefail
           mkdir -p .wrangler
@@ -1909,7 +1905,7 @@ jobs:
           done
           echo "✓ /api/health → up after another ${waited}s"
           # Health answers before the first login and feed do; warm them so the journeys' waits time the app.
-          WARM_PAGES="${{ needs.native-plan.outputs.ios_pages }}" bash scripts/ci/native/warm-stack.sh
+          bash scripts/ci/native/warm-stack.sh
 
       # Every unit test, and the journeys the plan picked (-only-testing flags; none = all of them).
       - name: Test (unit + XCUITest) on the Simulator
@@ -2072,12 +2068,11 @@ jobs:
       # proves on every OS). nohup, because the stack must outlive this step.
       # Dependency verification is off for the same reason as scripts/ci/e2e/ci-boot.sh:
       # the install action's cache already holds the lockfile's node_modules.
-      # PAGES=0: API only — the app never loads a page, so `next dev` was boot time and RAM for nothing.
+      # Pages on: WebFallbackJourneyTest opens real /vi/auth/handoff and /vi/pages in the in-app web view.
       - name: Boot the local stack (pnpm dev:lite → :3008)
         timeout-minutes: 15
         env:
           pnpm_config_verify_deps_before_run: 'false'
-          PAGES: '0'
         run: |
           set -uo pipefail
           mkdir -p .wrangler
