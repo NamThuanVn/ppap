@@ -1,0 +1,731 @@
+name: ERP · CI · Native batch (fan-out worker)
+
+# One BATCH of another repo's native UI journeys — iOS (`ios-batch`) or Android
+# (`android-batch`) — as the shards scripts/ci/native/journeys.sh planned.
+#
+# The same shape as erp-ci-checks-batch.yml. erp-ci-checks.yml's native-ios /
+# native-android jobs dispatch the shards to other fleet repos
+# (scripts/ci/fanout.mjs, SUITE=ios|android): IOS_HOST_SLOTS / ANDROID_HOST_SLOTS
+# per repo (scripts/ci/lib/fanout-plan.mjs), so a full iOS run spans 4 orgs —
+# GitHub Free gives each org 5 concurrent macOS jobs, which is what made one
+# repo run every journey serially. The dispatching repo stays the COORDINATOR:
+# it owns the commit Status and every PR write. The coordinator reads each shard
+# JOB's conclusion back by name (`Mobile (<platform>) <i>/<N>`, also what the
+# noise scan routes on) and fails the platform closed on any shard it has no
+# green job for.
+#
+# The steps are native-ios's and native-android's from before the fan-out, run
+# per shard: SwiftFormat/SwiftLint, Android's build, lint and unit tests, and the
+# iOS unit tests run once, on shard 1.
+#
+# This file MUST keep its `ci-` prefix: sync-workflows-to-ppap.yml mirrors only
+# `erp-ci-*.yml` to the CI fleet, and a fleet repo without this workflow is
+# skipped by the fan-out's dispatchability guard.
+
+run-name: "ERP · Native · ${{ github.event.client_payload.ctx.pr_number && format('PR #{0}', github.event.client_payload.ctx.pr_number) || 'manual' }} · ${{ github.event.action }} · batch ${{ github.event.client_payload.batch }}/${{ github.event.client_payload.batch_count }} · ${{ github.event.client_payload.correlation }}"
+
+on:
+  repository_dispatch:
+    types: [ios-batch, android-batch]
+
+permissions: read-all
+
+# Keyed on the correlation token (coordinator run id + attempt + platform) plus
+# the batch index, so a re-dispatched attempt supersedes its predecessor while
+# leaving other PRs' batches — and this PR's OTHER batches — alone.
+concurrency:
+  group: native-batch-${{ github.event.client_payload.correlation }}-${{ github.event.client_payload.batch }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: NamThuanVn/erp-namthuan
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
+jobs:
+  # Cheap gate in front of the matrix:
+  #   1. Pass `client_payload.shards` (a JSON array) on as the matrix.
+  #   2. STALE CHECK — a cancelled coordinator does not cancel across repos, and
+  #      an orphan iOS batch holds this org's scarce macOS runners. Fails OPEN:
+  #      an unreadable head still runs, and a skipped matrix fails its shards
+  #      closed at the coordinator anyway.
+  plan:
+    name: Native batch ${{ github.event.client_payload.batch }} · plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      run: ${{ steps.plan.outputs.run }}
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          # A batch job's PAT budgets from its coordinator (scripts/ci/ppap/fleet-token.sh hint); empty otherwise.
+          FLEET_PAT_HINT: ${{ github.event.client_payload.ctx.pat_hint }}
+        run: |
+          set -uo pipefail
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            # raw.githubusercontent.com costs no REST quota; the contents API costs one NT call per job
+            # (about 80 jobs per PR). The contents API stays as the fallback.
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -o "$D/fleet-token.sh" \
+              'https://raw.githubusercontent.com/NamThuanVn/erp-namthuan/main/scripts/ci/ppap/fleet-token.sh' \
+              || curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            # actions/checkout spends one GET /repos/{owner}/{repo}/hash-algorithm per checkout of a
+            # branch, on the token it is given. A checkout that persists no credentials only reads,
+            # so it takes a pooled PAT (CHECKOUT_PAT) for that call; git writes stay on the App.
+            CO=$(FLEET_APP_DIR="$D" "$D/bin/fleet-token" spill NamThuanVn api repos/NamThuanVn/erp-namthuan/hash-algorithm 2>/dev/null) || CO=''
+            if [ -n "$CO" ]; then echo "::add-mask::$CO"; echo "CHECKOUT_PAT=$CO" >> "$GITHUB_ENV"; fi
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
+          fi
+          exit 0
+
+      - id: plan
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          SHARDS: ${{ github.event.client_payload.shards }}
+          PR_NUMBER: ${{ github.event.client_payload.ctx.pr_number }}
+          HEAD_SHA: ${{ github.event.client_payload.ctx.head_sha }}
+        run: |
+          set -euo pipefail
+          echo "matrix=$(printf '%s' "$SHARDS" | jq -c .)" >> "$GITHUB_OUTPUT"
+
+          RUN=true
+          if [ -n "${PR_NUMBER:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+            CURRENT=$(gh api "repos/${PRIVATE_REPO}/pulls/${PR_NUMBER}" --jq '.head.sha // ""' 2>/dev/null || true)
+            if [ -n "$CURRENT" ] && [ "$CURRENT" != "$HEAD_SHA" ]; then
+              echo "::notice::stale batch — coordinator tested $HEAD_SHA but PR #$PR_NUMBER is now $CURRENT; skipping."
+              RUN=false
+            fi
+          fi
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+          echo "▶ native batch ${{ github.event.action }} shards=$(printf '%s' "$SHARDS" | jq -c '[.[].shard]') run=$RUN" >&2
+
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
+  # iOS: the native-ios steps, per shard, on a Simulator against the develop
+  # variant (NamThuan-Dev → localhost:3008) and the local stack booted on this
+  # runner, never staging.
+  ios:
+    name: 1 · CI · Mobile (iOS) ${{ matrix.shard }}/${{ matrix.of }}
+    needs: plan
+    if: ${{ needs.plan.outputs.run == 'true' && github.event.action == 'ios-batch' }}
+    # macos-26: its default Xcode is 26.x (Swift 6.2), which the Swift packages
+    # need — macos-15 defaults to Xcode 16 and cannot resolve them.
+    runs-on: macos-26
+    timeout-minutes: 90
+    strategy:
+      # Every shard runs to the end: one flaky journey must not cancel the rest's evidence.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          # A batch job's PAT budgets from its coordinator (scripts/ci/ppap/fleet-token.sh hint); empty otherwise.
+          FLEET_PAT_HINT: ${{ github.event.client_payload.ctx.pat_hint }}
+        run: |
+          set -uo pipefail
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            # raw.githubusercontent.com costs no REST quota; the contents API costs one NT call per job
+            # (about 80 jobs per PR). The contents API stays as the fallback.
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -o "$D/fleet-token.sh" \
+              'https://raw.githubusercontent.com/NamThuanVn/erp-namthuan/main/scripts/ci/ppap/fleet-token.sh' \
+              || curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            # actions/checkout spends one GET /repos/{owner}/{repo}/hash-algorithm per checkout of a
+            # branch, on the token it is given. A checkout that persists no credentials only reads,
+            # so it takes a pooled PAT (CHECKOUT_PAT) for that call; git writes stay on the App.
+            CO=$(FLEET_APP_DIR="$D" "$D/bin/fleet-token" spill NamThuanVn api repos/NamThuanVn/erp-namthuan/hash-algorithm 2>/dev/null) || CO=''
+            if [ -n "$CO" ]; then echo "::add-mask::$CO"; echo "CHECKOUT_PAT=$CO" >> "$GITHUB_ENV"; fi
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
+          fi
+          exit 0
+
+      # The checkout below names a pinned sha, so the log would not say which PR this shard
+      # tested. The CI-noise sweep (scripts/ci/noise-police.mjs parsePrNumber) reads that
+      # off this line, and ranks a failed test by the distinct PRs it failed on.
+      - name: Name the PR under test
+        env:
+          PR: ${{ github.event.client_payload.ctx.pr_number }}
+        run: |
+          if [ -n "$PR" ]; then echo "checkout_ref: refs/pull/$PR/merge"; else echo "  ref: main"; fi
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
+          ref: ${{ github.event.client_payload.ctx.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      # The develop variant's backend: `pnpm dev:lite` on :3008, as in local
+      # development (the boot itself is the one erp-local-stack-matrix.yml
+      # proves on every OS). nohup, because the stack must outlive this step.
+      # Started here and waited for only before the journeys, so its ~80 s boot
+      # overlaps the Xcode build instead of preceding it.
+      # Dependency verification is off for the same reason as scripts/ci/e2e/ci-boot.sh:
+      # the install action's cache already holds the lockfile's node_modules.
+      # PAGES=0: API only. The app calls /api alone, and `next dev` cost CPU and ~1 GB on a 3-core,
+      # 7 GB runner that also builds and runs the Simulator (load averages of 150–560, #8362).
+      # scripts/ci/native/load-sampler.sh logs the top CPU users every 30 s; the job prints it last,
+      # so a slow step says what it was waiting behind.
+      - name: Start the local stack (pnpm dev:lite → :3008)
+        env:
+          pnpm_config_verify_deps_before_run: 'false'
+          PAGES: '0'
+        run: |
+          set -uo pipefail
+          mkdir -p .wrangler
+          nohup bash scripts/ci/native/load-sampler.sh 30 > "$RUNNER_TEMP/load.log" 2>&1 &
+          nohup pnpm dev:lite > .wrangler/dev-lite.log 2>&1 &
+          echo $! > .wrangler/dev-lite.pid
+
+      - name: Install the iOS toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          for t in xcodegen swiftlint swiftformat xcbeautify; do
+            command -v "$t" >/dev/null 2>&1 || brew install "$t"
+          done
+          # The compiled-packages cache below is only worth restoring to the Xcode that built it.
+          echo "xcode=$(xcodebuild -version | awk '/Build version/ { print $3 }')" >> "$GITHUB_OUTPUT"
+
+      # Once per run, not once per shard.
+      - name: SwiftFormat + SwiftLint
+        if: ${{ matrix.shard == 1 }}
+        working-directory: apps/mobile/ios
+        run: |
+          set -euo pipefail
+          swiftformat --lint .
+          swiftlint --strict
+
+      # The Swift packages only: Sentry's and Lottie's zips (135 MB, 565 MB unpacked) and four git
+      # repos took 118–266 s to fetch here, against 0 s from a filled SourcePackages. Keyed on what
+      # declares them, so a key holds for weeks — unlike the DerivedData cache, whose source-keyed
+      # entry each fleet repo almost always missed (#8362). A stale restore is safe: xcodebuild
+      # fetches only what the declarations changed.
+      - name: Cache Swift packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/dd/SourcePackages
+          key: ios-spm-v1-${{ hashFiles('apps/mobile/ios/project.yml', 'apps/mobile/ios/Packages/*/Package.swift') }}
+          restore-keys: ios-spm-v1-
+
+      # The compiled Swift packages: NTAPI (50,000 generated lines), swift-openapi-*, swift-http-types and
+      # swift-collections are about half of the compile and change in about 1 iOS commit in 13. The app's own
+      # targets are left out of the cache and always rebuild. xcodebuild reuses a restored product only while its
+      # sources keep the modification time it was built against: the checkouts in SourcePackages keep theirs
+      # through the cache above, and the build step stamps one fixed time on Packages/, which a checkout dates
+      # now. That fixed time is why the key hashes every file in Packages/ and there are no restore-keys: an
+      # entry restores only onto the exact sources it was built from, so an edited package is never skipped.
+      - name: Cache compiled Swift packages
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ runner.temp }}/dd/Build
+            !${{ runner.temp }}/dd/Build/Intermediates.noindex/NamThuan.build
+            !${{ runner.temp }}/dd/Build/Products/*/NamThuan*
+          key: ios-dd-packages-v1-${{ steps.toolchain.outputs.xcode }}-${{ hashFiles('apps/mobile/ios/project.yml', 'apps/mobile/ios/Config/**', 'apps/mobile/ios/Packages/**') }}
+
+      # The Simulator comes from scripts/ci/native/simulator.sh: an iPhone on the
+      # NEWEST installed iOS runtime, checked against what xcodebuild offers and,
+      # on a runner image where xcodebuild does not see it, repaired (it says how).
+      # It needs the generated project and the resolved packages, so it runs after
+      # both, while the device is still shut down. It boots only after the build, in the
+      # background, so the boot overlaps the stack wait instead of the compile: the
+      # whole-module compile slowed from 162–226 s to ~640 s sharing the 3 cores with the
+      # boot (#9446), and booting before the install slowed the install to ~180 s
+      # (#9371). The test step waits for the boot. scripts/ci/native/xcode-log.sh
+      # prints one line per test plus a failed journey's raw steps; the full raw
+      # logs are uploaded with the results.
+      - name: Boot a Simulator + build for testing
+        working-directory: apps/mobile/ios
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          # One fixed modification time on the local packages, so the compiled-packages cache matches them.
+          find Packages ! -type l -exec touch -t 202001010000 {} +
+          # Fetching the packages and compiling are timed apart, with the runner's load beside each, so a
+          # slow build step says which of the two it was (#8362: 6.6–13.6 min here vs ~1 min locally).
+          SECONDS=0
+          # Streamed, not hidden in a file: the log's per-line timestamps show where the step waits —
+          # it took 173–360 s with every package already restored from the cache.
+          xcodebuild -resolvePackageDependencies -scheme NamThuan-Dev -derivedDataPath "$RUNNER_TEMP/dd" \
+            -skipPackagePluginValidation 2>&1 | tee "$RUNNER_TEMP/xcodebuild-resolve.log"
+          echo "⏱ packages resolved in ${SECONDS}s · load: $(uptime | sed 's/.*load averages*: //')"
+          UDID="$(bash "$GITHUB_WORKSPACE/scripts/ci/native/simulator.sh" "$RUNNER_TEMP/dd")"
+          echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
+          # After the check: names the Xcode the build really uses, if it switched.
+          xcodebuild -version
+          SECONDS=0
+          # No index store: nothing on CI reads it, and writing it slows every compile. arm64 only: the runner
+          # and its Simulator are Apple silicon, and a second architecture doubled every host-built package.
+          # Only the packages' part of DerivedData is cached (above): the whole of it, keyed on the source, missed (#8362).
+          # Whole-module: one compile job per module instead of one per file, fewer to share 3 cores.
+          xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath "$RUNNER_TEMP/dd" -skipPackagePluginValidation -showBuildTimingSummary \
+            COMPILER_INDEX_STORE_ENABLE=NO ARCHS=arm64 SWIFT_COMPILATION_MODE=wholemodule build-for-testing 2>&1 |
+            bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild-build.log"
+          echo "⏱ built in ${SECONDS}s · load: $(uptime | sed 's/.*load averages*: //')"
+          awk '/Build Timing Summary/ { on = 1 } on && /\| [0-9.]+ seconds/ && n++ < 8' "$RUNNER_TEMP/xcodebuild-build.log"
+          nohup xcrun simctl bootstatus "$UDID" -b > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
+
+      - name: Wait for the local stack
+        timeout-minutes: 15
+        run: |
+          set -uo pipefail
+          BOOT_PID=$(cat .wrangler/dev-lite.pid)
+          waited=0
+          until curl -sf -o /dev/null --max-time 20 http://127.0.0.1:3008/api/health; do
+            if ! kill -0 "$BOOT_PID" 2>/dev/null || [ "$waited" -ge 600 ]; then
+              echo "::error::pnpm dev:lite did not answer /api/health within ${waited}s"
+              tail -80 .wrangler/dev-lite.log
+              exit 1
+            fi
+            sleep 2
+            waited=$((waited + 2))
+          done
+          echo "✓ /api/health → up after another ${waited}s"
+          # Health answers before the first login and feed do; warm them so the journeys' waits time the app.
+          bash scripts/ci/native/warm-stack.sh
+
+      # This shard's journeys (-only-testing flags; the unit tests ride shard 1; none = all of them).
+      - name: Test (unit + XCUITest) on the Simulator
+        working-directory: apps/mobile/ios
+        env:
+          ONLY_TESTING: ${{ matrix.tests }}
+          JOURNEYS: shard ${{ matrix.shard }}/${{ matrix.of }}
+        run: |
+          set -euo pipefail
+          echo "::notice title=iOS journeys::${JOURNEYS:-all classes (no plan)}"
+          read -ra ONLY <<< "$ONLY_TESTING"
+          xcrun simctl bootstatus "$SIM_UDID" -b > /dev/null
+          xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$SIM_UDID" \
+            -derivedDataPath "$RUNNER_TEMP/dd" -resultBundlePath "$RUNNER_TEMP/NamThuan.xcresult" \
+            -skipPackagePluginValidation ${ONLY[@]+"${ONLY[@]}"} test-without-building 2>&1 |
+            bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Runner load, every 30 s
+        if: always()
+        run: cat "$RUNNER_TEMP/load.log" 2>/dev/null || true
+
+      - name: Upload test results
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: mobile-ios-results-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/NamThuan.xcresult
+            ${{ runner.temp }}/xcodebuild.log
+            ${{ runner.temp }}/xcodebuild-build.log
+            .wrangler/dev-lite.log
+            .wrangler/state/api.log
+            .wrangler/state/next.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
+
+  # Android: the native-android steps, per shard, on a REAL emulator against the
+  # develop variant (devDebug → 10.0.2.2:3008) and this runner's local stack.
+  android:
+    name: 1 · CI · Mobile (Android) ${{ matrix.shard }}/${{ matrix.of }}
+    needs: plan
+    if: ${{ needs.plan.outputs.run == 'true' && github.event.action == 'android-batch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. ONE account's
+      # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
+      # deploy graph AND the PR CI dispatcher — when it ran dry, even human PR CI
+      # could not be dispatched (`API rate limit exceeded for user ID 286265802`,
+      # ppap run 32333654329). `GET /rate_limit` does NOT count against the limit, so
+      # probing every token is free. Inlined rather than calling
+      # `scripts/ci/ppap/pat-pool.sh` (the canonical copy — keep the two in step)
+      # because a private-repo checkout itself needs a token, so the pool cannot live
+      # behind it.
+      #
+      # PAT_TOKEN_POOL is the ONLY source — the single-PAT fallback was retired once
+      # the pool was live in all 8 stores (#2611 shipped it, this removed it). That is
+      # deliberate: a fallback meant a mis-set pool silently reverted the whole system
+      # to one account's quota, i.e. straight back to the outage above, looking healthy
+      # the entire time. Now a missing pool fails the job loudly instead.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          AUTH_MODE: ${{ vars.FLEET_AUTH_MODE }}
+          APP_ID: ${{ secrets.FLEET_APP_ID }}
+          APP_KEY: ${{ secrets.FLEET_APP_PRIVATE_KEY }}
+          # A batch job's PAT budgets from its coordinator (scripts/ci/ppap/fleet-token.sh hint); empty otherwise.
+          FLEET_PAT_HINT: ${{ github.event.client_payload.ctx.pat_hint }}
+        run: |
+          set -uo pipefail
+          if [ "${AUTH_MODE:-pat}" = app ]; then
+            # GitHub App mode (docs/engineering/platform/ppap-github-app.md): one App
+            # installed on every fleet org instead of the pooled user PATs. Mint the
+            # NamThuanVn installation's token here (the checkout needs it), then fetch
+            # scripts/ci/ppap/fleet-token.sh from main and let it install the `gh`
+            # wrapper + git helper that hand every later call its own org's token.
+            D="$RUNNER_TEMP/fleet-app"; mkdir -p "$D/tokens"; chmod 700 "$D" "$D/tokens"
+            B64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+            KEY=$(mktemp); chmod 600 "$KEY"; printf '%s\n' "$APP_KEY" > "$KEY"; NOW=$(date +%s)
+            JWT="$(printf '{"alg":"RS256","typ":"JWT"}' | B64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | B64)"
+            JWT="$JWT.$(printf '%s' "$JWT" | openssl dgst -sha256 -sign "$KEY" | B64)"; rm -f "$KEY"
+            ID=$(curl -sf -m 20 -H "Authorization: Bearer $JWT" https://api.github.com/orgs/NamThuanVn/installation | jq -r '.id // empty')
+            TOK=$(curl -sf -m 20 -X POST -H "Authorization: Bearer $JWT" "https://api.github.com/app/installations/${ID:-0}/access_tokens")
+            BEST=$(printf '%s' "$TOK" | jq -r '.token // empty'); EXP=$(printf '%s' "$TOK" | jq -r '.expires_at // empty | fromdateiso8601')
+            [ -n "$BEST" ] || { echo "::error::FLEET_AUTH_MODE=app but no App token for NamThuanVn — check FLEET_APP_ID / FLEET_APP_PRIVATE_KEY on this repo and that the App is installed (ppap-github-app.md)"; exit 1; }
+            echo "::add-mask::$BEST"
+            printf '%s %s\n' "$EXP" "$BEST" > "$D/tokens/NamThuanVn"
+            # raw.githubusercontent.com costs no REST quota; the contents API costs one NT call per job
+            # (about 80 jobs per PR). The contents API stays as the fallback.
+            curl -sf -m 20 -H "Authorization: Bearer $BEST" -o "$D/fleet-token.sh" \
+              'https://raw.githubusercontent.com/NamThuanVn/erp-namthuan/main/scripts/ci/ppap/fleet-token.sh' \
+              || curl -sf -m 20 -H "Authorization: Bearer $BEST" -H 'Accept: application/vnd.github.raw' -o "$D/fleet-token.sh" \
+              'https://api.github.com/repos/NamThuanVn/erp-namthuan/contents/scripts/ci/ppap/fleet-token.sh?ref=main' \
+              || { echo "::error::could not fetch scripts/ci/ppap/fleet-token.sh from main"; exit 1; }
+            FLEET_APP_ID="$APP_ID" FLEET_APP_KEY="$APP_KEY" FLEET_APP_DIR="$D" bash "$D/fleet-token.sh" setup || exit 1
+            # actions/checkout spends one GET /repos/{owner}/{repo}/hash-algorithm per checkout of a
+            # branch, on the token it is given. A checkout that persists no credentials only reads,
+            # so it takes a pooled PAT (CHECKOUT_PAT) for that call; git writes stay on the App.
+            CO=$(FLEET_APP_DIR="$D" "$D/bin/fleet-token" spill NamThuanVn api repos/NamThuanVn/erp-namthuan/hash-algorithm 2>/dev/null) || CO=''
+            if [ -n "$CO" ]; then echo "::add-mask::$CO"; echo "CHECKOUT_PAT=$CO" >> "$GITHUB_ENV"; fi
+            LOGIN='namthuan-erp-fleet[bot]'
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; echo "FLEET_AUTH_MODE=app"; } >> "$GITHUB_ENV"
+            echo "GitHub App -> @$LOGIN"
+          else
+            POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+            # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+            # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+            # account reads 5000 — so one account served every job while the rest idled,
+            # which is the concentration the pool exists to prevent. Jobs shuffle
+            # independently, so a fan-out spreads instead of stampeding onto one token.
+            POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+            # The budget comes from the X-RateLimit headers of a REAL call (GET /user, which
+            # also names the account), never from /rate_limit: for these accounts that
+            # endpoint reports 0 used while real calls show hundreds (2026-10-08, it2nt:
+            # /rate_limit 0 vs /user 916), so every job saw a 5000-each tie and piled onto
+            # one account until GitHub refused it. Stop at the first account with GOOD calls
+            # left — still about one call per job, and the login comes with it.
+            GOOD=1500; BEST=''; BEST_REM=-1; LOGIN=''; BODY=$(mktemp)
+            while IFS= read -r T; do
+              [ -n "$T" ] || continue
+              echo "::add-mask::$T"
+              H=$(curl -s -m 15 -D - -o "$BODY" -H "Authorization: Bearer $T" https://api.github.com/user) || continue
+              R=$(printf '%s\n' "$H" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-ratelimit-remaining"{print $2}' | tail -n1)
+              case "$R" in ''|*[!0-9]*) continue ;; esac
+              L=$(jq -r '.login // empty' "$BODY" 2>/dev/null)
+              [ -n "$L" ] || continue
+              if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; LOGIN="$L"; fi
+              [ "$R" -ge "$GOOD" ] && break
+            done <<< "$POOL"
+            rm -f "$BODY"
+            [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+            { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+            echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+            if [ "$BEST_REM" -lt 500 ]; then
+              echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+            fi
+          fi
+          exit 0
+
+      # The checkout below names a pinned sha, so the log would not say which PR this shard
+      # tested. The CI-noise sweep (scripts/ci/noise-police.mjs parsePrNumber) reads that
+      # off this line, and ranks a failed test by the distinct PRs it failed on.
+      - name: Name the PR under test
+        env:
+          PR: ${{ github.event.client_payload.ctx.pr_number }}
+        run: |
+          if [ -n "$PR" ]; then echo "checkout_ref: refs/pull/$PR/merge"; else echo "  ref: main"; fi
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
+          ref: ${{ github.event.client_payload.ctx.checkout_ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/install
+
+      # The develop variant's backend: `pnpm dev:lite` on :3008, as in local
+      # development (the boot itself is the one erp-local-stack-matrix.yml
+      # proves on every OS). nohup, because the stack must outlive this step.
+      # Dependency verification is off for the same reason as scripts/ci/e2e/ci-boot.sh:
+      # the install action's cache already holds the lockfile's node_modules.
+      # Pages on: WebFallbackJourneyTest opens real /vi/auth/handoff and /vi/pages in the in-app web view.
+      - name: Boot the local stack (pnpm dev:lite → :3008)
+        timeout-minutes: 15
+        env:
+          pnpm_config_verify_deps_before_run: 'false'
+        run: |
+          set -uo pipefail
+          mkdir -p .wrangler
+          nohup pnpm dev:lite > .wrangler/dev-lite.log 2>&1 &
+          BOOT_PID=$!
+          waited=0
+          until curl -sf -o /dev/null --max-time 20 http://127.0.0.1:3008/api/health; do
+            if ! kill -0 "$BOOT_PID" 2>/dev/null || [ "$waited" -ge 600 ]; then
+              echo "::error::pnpm dev:lite did not answer /api/health within ${waited}s"
+              tail -80 .wrangler/dev-lite.log
+              exit 1
+            fi
+            sleep 2
+            waited=$((waited + 2))
+          done
+          echo "✓ /api/health → up after ${waited}s"
+          # Health answers before the first login and feed do; warm them so the journeys' waits time the app.
+          bash scripts/ci/native/warm-stack.sh
+
+      # Launches Gradle only; the daemon's own JDK comes from
+      # gradle/gradle-daemon-jvm.properties, provisioned by the toolchain resolver.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Caches Gradle's distribution and dependencies between runs. Without it every run downloaded
+      # Gradle and the dependencies (88 s before the first task) and re-ran every task (74 of 75).
+      # v5, not v6: v6's caching is a proprietary component with its own terms of use.
+      - uses: gradle/actions/setup-gradle@v5
+
+      # The emulator needs hardware acceleration, which the runner only grants
+      # once /dev/kvm is opened to the runner user.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Once per run, on shard 1. The other shards' UI-test task builds the APKs it needs.
+      - name: Build, lint + unit tests
+        if: ${{ matrix.shard == 1 }}
+        working-directory: apps/mobile/android
+        run: ./gradlew :app:assembleDevDebug :app:testDevDebugUnitTest ktlintCheck detekt :app:lintDevDebug
+
+      # The emulator runner below downloads the emulator and its system image on every run, once:
+      # one corrupt download (`Error on ZipFile unknown archive`, after 9 min on #8320) failed the
+      # job with no test run. Install both here with a bounded retry; the runner's own install
+      # then finds them present and downloads nothing.
+      - name: Install the emulator and its system image
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          PKGS=(emulator 'system-images;android-35;aosp_atd;x86_64')
+          yes | timeout 60 "$SDKM" --licenses > /dev/null || true
+          for i in 1 2 3; do
+            timeout 300 "$SDKM" --install "${PKGS[@]}" --channel=0 > /dev/null && exit 0
+            echo "sdkmanager install attempt $i of 3 failed" >&2
+            rm -rf "$ANDROID_HOME/.temp"
+          done
+          echo "::error::installing ${PKGS[*]} failed 3 times"
+          exit 1
+
+      # This shard's journeys (a class filter; none = all of them).
+      - name: Compose UI tests on an emulator
+        id: ui
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          ANDROID_TESTS: ${{ matrix.tests }}
+          JOURNEYS: shard ${{ matrix.shard }}/${{ matrix.of }}
+        with:
+          api-level: 35
+          arch: x86_64
+          # The same headless image as the managed device in app/build.gradle.kts.
+          target: aosp_atd
+          disable-animations: true
+          emulator-options: -no-window -no-snapshot-save -gpu swiftshader_indirect -noaudio -no-boot-anim
+          working-directory: apps/mobile/android
+          script: |
+            echo "::notice title=Android journeys::${JOURNEYS:-all classes (no plan)}"
+            ./gradlew :app:connectedDevDebugAndroidTest $ANDROID_TESTS
+
+      # Gradle reports success when the device ran nothing, so count the
+      # results: a UI-test step that ran zero tests is red, not green. It also runs after
+      # a failed UI-test step, to name each failed test: Gradle's log names none of them.
+      - name: Count the UI tests that ran
+        if: ${{ !cancelled() && steps.ui.outcome != 'skipped' }}
+        run: |
+          set -euo pipefail
+          DIR=apps/mobile/android/app/build/outputs/androidTest-results/connected
+          count() { { find "$DIR" -name '*.xml' -exec cat {} + 2>/dev/null || true; } | { grep -o "$1" || true; } | wc -l | tr -d ' '; }
+          RAN=$(count '<testcase'); FAILED=$(count '<failure'); SKIPPED=$(count '<skipped')
+          echo "UI tests: $RAN ran, $FAILED failed, $SKIPPED skipped"
+          bash scripts/ci/native/android-test-log.sh "$DIR"
+          [ "$((RAN - SKIPPED))" -gt 0 ] || { echo "::error::no Compose UI test ran on the emulator (results under $DIR)"; exit 1; }
+
+      - name: Upload test results
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: mobile-android-results-${{ matrix.shard }}
+          # Test reports only, never lint's HTML: it quotes source, and ppap repos are public.
+          path: |
+            apps/mobile/android/app/build/reports/tests
+            apps/mobile/android/app/build/reports/androidTests
+            apps/mobile/android/app/build/outputs/androidTest-results
+            .wrangler/dev-lite.log
+            .wrangler/state/api.log
+            .wrangler/state/next.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
+      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
+      - name: GitHub calls (NT / PAT)
+        if: always()
+        run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true

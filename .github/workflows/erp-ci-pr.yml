@@ -621,7 +621,7 @@ jobs:
       #
       # Reusable-workflow jobs share THIS run, so `github.run_id` covers every
       # coordinator job; the fanned-out batches live in other repos and come
-      # from the `e2e_runs` and `check_runs` outputs.
+      # from the `e2e_runs`, `check_runs`, `ios_runs` and `android_runs` outputs.
       #
       # `continue-on-error` + `set +e`: a scan hiccup must never red a run whose
       # actual checks passed. When it cannot run, `clean` stays empty, which the
@@ -646,6 +646,8 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           E2E_RUNS: ${{ needs.checks.outputs.e2e_runs }}
           CHECK_RUNS: ${{ needs.checks.outputs.check_runs }}
+          IOS_RUNS: ${{ needs.checks.outputs.ios_runs }}
+          ANDROID_RUNS: ${{ needs.checks.outputs.android_runs }}
           # Which categories CI itself calls red. The digest uses this to tell
           # "this job passed" apart from "this job failed and I could not parse
           # why" — an unparsed red job must announce itself, not read as silence.
@@ -663,7 +665,9 @@ jobs:
           # Exported because scripts/ci/report.mjs → job-index.mjs reads the
           # same variable. The ci-sites download below walks it too; a check
           # batch simply has no ci-sites artifact, which that loop tolerates.
-          BATCH_RUNS="$(jq -cn --argjson a "${E2E_RUNS:-[]}" --argjson b "${CHECK_RUNS:-[]}" '($a // []) + ($b // [])' 2>/dev/null || printf '%s' "${E2E_RUNS:-[]}")"
+          BATCH_RUNS="$(jq -cn --argjson a "${E2E_RUNS:-[]}" --argjson b "${CHECK_RUNS:-[]}" \
+            --argjson c "${IOS_RUNS:-[]}" --argjson d "${ANDROID_RUNS:-[]}" \
+            '($a // []) + ($b // []) + ($c // []) + ($d // [])' 2>/dev/null || printf '%s' "${E2E_RUNS:-[]}")"
           export BATCH_RUNS
           tmp="$(mktemp -d)"
           : > "$tmp/e2e.log"; : > "$tmp/biome.log"; : > "$tmp/test.log"

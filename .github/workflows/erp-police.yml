@@ -379,6 +379,9 @@ jobs:
       held: ${{ steps.held.outputs.blocked }}
       open_pr: ${{ steps.guard.outputs.open_pr }}
       open_branch: ${{ steps.guard.outputs.open_branch }}
+      # The hunters the `kill` matrix runs tonight, in parallel: web, ios, android —
+      # each only when its platform has work. Built by "Plan the kill matrix".
+      kill_matrix: ${{ steps.matrix.outputs.kill_matrix }}
     # ~1.5k REST calls for a 7-day window over the 16-repo fleet (two run
     # listings per repo, one job listing per run, one log download per
     # test-bearing job), six in flight at a time. Measured serially at ~35
@@ -590,6 +593,35 @@ jobs:
             echo "::notice::killing $COUNT site(s): $KEYS"
           fi
 
+      # The native hunters' batches, from the same report: each platform's failed
+      # tests, ambient-only, capped, worst first — the web rule, per platform
+      # (scripts/ci/noise-fix.mjs --platform). Their briefs ride in the same artifact.
+      - name: Pick the native fix batches
+        id: native
+        if: ${{ steps.scan.conclusion == 'success' }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DAYS: ${{ inputs.days || '7' }}
+        run: |
+          set -uo pipefail
+          for P in ios android; do
+            BATCH=$(node scripts/ci/noise-fix.mjs plan \
+                      --platform "$P" \
+                      --report noise/ci-noise-fleet.json \
+                      --repo NamThuanVn/erp-namthuan \
+                      --brief "noise/fix-brief-$P.md" \
+                      --run-url "$RUN_URL" --days "$DAYS") || BATCH=''
+            if [ -z "$BATCH" ]; then
+              echo "::warning::noise-fix planner failed for $P — its hunter kills nothing tonight"
+              echo "${P}_count=unknown" >> "$GITHUB_OUTPUT"
+              continue
+            fi
+            COUNT=$(printf '%s' "$BATCH" | jq '.count')
+            echo "${P}_count=$COUNT" >> "$GITHUB_OUTPUT"
+            [ "$COUNT" -eq 0 ] || echo "::notice::$P: killing $COUNT site(s): $(printf '%s' "$BATCH" | jq -r '.keys | join(", ")')"
+          done
+
       - name: Upload the fleet noise report
         if: ${{ always() }}
         continue-on-error: true
@@ -627,7 +659,8 @@ jobs:
           set -uo pipefail
           OPEN=$(gh pr list --repo NamThuanVn/erp-namthuan --state open \
                    --json number,headRefName,updatedAt \
-                   --jq '[.[] | select(.headRefName | startswith("chore/ci-noise") or startswith("agent/chore/ci-noise"))]
+                   --jq '[.[] | select((.headRefName | startswith("chore/ci-noise") or startswith("agent/chore/ci-noise"))
+                                       and (.headRefName | test("ci-noise-(ios|android)-") | not))]
                          | sort_by(.updatedAt) | reverse' 2>/dev/null || echo '[]')
           N=$(printf '%s' "$OPEN" | jq 'length' 2>/dev/null || echo 0)
           if [ "${N:-0}" -eq 0 ]; then
@@ -644,6 +677,52 @@ jobs:
             echo "::warning::$N hunter PRs are open, which should not happen. Adopting the most recently updated (#$PR); the rest want a human: $(printf '%s' "$OPEN" | jq -r '.[1:][].number' | tr '\n' ' ')"
           fi
           exit 0
+
+      # The native hunters adopt their own open PR the same way: one per platform,
+      # on `chore/ci-noise-<platform>-*` (still `chore/ci-noise*`, so the dispatcher
+      # samples it three ways like the web hunter's).
+      - name: Adopt the open native hunter PRs
+        id: native_guard
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          for P in ios android; do
+            OPEN=$(gh pr list --repo NamThuanVn/erp-namthuan --state open \
+                     --json number,headRefName,updatedAt \
+                     --jq "[.[] | select(.headRefName | test(\"^(agent/)?chore/ci-noise-$P-\"))] | sort_by(.updatedAt) | reverse" \
+                     2>/dev/null || echo '[]')
+            PR=$(printf '%s' "$OPEN" | jq -r '.[0].number // ""' 2>/dev/null || echo '')
+            BR=$(printf '%s' "$OPEN" | jq -r '.[0].headRefName // ""' 2>/dev/null || echo '')
+            echo "${P}_open_pr=$PR" >> "$GITHUB_OUTPUT"
+            echo "${P}_open_branch=$BR" >> "$GITHUB_OUTPUT"
+            [ -z "$PR" ] || echo "::notice::$P: adopting the open hunter PR #$PR ($BR)"
+          done
+          exit 0
+
+      # ONE scan, then the hunters in parallel: an entry per platform that has work
+      # (scripts/ci/police-matrix.mjs holds the rule, where it is tested).
+      - name: Plan the kill matrix
+        id: matrix
+        if: ${{ always() }}
+        env:
+          SMOKE: ${{ inputs.smoke }}
+          WEB_SITES: ${{ steps.batch.outputs.count }}
+          WEB_FIXABLE: ${{ steps.scan.outputs.fixable_files }}
+          WEB_OPEN_PR: ${{ steps.guard.outputs.open_pr }}
+          WEB_OPEN_BRANCH: ${{ steps.guard.outputs.open_branch }}
+          IOS_SITES: ${{ steps.native.outputs.ios_count }}
+          IOS_OPEN_PR: ${{ steps.native_guard.outputs.ios_open_pr }}
+          IOS_OPEN_BRANCH: ${{ steps.native_guard.outputs.ios_open_branch }}
+          ANDROID_SITES: ${{ steps.native.outputs.android_count }}
+          ANDROID_OPEN_PR: ${{ steps.native_guard.outputs.android_open_pr }}
+          ANDROID_OPEN_BRANCH: ${{ steps.native_guard.outputs.android_open_branch }}
+        run: |
+          set -uo pipefail
+          M=$(node scripts/ci/police-matrix.mjs) || M='[]'
+          echo "kill_matrix=$M" >> "$GITHUB_OUTPUT"
+          echo "▶ kill matrix: $M"
 
       # The sticky inventory. ONE issue, refreshed in place — a new issue per day
       # would bury the trend under 30 duplicates, and the trend (which spec, how
@@ -756,7 +835,7 @@ jobs:
   # leaves the PR open with the evidence on it, and tomorrow's sweep holds
   # (see `Hold the kill…` above) until a human has looked.
   kill:
-    name: Kill the noise
+    name: Kill the noise (${{ matrix.platform }})
     needs: patrol-noise
     # Three conditions, and the middle one is the one that is easy to get
     # wrong: `sites` is the string `unknown` when the planner crashed, which
@@ -765,16 +844,24 @@ jobs:
     # `smoke` runs it regardless of what the sweep found: the point is to
     # exercise the WIRING, and a night with nothing to kill is exactly when a
     # broken step would otherwise go unnoticed until the next real batch.
+    # The patrol decides which hunters run tonight (its `kill_matrix` output):
+    # `web` under the original rule — a smoke run, an open hunter PR to adopt, an
+    # ambient site, or a biome file — and `ios` / `android` when their platform has
+    # an ambient failed test or an open hunter PR. A job-level `if:` cannot read the
+    # matrix, so it only asks whether there is any entry at all. `sites` is the
+    # string `unknown` when a planner crashed, and the patrol leaves that platform out.
     if: >-
       ${{ !inputs.dry_run
           && needs.patrol-noise.outputs.held != 'true'
-          && (inputs.smoke
-              || needs.patrol-noise.outputs.open_pr != ''
-              || ((needs.patrol-noise.outputs.sites != '0'
-                   && needs.patrol-noise.outputs.sites != 'unknown'
-                   && needs.patrol-noise.outputs.sites != '')
-                  || needs.patrol-noise.outputs.fixable != '')) }}
-    runs-on: ubuntu-latest
+          && needs.patrol-noise.outputs.kill_matrix != ''
+          && needs.patrol-noise.outputs.kill_matrix != '[]' }}
+    strategy:
+      # One platform's hunter failing must not cancel another's session.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.patrol-noise.outputs.kill_matrix) }}
+    # ubuntu-latest for web and Android (KVM, so the emulator boots), macos-26 for iOS.
+    runs-on: ${{ matrix.runner }}
     # A fixer session plus five watched CI runs. The session is bounded by the
     # harness's own budgets; the fan-out is ~20 min for the slowest run. Five
     # hours is the same order as an agent lane (330 min) and well inside the
@@ -912,7 +999,7 @@ jobs:
       # finishing #N is. Overwriting the brief keeps that decision with the
       # guard rather than teaching patrol-noise about it.
       - name: Write the continue brief when adopting a PR
-        if: ${{ needs.patrol-noise.outputs.open_pr != '' }}
+        if: ${{ matrix.open_pr != '' }}
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -923,17 +1010,17 @@ jobs:
           # see which sites survived an earlier fix, i.e. which explanations
           # have already been tried and disproved. Best-effort: a comment that
           # cannot be read costs the hindsight, not the run.
-          gh api "repos/NamThuanVn/erp-namthuan/issues/${{ needs.patrol-noise.outputs.open_pr }}/comments" \
+          gh api "repos/NamThuanVn/erp-namthuan/issues/${{ matrix.open_pr }}/comments" \
             --jq '[.[] | select(.body | startswith("<!-- ci-report -->"))][0].body // ""' \
             > "$RUNNER_TEMP/noise/pr-comment.md" 2>/dev/null || : > "$RUNNER_TEMP/noise/pr-comment.md"
           node scripts/ci/noise-fix.mjs plan \
-            --continue-pr "${{ needs.patrol-noise.outputs.open_pr }}" \
-            --continue-branch "${{ needs.patrol-noise.outputs.open_branch }}" \
+            --continue-pr "${{ matrix.open_pr }}" \
+            --continue-branch "${{ matrix.open_branch }}" \
             --run-url "$RUN_URL" \
             --round "${{ inputs.round || '1' }}" \
             --run-log "$RUNNER_TEMP/noise/pr-comment.md" \
-            --brief "$RUNNER_TEMP/noise/fix-brief.md"
-          echo "✓ brief rewritten to finish PR #${{ needs.patrol-noise.outputs.open_pr }} (round ${{ inputs.round || '1' }})"
+            --brief "$RUNNER_TEMP/noise/${{ matrix.brief }}"
+          echo "✓ brief rewritten to finish PR #${{ matrix.open_pr }} (round ${{ inputs.round || '1' }})"
 
       # The SAME layout every agent lane uses, and for the same reason: the
       # session ships with /ship-pr, which pushes to `origin` and opens the PR
@@ -948,8 +1035,8 @@ jobs:
       - name: Branch + fork layout + identity
         env:
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          OPEN_PR: ${{ needs.patrol-noise.outputs.open_pr }}
-          OPEN_BRANCH: ${{ needs.patrol-noise.outputs.open_branch }}
+          OPEN_PR: ${{ matrix.open_pr }}
+          OPEN_BRANCH: ${{ matrix.open_branch }}
           SMOKE: ${{ inputs.smoke }}
         run: |
           set -euo pipefail
@@ -967,7 +1054,7 @@ jobs:
           if [ "${SMOKE:-}" = "true" ]; then
             BRANCH="smoke/hunter-${GITHUB_RUN_ID}"
           else
-            BRANCH="${OPEN_BRANCH:-chore/ci-noise-$(date -u +%Y%m%d-%H%M)}"
+            BRANCH="${OPEN_BRANCH:-${{ matrix.branch_prefix }}-$(date -u +%Y%m%d-%H%M)}"
           fi
           # Same-repo mode (FORK_REPO is upstream itself, ppap-github-app.md):
           # every branch goes under agent/, the only prefix any sweep may delete
@@ -1032,6 +1119,35 @@ jobs:
 
       - uses: ./.github/actions/install
 
+      # ── Native toolchains (a native hunter only): the same tools erp-agent-car.yml
+      # gives a platform lane, so the session can run scripts/dev/mobile/ui-journey.sh,
+      # which boots the local stack (and the emulator) for the classes it fixes.
+      - name: Install the iOS toolchain
+        if: ${{ matrix.platform == 'ios' }}
+        run: |
+          set -euo pipefail
+          for t in xcodegen swiftlint swiftformat xcbeautify; do
+            command -v "$t" >/dev/null 2>&1 || brew install "$t"
+          done
+
+      # Launches Gradle only; the daemon's own JDK comes from
+      # gradle/gradle-daemon-jvm.properties, provisioned by the toolchain resolver.
+      - name: Set up Java (Android hunter)
+        if: ${{ matrix.platform == 'android' }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The emulator needs hardware acceleration, which the runner only grants
+      # once /dev/kvm is opened to the runner user.
+      - name: Enable KVM (Android hunter)
+        if: ${{ matrix.platform == 'android' }}
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
       # Biome IS the codemod — the hunter never reimplements a fixer, exactly
       # as patrol-timeouts borrows strip-timeouts.mjs from the gate. Scoped to
       # the files the scan named rather than the whole tree, so every hunk is
@@ -1040,9 +1156,9 @@ jobs:
       # /ship-pr stages everything, so this needs no commit of its own.
       - name: Fix the biome warnings the sweep named
         id: biome
-        if: ${{ needs.patrol-noise.outputs.fixable != '' && needs.patrol-noise.outputs.open_pr == '' }}
+        if: ${{ matrix.fixable != '' && matrix.open_pr == '' }}
         env:
-          FIXABLE: ${{ needs.patrol-noise.outputs.fixable }}
+          FIXABLE: ${{ matrix.fixable }}
         run: |
           set -uo pipefail
           # shellcheck disable=SC2086  # FIXABLE is an intentional space-separated path list
@@ -1060,7 +1176,7 @@ jobs:
       # zero new sites still runs the session, and run 36784061721 died there
       # with `claude: command not found` (rc=127).
       - name: Install Claude Code CLI
-        if: ${{ !inputs.smoke && (needs.patrol-noise.outputs.open_pr != '' || needs.patrol-noise.outputs.sites != '0') }}
+        if: ${{ !inputs.smoke && (matrix.open_pr != '' || matrix.sites != '0') }}
         env:
           CLAUDE_VERSION: 'latest'
         run: |
@@ -1081,7 +1197,7 @@ jobs:
       # no model plumbing at all before this. Mirrors the fixer's own `if:` —
       # resolving a model nobody is going to spend is wasted work.
       - name: Resolve model
-        if: ${{ inputs.smoke || needs.patrol-noise.outputs.open_pr != '' || needs.patrol-noise.outputs.sites != '0' }}
+        if: ${{ inputs.smoke || matrix.open_pr != '' || matrix.sites != '0' }}
         env:
           EXPLICIT: ${{ inputs.model }}
           # AGENT_DRIVERS is in the job env from "Load hunter config".
@@ -1109,7 +1225,7 @@ jobs:
       # says plainly what happened.
       - name: Fix the flaky sites and ship the PR
         id: fixer
-        if: ${{ inputs.smoke || needs.patrol-noise.outputs.open_pr != '' || needs.patrol-noise.outputs.sites != '0' }}
+        if: ${{ inputs.smoke || matrix.open_pr != '' || matrix.sites != '0' }}
         continue-on-error: true
         env:
           CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
@@ -1118,7 +1234,7 @@ jobs:
           ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
           ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
           GH_TOKEN: ${{ env.RESOLVED_PAT }}
-          HUNT_BRIEF: ${{ runner.temp }}/noise/fix-brief.md
+          HUNT_BRIEF: ${{ runner.temp }}/noise/${{ matrix.brief }}
           HUNT_BRANCH: ${{ env.BRANCH }}
           AGENT_STATE_DIR: ${{ runner.temp }}
           # Runs mode detection, the env preconditions and the budget
@@ -1146,7 +1262,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
-          name: police-fixer-session
+          name: police-fixer-session-${{ matrix.platform }}
           path: ${{ runner.temp }}/agent-*.json*
           retention-days: 14
           if-no-files-found: ignore
@@ -1272,7 +1388,7 @@ jobs:
           # The fixer is `continue-on-error`, so JOB_STATUS alone reads
           # `success` over a session that never started (run 36784061721).
           FIXER_OUTCOME: ${{ steps.fixer.outcome }}
-          ADOPTED: ${{ needs.patrol-noise.outputs.open_pr != '' }}
+          ADOPTED: ${{ matrix.open_pr != '' }}
           FAILED_STEP: ${{ steps.fixer.outcome == 'failure' && 'Fix the flaky sites and ship the PR' || '' }}
         run: |
           set -uo pipefail

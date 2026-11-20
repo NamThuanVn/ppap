@@ -86,6 +86,12 @@ on:
       e2e_runs:
         description: 'JSON array of the fanned-out batch runs ([{repo, batch, run_id, conclusion}]) so the caller can scan their logs. Empty when nothing was dispatched.'
         value: ${{ jobs.e2e.outputs.runs }}
+      ios_runs:
+        description: 'JSON array of the fanned-out iOS shard batch runs ([{repo, batch, run_id, conclusion}]), the native counterpart of e2e_runs.'
+        value: ${{ jobs.native-ios.outputs.runs }}
+      android_runs:
+        description: 'JSON array of the fanned-out Android shard batch runs ([{repo, batch, run_id, conclusion}]).'
+        value: ${{ jobs.native-android.outputs.runs }}
       native:
         description: 'Native mobile verdict: success when every platform job the plan asked for passed and the rest were skipped (and always when run_native is false); failure otherwise. Empty (⇒ red) if the verdict job itself died.'
         value: ${{ !inputs.run_native && 'success' || jobs.native.outputs.result }}
@@ -1360,9 +1366,10 @@ jobs:
       android: ${{ steps.plan.outputs.android }}
       ios_tests: ${{ steps.plan.outputs.ios_tests }}
       ios_journeys: ${{ steps.plan.outputs.ios_journeys }}
-      ios_pages: ${{ steps.plan.outputs.ios_pages }}
+      ios_shards: ${{ steps.plan.outputs.ios_shards }}
       android_tests: ${{ steps.plan.outputs.android_tests }}
       android_journeys: ${{ steps.plan.outputs.android_journeys }}
+      android_shards: ${{ steps.plan.outputs.android_shards }}
       sha: ${{ steps.pin.outputs.sha }}
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
@@ -1663,18 +1670,19 @@ jobs:
         if: always()
         run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
 
-  # iOS: format, lint, build, unit tests and the XCUITest journeys, on a
-  # Simulator against the develop variant (NamThuan-Dev → localhost:3008). The
-  # backend is the local stack booted on this runner, never staging, so a
-  # journey sees the migration-seeded accounts and the fixed local OTP.
+  # iOS: the UI journeys, fanned out. journeys.sh (native-plan) splits them into
+  # shards and this job dispatches them to other fleet repos, IOS_HOST_SLOTS per repo
+  # (scripts/ci/fanout.mjs SUITE=ios), where erp-ci-native-batch.yml runs each shard
+  # on its own runner. This job only dispatches and waits; the shards' logs and
+  # results live in the batch runs, linked from its summary.
   native-ios:
     name: 1 · CI · Mobile (iOS)
     needs: native-plan
     if: ${{ needs.native-plan.outputs.ios == 'true' }}
-    # macos-26: its default Xcode is 26.x (Swift 6.2), which the Swift packages
-    # need — macos-15 defaults to Xcode 16 and cannot resolve them.
-    runs-on: macos-26
-    timeout-minutes: 90
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      runs: ${{ steps.collect.outputs.runs }}
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
       # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
@@ -1775,194 +1783,68 @@ jobs:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
           ref: ${{ needs.native-plan.outputs.sha }}
+          sparse-checkout: scripts
           persist-credentials: false
 
-      - uses: ./.github/actions/install
-
-      # The develop variant's backend: `pnpm dev:lite` on :3008, as in local
-      # development (the boot itself is the one erp-local-stack-matrix.yml
-      # proves on every OS). nohup, because the stack must outlive this step.
-      # Started here and waited for only before the journeys, so its ~80 s boot
-      # overlaps the Xcode build instead of preceding it.
-      # Dependency verification is off for the same reason as scripts/ci/e2e/ci-boot.sh:
-      # the install action's cache already holds the lockfile's node_modules.
-      # PAGES=0: API only. The app calls /api alone, and `next dev` cost CPU and ~1 GB on a 3-core,
-      # 7 GB runner that also builds and runs the Simulator (load averages of 150–560, #8362).
-      # The exception: a run whose plan includes a journey that opens a real web page (the web
-      # fallback; journeys.sh IOS_PAGES) boots `next dev`, and warm-stack.sh compiles the page
-      # before the tests start.
-      # scripts/ci/native/load-sampler.sh logs the top CPU users every 30 s; the job prints it last,
-      # so a slow step says what it was waiting behind.
-      - name: Start the local stack (pnpm dev:lite → :3008)
+      - name: Dispatch + wait for iOS shards
+        id: collect
         env:
-          pnpm_config_verify_deps_before_run: 'false'
-          PAGES: ${{ needs.native-plan.outputs.ios_pages == '1' && '1' || '0' }}
-        run: |
-          set -uo pipefail
-          mkdir -p .wrangler
-          nohup bash scripts/ci/native/load-sampler.sh 30 > "$RUNNER_TEMP/load.log" 2>&1 &
-          nohup pnpm dev:lite > .wrangler/dev-lite.log 2>&1 &
-          echo $! > .wrangler/dev-lite.pid
-
-      - name: Install the iOS toolchain
-        id: toolchain
-        run: |
-          set -euo pipefail
-          for t in xcodegen swiftlint swiftformat xcbeautify; do
-            command -v "$t" >/dev/null 2>&1 || brew install "$t"
-          done
-          # The compiled-packages cache below is only worth restoring to the Xcode that built it.
-          echo "xcode=$(xcodebuild -version | awk '/Build version/ { print $3 }')" >> "$GITHUB_OUTPUT"
-
-      - name: SwiftFormat + SwiftLint
-        working-directory: apps/mobile/ios
-        run: |
-          set -euo pipefail
-          swiftformat --lint .
-          swiftlint --strict
-
-      # The Swift packages only: Sentry's and Lottie's zips (135 MB, 565 MB unpacked) and four git
-      # repos took 118–266 s to fetch here, against 0 s from a filled SourcePackages. Keyed on what
-      # declares them, so a key holds for weeks — unlike the DerivedData cache, whose source-keyed
-      # entry each fleet repo almost always missed (#8362). A stale restore is safe: xcodebuild
-      # fetches only what the declarations changed.
-      - name: Cache Swift packages
-        uses: actions/cache@v6
-        with:
-          path: ${{ runner.temp }}/dd/SourcePackages
-          key: ios-spm-v1-${{ hashFiles('apps/mobile/ios/project.yml', 'apps/mobile/ios/Packages/*/Package.swift') }}
-          restore-keys: ios-spm-v1-
-
-      # The compiled Swift packages: NTAPI (50,000 generated lines), swift-openapi-*, swift-http-types and
-      # swift-collections are about half of the compile and change in about 1 iOS commit in 13. The app's own
-      # targets are left out of the cache and always rebuild. xcodebuild reuses a restored product only while its
-      # sources keep the modification time it was built against: the checkouts in SourcePackages keep theirs
-      # through the cache above, and the build step stamps one fixed time on Packages/, which a checkout dates
-      # now. That fixed time is why the key hashes every file in Packages/ and there are no restore-keys: an
-      # entry restores only onto the exact sources it was built from, so an edited package is never skipped.
-      - name: Cache compiled Swift packages
-        uses: actions/cache@v6
-        with:
-          path: |
-            ${{ runner.temp }}/dd/Build
-            !${{ runner.temp }}/dd/Build/Intermediates.noindex/NamThuan.build
-            !${{ runner.temp }}/dd/Build/Products/*/NamThuan*
-          key: ios-dd-packages-v1-${{ steps.toolchain.outputs.xcode }}-${{ hashFiles('apps/mobile/ios/project.yml', 'apps/mobile/ios/Config/**', 'apps/mobile/ios/Packages/**') }}
-
-      # The Simulator comes from scripts/ci/native/simulator.sh: an iPhone on the
-      # NEWEST installed iOS runtime, checked against what xcodebuild offers and,
-      # on a runner image where xcodebuild does not see it, repaired (it says how).
-      # It needs the generated project and the resolved packages, so it runs after
-      # both, while the device is still shut down. It boots only after the build, in the
-      # background, so the boot overlaps the stack wait instead of the compile: the
-      # whole-module compile slowed from 162–226 s to ~640 s sharing the 3 cores with the
-      # boot (#9446), and booting before the install slowed the install to ~180 s
-      # (#9371). The test step waits for the boot. scripts/ci/native/xcode-log.sh
-      # prints one line per test plus a failed journey's raw steps; the full raw
-      # logs are uploaded with the results.
-      - name: Boot a Simulator + build for testing
-        working-directory: apps/mobile/ios
-        run: |
-          set -euo pipefail
-          xcodegen generate
-          # One fixed modification time on the local packages, so the compiled-packages cache matches them.
-          find Packages ! -type l -exec touch -t 202001010000 {} +
-          # Fetching the packages and compiling are timed apart, with the runner's load beside each, so a
-          # slow build step says which of the two it was (#8362: 6.6–13.6 min here vs ~1 min locally).
-          SECONDS=0
-          # Streamed, not hidden in a file: the log's per-line timestamps show where the step waits —
-          # it took 173–360 s with every package already restored from the cache.
-          xcodebuild -resolvePackageDependencies -scheme NamThuan-Dev -derivedDataPath "$RUNNER_TEMP/dd" \
-            -skipPackagePluginValidation 2>&1 | tee "$RUNNER_TEMP/xcodebuild-resolve.log"
-          echo "⏱ packages resolved in ${SECONDS}s · load: $(uptime | sed 's/.*load averages*: //')"
-          UDID="$(bash "$GITHUB_WORKSPACE/scripts/ci/native/simulator.sh" "$RUNNER_TEMP/dd")"
-          echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
-          # After the check: names the Xcode the build really uses, if it switched.
-          xcodebuild -version
-          SECONDS=0
-          # No index store: nothing on CI reads it, and writing it slows every compile. arm64 only: the runner
-          # and its Simulator are Apple silicon, and a second architecture doubled every host-built package.
-          # Only the packages' part of DerivedData is cached (above): the whole of it, keyed on the source, missed (#8362).
-          # Whole-module: one compile job per module instead of one per file, fewer to share 3 cores.
-          xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$UDID" \
-            -derivedDataPath "$RUNNER_TEMP/dd" -skipPackagePluginValidation -showBuildTimingSummary \
-            COMPILER_INDEX_STORE_ENABLE=NO ARCHS=arm64 SWIFT_COMPILATION_MODE=wholemodule build-for-testing 2>&1 |
-            bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild-build.log"
-          echo "⏱ built in ${SECONDS}s · load: $(uptime | sed 's/.*load averages*: //')"
-          awk '/Build Timing Summary/ { on = 1 } on && /\| [0-9.]+ seconds/ && n++ < 8' "$RUNNER_TEMP/xcodebuild-build.log"
-          nohup xcrun simctl bootstatus "$UDID" -b > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
-
-      - name: Wait for the local stack
-        timeout-minutes: 15
-        run: |
-          set -uo pipefail
-          BOOT_PID=$(cat .wrangler/dev-lite.pid)
-          waited=0
-          until curl -sf -o /dev/null --max-time 20 http://127.0.0.1:3008/api/health; do
-            if ! kill -0 "$BOOT_PID" 2>/dev/null || [ "$waited" -ge 600 ]; then
-              echo "::error::pnpm dev:lite did not answer /api/health within ${waited}s"
-              tail -80 .wrangler/dev-lite.log
-              exit 1
-            fi
-            sleep 2
-            waited=$((waited + 2))
-          done
-          echo "✓ /api/health → up after another ${waited}s"
-          # Health answers before the first login and feed do; warm them so the journeys' waits time the app.
-          WARM_PAGES="${{ needs.native-plan.outputs.ios_pages }}" bash scripts/ci/native/warm-stack.sh
-
-      # Every unit test, and the journeys the plan picked (-only-testing flags; none = all of them).
-      - name: Test (unit + XCUITest) on the Simulator
-        working-directory: apps/mobile/ios
-        env:
-          ONLY_TESTING: ${{ needs.native-plan.outputs.ios_tests }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          SUITE: ios
+          # A ref whose journeys.sh predates the shards: one shard, every journey.
+          NATIVE_SHARDS: ${{ needs.native-plan.outputs.ios_shards || '[{"shard":1,"of":1,"tests":""}]' }}
           JOURNEYS: ${{ needs.native-plan.outputs.ios_journeys }}
+          SELF: ${{ github.repository }}
+          FLEET: ${{ inputs.fleet }}
+          CHECKOUT_REF: ${{ needs.native-plan.outputs.sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          # iOS and Android batches share one worker workflow, so the platform is
+          # part of the token a batch run is found by.
+          CORRELATION: ${{ github.run_id }}-${{ github.run_attempt }}-ios
+          # DISPATCH_WAIT_S is how long a busy fleet may keep shards waiting for room;
+          # TIMEOUT_S bounds the whole step, inside timeout-minutes.
+          DISPATCH_WAIT_S: '1800'
+          TIMEOUT_S: '6600'
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: |
           set -euo pipefail
           echo "::notice title=iOS journeys::${JOURNEYS:-all classes (no plan)}"
-          read -ra ONLY <<< "$ONLY_TESTING"
-          xcrun simctl bootstatus "$SIM_UDID" -b > /dev/null
-          xcodebuild -scheme NamThuan-Dev -destination "platform=iOS Simulator,id=$SIM_UDID" \
-            -derivedDataPath "$RUNNER_TEMP/dd" -resultBundlePath "$RUNNER_TEMP/NamThuan.xcresult" \
-            -skipPackagePluginValidation ${ONLY[@]+"${ONLY[@]}"} test-without-building 2>&1 |
-            bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild.log"
+          node scripts/ci/fanout.mjs run
 
-      - name: Runner load, every 30 s
-        if: always()
-        run: cat "$RUNNER_TEMP/load.log" 2>/dev/null || true
-
-      - name: Upload test results
-        if: ${{ failure() }}
+      # Read by scripts/ci/ppap/ci-repo.sh --fanout, to find the shard logs in other repos.
+      - name: Upload iOS fan-out map
+        if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: mobile-ios-results
-          path: |
-            ${{ runner.temp }}/NamThuan.xcresult
-            ${{ runner.temp }}/xcodebuild.log
-            ${{ runner.temp }}/xcodebuild-build.log
-            .wrangler/dev-lite.log
-            .wrangler/state/api.log
-            .wrangler/state/next.log
+          name: ci-fanout-ios
+          path: ci-fanout-ios.json
           retention-days: 7
+          overwrite: true
           if-no-files-found: ignore
 
-      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
-      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
       - name: GitHub calls (NT / PAT)
         if: always()
         run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
 
-  # Android: ktlint, detekt, Android Lint, the build and unit tests, then the
-  # Compose UI journeys on a REAL emulator against the develop variant
-  # (devDebug → 10.0.2.2:3008, ntDevPort in gradle.properties). Not the
-  # Gradle-managed pixel6Api35: that device has no route to this runner's
-  # local stack.
+  # Android: the UI journeys, fanned out. journeys.sh (native-plan) splits them into
+  # shards and this job dispatches them to other fleet repos, ANDROID_HOST_SLOTS per repo
+  # (scripts/ci/fanout.mjs SUITE=android), where erp-ci-native-batch.yml runs each shard
+  # on its own runner. This job only dispatches and waits; the shards' logs and
+  # results live in the batch runs, linked from its summary.
   native-android:
     name: 1 · CI · Mobile (Android)
     needs: native-plan
     if: ${{ needs.native-plan.outputs.android == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
+    outputs:
+      runs: ${{ steps.collect.outputs.runs }}
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
       # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
@@ -2063,131 +1945,51 @@ jobs:
           repository: ${{ env.PRIVATE_REPO }}
           token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
           ref: ${{ needs.native-plan.outputs.sha }}
+          sparse-checkout: scripts
           persist-credentials: false
 
-      - uses: ./.github/actions/install
-
-      # The develop variant's backend: `pnpm dev:lite` on :3008, as in local
-      # development (the boot itself is the one erp-local-stack-matrix.yml
-      # proves on every OS). nohup, because the stack must outlive this step.
-      # Dependency verification is off for the same reason as scripts/ci/e2e/ci-boot.sh:
-      # the install action's cache already holds the lockfile's node_modules.
-      # Pages on: WebFallbackJourneyTest opens real /vi/auth/handoff and /vi/pages in the in-app web view.
-      - name: Boot the local stack (pnpm dev:lite → :3008)
-        timeout-minutes: 15
+      - name: Dispatch + wait for Android shards
+        id: collect
         env:
-          pnpm_config_verify_deps_before_run: 'false'
-        run: |
-          set -uo pipefail
-          mkdir -p .wrangler
-          nohup pnpm dev:lite > .wrangler/dev-lite.log 2>&1 &
-          BOOT_PID=$!
-          waited=0
-          until curl -sf -o /dev/null --max-time 20 http://127.0.0.1:3008/api/health; do
-            if ! kill -0 "$BOOT_PID" 2>/dev/null || [ "$waited" -ge 600 ]; then
-              echo "::error::pnpm dev:lite did not answer /api/health within ${waited}s"
-              tail -80 .wrangler/dev-lite.log
-              exit 1
-            fi
-            sleep 2
-            waited=$((waited + 2))
-          done
-          echo "✓ /api/health → up after ${waited}s"
-          # Health answers before the first login and feed do; warm them so the journeys' waits time the app.
-          bash scripts/ci/native/warm-stack.sh
-
-      # Launches Gradle only; the daemon's own JDK comes from
-      # gradle/gradle-daemon-jvm.properties, provisioned by the toolchain resolver.
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      # Caches Gradle's distribution and dependencies between runs. Without it every run downloaded
-      # Gradle and the dependencies (88 s before the first task) and re-ran every task (74 of 75).
-      # v5, not v6: v6's caching is a proprietary component with its own terms of use.
-      - uses: gradle/actions/setup-gradle@v5
-
-      # The emulator needs hardware acceleration, which the runner only grants
-      # once /dev/kvm is opened to the runner user.
-      - name: Enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-
-      - name: Build, lint + unit tests
-        working-directory: apps/mobile/android
-        run: ./gradlew :app:assembleDevDebug :app:testDevDebugUnitTest ktlintCheck detekt :app:lintDevDebug
-
-      # The emulator runner below downloads the emulator and its system image on every run, once:
-      # one corrupt download (`Error on ZipFile unknown archive`, after 9 min on #8320) failed the
-      # job with no test run. Install both here with a bounded retry; the runner's own install
-      # then finds them present and downloads nothing.
-      - name: Install the emulator and its system image
-        run: |
-          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          PKGS=(emulator 'system-images;android-35;aosp_atd;x86_64')
-          yes | timeout 60 "$SDKM" --licenses > /dev/null || true
-          for i in 1 2 3; do
-            timeout 300 "$SDKM" --install "${PKGS[@]}" --channel=0 > /dev/null && exit 0
-            echo "sdkmanager install attempt $i of 3 failed" >&2
-            rm -rf "$ANDROID_HOME/.temp"
-          done
-          echo "::error::installing ${PKGS[*]} failed 3 times"
-          exit 1
-
-      # The journeys the plan picked (a class filter; none = all of them).
-      - name: Compose UI tests on an emulator
-        id: ui
-        uses: reactivecircus/android-emulator-runner@v2
-        env:
-          ANDROID_TESTS: ${{ needs.native-plan.outputs.android_tests }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          SUITE: android
+          # A ref whose journeys.sh predates the shards: one shard, every journey.
+          NATIVE_SHARDS: ${{ needs.native-plan.outputs.android_shards || '[{"shard":1,"of":1,"tests":""}]' }}
           JOURNEYS: ${{ needs.native-plan.outputs.android_journeys }}
-        with:
-          api-level: 35
-          arch: x86_64
-          # The same headless image as the managed device in app/build.gradle.kts.
-          target: aosp_atd
-          disable-animations: true
-          emulator-options: -no-window -no-snapshot-save -gpu swiftshader_indirect -noaudio -no-boot-anim
-          working-directory: apps/mobile/android
-          script: |
-            echo "::notice title=Android journeys::${JOURNEYS:-all classes (no plan)}"
-            ./gradlew :app:connectedDevDebugAndroidTest $ANDROID_TESTS
-
-      # Gradle reports success when the device ran nothing, so count the
-      # results: a UI-test step that ran zero tests is red, not green. It also runs after
-      # a failed UI-test step, to name each failed test: Gradle's log names none of them.
-      - name: Count the UI tests that ran
-        if: ${{ !cancelled() && steps.ui.outcome != 'skipped' }}
+          SELF: ${{ github.repository }}
+          FLEET: ${{ inputs.fleet }}
+          CHECKOUT_REF: ${{ needs.native-plan.outputs.sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          # iOS and Android batches share one worker workflow, so the platform is
+          # part of the token a batch run is found by.
+          CORRELATION: ${{ github.run_id }}-${{ github.run_attempt }}-android
+          # DISPATCH_WAIT_S is how long a busy fleet may keep shards waiting for room;
+          # TIMEOUT_S bounds the whole step, inside timeout-minutes.
+          DISPATCH_WAIT_S: '1800'
+          TIMEOUT_S: '6600'
+          ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
+          ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
+          ERP_HUB_CLIENT_SECRET_STAGING: ${{ secrets.ERP_HUB_CLIENT_SECRET_STAGING }}
+          ERP_HUB_CLIENT_ID_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_ID_PRODUCTION }}
+          ERP_HUB_CLIENT_SECRET_PRODUCTION: ${{ secrets.ERP_HUB_CLIENT_SECRET_PRODUCTION }}
         run: |
           set -euo pipefail
-          DIR=apps/mobile/android/app/build/outputs/androidTest-results/connected
-          count() { { find "$DIR" -name '*.xml' -exec cat {} + 2>/dev/null || true; } | { grep -o "$1" || true; } | wc -l | tr -d ' '; }
-          RAN=$(count '<testcase'); FAILED=$(count '<failure'); SKIPPED=$(count '<skipped')
-          echo "UI tests: $RAN ran, $FAILED failed, $SKIPPED skipped"
-          bash scripts/ci/native/android-test-log.sh "$DIR"
-          [ "$((RAN - SKIPPED))" -gt 0 ] || { echo "::error::no Compose UI test ran on the emulator (results under $DIR)"; exit 1; }
+          echo "::notice title=Android journeys::${JOURNEYS:-all classes (no plan)}"
+          node scripts/ci/fanout.mjs run
 
-      - name: Upload test results
-        if: ${{ failure() }}
+      # Read by scripts/ci/ppap/ci-repo.sh --fanout, to find the shard logs in other repos.
+      - name: Upload Android fan-out map
+        if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: mobile-android-results
-          # Test reports only, never lint's HTML: it quotes source, and ppap repos are public.
-          path: |
-            apps/mobile/android/app/build/reports/tests
-            apps/mobile/android/app/build/reports/androidTests
-            apps/mobile/android/app/build/outputs/androidTest-results
-            .wrangler/dev-lite.log
-            .wrangler/state/api.log
-            .wrangler/state/next.log
+          name: ci-fanout-android
+          path: ci-fanout-android.json
           retention-days: 7
+          overwrite: true
           if-no-files-found: ignore
 
-      # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
-      # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
       - name: GitHub calls (NT / PAT)
         if: always()
         run: command -v fleet-token >/dev/null 2>&1 && fleet-token calls-report || true
