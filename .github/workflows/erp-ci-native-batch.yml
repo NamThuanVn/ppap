@@ -375,6 +375,26 @@ jobs:
             !${{ runner.temp }}/dd/Build/Products/*/NamThuan*
           key: ios-dd-packages-v1-${{ steps.toolchain.outputs.xcode }}-${{ hashFiles('apps/mobile/ios/project.yml', 'apps/mobile/ios/Config/**', 'apps/mobile/ios/Packages/**') }}
 
+      # A settled copy of the Simulator's data (scripts/ci/native/simulator-seed.sh): a fresh device's first
+      # boot took 4–8 min after the build on every shard and the journeys started inside it (load 270–480);
+      # booted from the copy it is up and quieted in ~30 s. Keyed on what the data belongs to — the macOS
+      # build, the Xcode and the newest iOS runtime — so it is remade once per runner image, per fleet repo
+      # (~1 GB). A miss makes it (one fresh boot, settled at most 240 s) and saves it after the journeys.
+      - name: Simulator seed key
+        id: simkey
+        run: |
+          set -euo pipefail
+          RUNTIME="$(xcrun simctl list runtimes -j | jq -r '[.runtimes[] | select(.platform == "iOS" and .isAvailable)]
+            | sort_by(.version | split(".") | map(tonumber)) | last | .buildversion // "none"')"
+          echo "key=ios-sim-seed-v1-$(sw_vers -buildVersion)-${{ steps.toolchain.outputs.xcode }}-$RUNTIME" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the settled Simulator
+        id: simseed
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/sim-seed
+          key: ${{ steps.simkey.outputs.key }}
+
       # The Simulator comes from scripts/ci/native/simulator.sh: an iPhone on the
       # NEWEST installed iOS runtime, checked against what xcodebuild offers and,
       # on a runner image where xcodebuild does not see it, repaired (it says how).
@@ -421,9 +441,10 @@ jobs:
             bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild-build.log"
           echo "⏱ built in ${SECONDS}s · load: $(uptime | sed 's/.*load averages*: //')"
           awk '/Build Timing Summary/ { on = 1 } on && /\| [0-9.]+ seconds/ && n++ < 8' "$RUNNER_TEMP/xcodebuild-build.log"
-          # Boot after the build and quiet its background work the moment it is up; the test step waits for the marker.
-          nohup bash "$GITHUB_WORKSPACE/scripts/ci/native/quiet-simulator.sh" "$UDID" --boot "$RUNNER_TEMP/sim-quiet.done" \
-            > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
+          # Boot after the build — from the settled seed, or making it — and quiet its background work the moment
+          # it is up; the test step waits for the marker.
+          nohup bash "$GITHUB_WORKSPACE/scripts/ci/native/simulator-seed.sh" "$UDID" "$RUNNER_TEMP/sim-seed" \
+            "$RUNNER_TEMP/sim-quiet.done" > "$RUNNER_TEMP/simctl-boot.log" 2>&1 &
 
       - name: Wait for the local stack
         timeout-minutes: 15
@@ -454,8 +475,9 @@ jobs:
           set -euo pipefail
           echo "::notice title=iOS journeys::${JOURNEYS:-all classes (no plan)}"
           read -ra ONLY <<< "$ONLY_TESTING"
-          # The boot and its quieting started before the build (marker written when both are done).
-          for _ in $(seq 1 150); do [ -f "$RUNNER_TEMP/sim-quiet.done" ] && break; sleep 2; done
+          # The boot and its quieting started after the build (marker written when both are done). Up to 10 min:
+          # a fresh first boot took 4–8, and making the seed adds a settle and a second boot.
+          for _ in $(seq 1 300); do [ -f "$RUNNER_TEMP/sim-quiet.done" ] && break; sleep 2; done
           cat "$RUNNER_TEMP/simctl-boot.log" 2>/dev/null || true
           xcrun simctl bootstatus "$SIM_UDID" -b > /dev/null
           echo "⏱ journeys start at load $(sysctl -n vm.loadavg | awk '{ print $2 }')"
@@ -463,6 +485,21 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/dd" -resultBundlePath "$RUNNER_TEMP/NamThuan.xcresult" \
             -skipPackagePluginValidation ${ONLY[@]+"${ONLY[@]}"} test-without-building 2>&1 |
             bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild.log"
+
+      # Made on this run (a miss): saved even when a journey failed, since it was copied before any ran.
+      # Shards of one run that all missed race for the key; the losers' save only warns.
+      - name: Seed made?
+        id: seedmade
+        if: ${{ always() && steps.simseed.outputs.cache-hit != 'true' }}
+        run: |
+          if [ -f "$RUNNER_TEMP/sim-seed/device-type" ]; then echo "made=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Save the settled Simulator
+        if: ${{ always() && steps.seedmade.outputs.made == 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/sim-seed
+          key: ${{ steps.simkey.outputs.key }}
 
       - name: Runner load, every 30 s
         if: always()
