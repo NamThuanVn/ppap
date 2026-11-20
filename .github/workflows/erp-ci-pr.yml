@@ -682,7 +682,7 @@ jobs:
           while IFS="$(printf '\t')" read -r repo run; do
             [ -n "$repo" ] && [ -n "$run" ] || continue
             gh api "repos/${repo}/actions/runs/${run}/jobs" --paginate \
-              --jq '.jobs[]? | [(.id|tostring), .name] | @tsv' 2>/dev/null \
+              --jq '.jobs[]? | select(.conclusion != "skipped") | [(.id|tostring), .name] | @tsv' 2>/dev/null \
               | while IFS="$(printf '\t')" read -r id name; do
                   [ -n "$id" ] || continue
                   # `E2E (shard` and not `E2E`: the plan, build-zone and seed

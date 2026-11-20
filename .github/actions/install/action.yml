@@ -90,9 +90,31 @@ runs:
     # `pnpm-workspace.yaml` is in the key for the same reason: adding a workspace
     # root now busts the cache automatically instead of silently reusing an entry
     # that predates it. (It also busts the bad entries that exist today.)
+    #
+    # RESTORE here, SAVE right after the install below — never at the end of the job. A plain
+    # actions/cache step picks its key now and saves at job end, so whatever the job did to
+    # node_modules in between was stored under a key it no longer matched: an iOS agent lane
+    # (a session that switches branches and rebases) saved a tree missing apis/worklog's
+    # @hono/zod-openapi on NamThuanVnXi/ppap (2026-11-17), and every later macOS job there
+    # restored it, skipped the install and could not boot the local stack (2026-11-20).
+    # The key's platform part. A macOS entry also names the macOS and Xcode versions: node_modules
+    # holds native builds made with that toolchain, and a runner-image bump must not restore a tree
+    # built for the old one. Linux keeps the bare `Linux`, so its existing entries stay valid.
+    - name: Cache key platform
+      id: platform
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "$RUNNER_OS" = macOS ]; then
+          XCODE="$(xcodebuild -version 2>/dev/null | awk 'NR == 1 { print $2 }')"
+          echo "os=macOS-$(sw_vers -productVersion)-xcode-${XCODE:-none}" >> "$GITHUB_OUTPUT"
+        else
+          echo "os=$RUNNER_OS" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Restore node_modules cache
       id: cache
-      uses: actions/cache@v6
+      uses: actions/cache/restore@v6
       with:
         path: |
           node_modules
@@ -101,7 +123,7 @@ runs:
           packages/*/node_modules
           monolith/*/node_modules
           scripts/node_modules
-        key: pnpm-modules-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml') }}
+        key: pnpm-modules-${{ steps.platform.outputs.os }}-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml') }}
       env:
         NODE_OPTIONS: --no-deprecation
 
@@ -111,3 +133,26 @@ runs:
       env:
         NODE_OPTIONS: --no-deprecation
       run: pnpm install --frozen-lockfile --prefer-offline
+
+    # A sparse checkout installs only the workspaces it holds; saving that under the full key
+    # is the same poisoning as above, so it is never saved.
+    - name: Check the checkout is whole
+      id: whole
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: echo "sparse=$(git config --bool core.sparseCheckout || echo false)" >> "$GITHUB_OUTPUT"
+
+    - name: Save node_modules cache
+      if: steps.cache.outputs.cache-hit != 'true' && steps.whole.outputs.sparse != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: |
+          node_modules
+          apis/*/node_modules
+          apps/web/*/*/node_modules
+          packages/*/node_modules
+          monolith/*/node_modules
+          scripts/node_modules
+        key: ${{ steps.cache.outputs.cache-primary-key }}
+      env:
+        NODE_OPTIONS: --no-deprecation
