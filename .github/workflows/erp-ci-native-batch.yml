@@ -383,13 +383,14 @@ jobs:
       # booted from the copy it is up and quieted in ~30 s. Keyed on what the data belongs to — the macOS
       # build, the Xcode and the newest iOS runtime — so it is remade once per runner image, per fleet repo
       # (~1 GB). A miss makes it (one fresh boot, settled at most 240 s) and saves it after the journeys.
+      # v2: the seed also carries launchd's disabled list, which v1 seeds lack (#10583).
       - name: Simulator seed key
         id: simkey
         run: |
           set -euo pipefail
           RUNTIME="$(xcrun simctl list runtimes -j | jq -r '[.runtimes[] | select(.platform == "iOS" and .isAvailable)]
             | sort_by(.version | split(".") | map(tonumber)) | last | .buildversion // "none"')"
-          echo "key=ios-sim-seed-v1-$(sw_vers -buildVersion)-${{ steps.toolchain.outputs.xcode }}-$RUNTIME" >> "$GITHUB_OUTPUT"
+          echo "key=ios-sim-seed-v2-$(sw_vers -buildVersion)-${{ steps.toolchain.outputs.xcode }}-$RUNTIME" >> "$GITHUB_OUTPUT"
 
       - name: Restore the settled Simulator
         id: simseed
