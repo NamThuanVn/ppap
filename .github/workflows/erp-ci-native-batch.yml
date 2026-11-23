@@ -383,14 +383,14 @@ jobs:
       # booted from the copy it is up and quieted in ~30 s. Keyed on what the data belongs to — the macOS
       # build, the Xcode and the newest iOS runtime — so it is remade once per runner image, per fleet repo
       # (~1 GB). A miss makes it (one fresh boot, settled at most 240 s) and saves it after the journeys.
-      # v2: the seed also carries launchd's disabled list, which v1 seeds lack (#10583).
+      # v2: the seed also carries launchd's disabled list, which v1 seeds lack; v3: six more quieted daemons (#10583).
       - name: Simulator seed key
         id: simkey
         run: |
           set -euo pipefail
           RUNTIME="$(xcrun simctl list runtimes -j | jq -r '[.runtimes[] | select(.platform == "iOS" and .isAvailable)]
             | sort_by(.version | split(".") | map(tonumber)) | last | .buildversion // "none"')"
-          echo "key=ios-sim-seed-v2-$(sw_vers -buildVersion)-${{ steps.toolchain.outputs.xcode }}-$RUNTIME" >> "$GITHUB_OUTPUT"
+          echo "key=ios-sim-seed-v3-$(sw_vers -buildVersion)-${{ steps.toolchain.outputs.xcode }}-$RUNTIME" >> "$GITHUB_OUTPUT"
 
       - name: Restore the settled Simulator
         id: simseed
@@ -398,6 +398,20 @@ jobs:
         with:
           path: ${{ runner.temp }}/sim-seed
           key: ${{ steps.simkey.outputs.key }}
+
+      # A miss: the seed another fleet repo made for this key, uploaded as an artifact (seed-share.sh), instead
+      # of making one here — after an image change each repo's first run made its own, ~11 min a shard (#10583).
+      - name: Fetch the seed another fleet repo made
+        id: simfetch
+        if: ${{ steps.simseed.outputs.cache-hit != 'true' }}
+        env:
+          GH_TOKEN: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
+          KEY: ${{ steps.simkey.outputs.key }}
+        run: |
+          FLEET_REPOS="$(gh api "repos/$PRIVATE_REPO/actions/variables/PPAP_CI_REPOS" --jq .value 2>/dev/null || true)"
+          if FLEET_REPOS="$FLEET_REPOS" bash scripts/ci/native/seed-share.sh "$KEY" "$RUNNER_TEMP/sim-seed"; then
+            echo "fetched=true" >> "$GITHUB_OUTPUT"
+          fi
 
       # The Simulator comes from scripts/ci/native/simulator.sh: an iPhone on the
       # NEWEST installed iOS runtime, checked against what xcodebuild offers and,
@@ -490,20 +504,40 @@ jobs:
             -skipPackagePluginValidation ${ONLY[@]+"${ONLY[@]}"} test-without-building 2>&1 |
             bash "$GITHUB_WORKSPACE/scripts/ci/native/xcode-log.sh" "$RUNNER_TEMP/xcodebuild.log"
 
-      # Made on this run (a miss): saved even when a journey failed, since it was copied before any ran.
-      # Shards of one run that all missed race for the key; the losers' save only warns.
-      - name: Seed made?
+      # Fetched or made on this run (a miss): saved even when a journey failed, since it was copied before any
+      # ran. Shards of one run that all missed race for the key; the losers' save only warns.
+      - name: Seed to keep?
         id: seedmade
         if: ${{ always() && steps.simseed.outputs.cache-hit != 'true' }}
         run: |
-          if [ -f "$RUNNER_TEMP/sim-seed/device-type" ]; then echo "made=true" >> "$GITHUB_OUTPUT"; fi
+          if [ -d "$RUNNER_TEMP/sim-seed/data" ]; then echo "keep=true" >> "$GITHUB_OUTPUT"; fi
 
       - name: Save the settled Simulator
-        if: ${{ always() && steps.seedmade.outputs.made == 'true' }}
+        if: ${{ always() && steps.seedmade.outputs.keep == 'true' }}
         uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/sim-seed
           key: ${{ steps.simkey.outputs.key }}
+
+      # Made here: shared with the other fleet repos for 90 days. Shards of one run race for the name; the
+      # losers' upload fails without failing the job.
+      - name: Pack the seed for the other fleet repos
+        id: simpack
+        if: ${{ always() && steps.seedmade.outputs.keep == 'true' && steps.simfetch.outputs.fetched != 'true' }}
+        run: |
+          SECONDS=0
+          tar -C "$RUNNER_TEMP/sim-seed" -cf - . | zstd -T0 -3 -q -o "$RUNNER_TEMP/seed.tar.zst"
+          echo "packed $(du -sh "$RUNNER_TEMP/seed.tar.zst" | cut -f1) in ${SECONDS}s"
+
+      - name: Share the seed with the other fleet repos
+        if: ${{ always() && steps.simpack.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.simkey.outputs.key }}
+          path: ${{ runner.temp }}/seed.tar.zst
+          retention-days: 90
+          compression-level: 0
 
       - name: Runner load, every 30 s
         if: always()
