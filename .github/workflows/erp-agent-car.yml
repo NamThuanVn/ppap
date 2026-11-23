@@ -131,8 +131,8 @@ jobs:
   agent:
     name: Agent
     # A native lane builds what it claims: Xcode is macOS-only, so an iOS lane
-    # runs there (the same image as erp-ci-checks.yml's native-ios job).
-    runs-on: ${{ (github.event.client_payload.platform || inputs.platform) == 'ios' && 'macos-26' || 'ubuntu-latest' }}
+    # runs there (the same image and Xcode 27 as erp-ci-native-batch.yml's iOS shards).
+    runs-on: ${{ (github.event.client_payload.platform || inputs.platform) == 'ios' && 'xcode-27' || 'ubuntu-latest' }}
     # 30 min under GitHub's 360-min hard cap: leave room for the always-steps
     # (a timeout-killed run still executes tow-in-or-revert).
     timeout-minutes: 330
@@ -574,6 +574,7 @@ jobs:
         if: (env.ITEM_ARG != '' || steps.claim.outputs.claimed == 'true') && steps.pool.outputs.exhausted != 'true' && env.AGENT_LANE_PLATFORM == 'ios'
         run: |
           set -euo pipefail
+          bash scripts/ci/native/select-xcode.sh
           for t in xcodegen swiftlint swiftformat xcbeautify; do
             command -v "$t" >/dev/null 2>&1 || brew install "$t"
           done

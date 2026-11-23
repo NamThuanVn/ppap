@@ -255,7 +255,9 @@ jobs:
     name: iOS → TestFlight · App Store review
     needs: prepare
     if: inputs.platforms != 'android'
-    runs-on: macos-26
+    # xcode-27: the runner image with Xcode 27 (iOS 27 SDK); macos-26 has only Xcode 26. App Store
+    # uploads need the iOS 27 SDK from April 2027 (ITMS-90725).
+    runs-on: xcode-27
     environment: mobile-production
     timeout-minutes: 90
     steps:
@@ -357,6 +359,11 @@ jobs:
           ruby-version: '3.3'
           bundler-cache: true
           working-directory: apps/mobile
+
+      - name: Select Xcode 27 (iOS 27 SDK)
+        run: |
+          bash scripts/ci/native/select-xcode.sh
+          xcodebuild -version
 
       - name: Install XcodeGen
         if: inputs.mode != 'release'

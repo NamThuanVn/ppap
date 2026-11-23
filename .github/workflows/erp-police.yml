@@ -860,7 +860,7 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.patrol-noise.outputs.kill_matrix) }}
-    # ubuntu-latest for web and Android (KVM, so the emulator boots), macos-26 for iOS.
+    # ubuntu-latest for web and Android (KVM, so the emulator boots), xcode-27 for iOS.
     runs-on: ${{ matrix.runner }}
     # A fixer session plus five watched CI runs. The session is bounded by the
     # harness's own budgets; the fan-out is ~20 min for the slowest run. Five
@@ -1126,6 +1126,7 @@ jobs:
         if: ${{ matrix.platform == 'ios' }}
         run: |
           set -euo pipefail
+          bash scripts/ci/native/select-xcode.sh
           for t in xcodegen swiftlint swiftformat xcbeautify; do
             command -v "$t" >/dev/null 2>&1 || brew install "$t"
           done

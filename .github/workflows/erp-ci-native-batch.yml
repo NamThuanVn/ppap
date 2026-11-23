@@ -184,9 +184,10 @@ jobs:
     name: 1 · CI · Mobile (iOS) ${{ matrix.shard }}/${{ matrix.of }}
     needs: plan
     if: ${{ needs.plan.outputs.run == 'true' && github.event.action == 'ios-batch' }}
-    # macos-26: its default Xcode is 26.x (Swift 6.2), which the Swift packages
-    # need — macos-15 defaults to Xcode 16 and cannot resolve them.
-    runs-on: macos-26
+    # xcode-27: the macOS 27 image with Xcode 27 (iOS 27 SDK), the one the TestFlight uploads build
+    # with (erp-mobile-staging.yml, erp-mobile-release.yml), so a PR compiles with the same Xcode.
+    # GitHub has no macos-27 label yet; when the image leaves preview, swap the label here and in both.
+    runs-on: xcode-27
     timeout-minutes: 90
     strategy:
       # Every shard runs to the end: one flaky journey must not cancel the rest's evidence.
@@ -332,6 +333,8 @@ jobs:
         id: toolchain
         run: |
           set -euo pipefail
+          bash scripts/ci/native/select-xcode.sh
+          xcodebuild -version
           for t in xcodegen swiftlint swiftformat xcbeautify; do
             command -v "$t" >/dev/null 2>&1 || brew install "$t"
           done
