@@ -336,6 +336,9 @@ jobs:
       # e2e (both report success) and runs only the repo gates, plus the native
       # iOS / Android jobs for the platforms it touches. One file anywhere else
       # and the full graph runs as above. See scripts/ci/native/scope.sh.
+      # A third, narrower one: when the rest of the diff is CI, fleet, gate or harness
+      # tooling the e2e chain never reads (scripts/{ci,agent,gate,ba,tests}, .claude,
+      # .github), the checks run and only e2e is skipped (scope.sh e2e=false). Never scoped.
       run_native: true
       rerun: ${{ needs.source-pr.outputs.rerun }}
     secrets:

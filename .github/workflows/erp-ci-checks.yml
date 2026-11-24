@@ -56,7 +56,7 @@ on:
         type: boolean
         default: false
       run_native:
-        description: 'Plan the change with scripts/ci/native/scope.sh: run the native iOS / Android jobs for the platforms it touches, and skip the web/backend checks and e2e (reported as success) when every changed file is under apps/mobile/ or is markdown. Only PR CI passes true; the deploy gate keeps the default (false), so none of this runs there and every web suite runs as before.'
+        description: 'Plan the change with scripts/ci/native/scope.sh: run the native iOS / Android jobs for the platforms it touches, skip the web/backend checks and e2e (reported as success) when every changed file is under apps/mobile/ or is markdown, and skip e2e alone when the rest is CI, fleet, gate or harness tooling the e2e chain never reads (scope.sh e2e=false). Only PR CI passes true; the deploy gate keeps the default (false), so none of this runs there and every web suite runs as before.'
         type: boolean
         default: false
       rerun:
@@ -628,8 +628,8 @@ jobs:
         env:
           CHANGED_ONLY: ${{ inputs.e2e_changed_only }}
           TOTAL: ${{ inputs.e2e_shards }}
-          # The checks job's web=false rule, applied here too: a PR whose every
-          # changed file is under apps/mobile/ or is markdown has no web surface to test.
+          # scripts/ci/native/scope.sh's e2e=false: a PR whose every changed file is mobile,
+          # markdown, or CI/fleet/gate tooling the e2e chain never reads has nothing for e2e to test.
           NATIVE: ${{ inputs.run_native && startsWith(inputs.checkout_ref, 'refs/pull/') }}
           RERUN: ${{ inputs.rerun }}
         run: |
@@ -653,7 +653,7 @@ jobs:
             fi
           fi
           if [ "$NATIVE" = "true" ] && [ -f scripts/ci/native/scope.sh ] &&
-            NATIVE_SCOPE_BASE=HEAD^1 GITHUB_OUTPUT='' bash scripts/ci/native/scope.sh | grep -qx 'web=false'; then
+            NATIVE_SCOPE_BASE=HEAD^1 GITHUB_OUTPUT='' bash scripts/ci/native/scope.sh | grep -qx 'e2e=false'; then
             MODE=skip
             TARGETS=""
           fi
