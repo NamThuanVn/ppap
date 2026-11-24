@@ -1608,11 +1608,13 @@ jobs:
           && needs.patrol-noise.outputs.open_pr == ''
           && inputs.fresh_hunt && !inputs.dry_run }}
     runs-on: ubuntu-latest
-    # Five CI runs dispatched at once and watched to completion: ~20 minutes
-    # for the slowest, plus the poll interval and artifact reads. Double that
-    # and stop — a fan-out still unfinished after an hour has lost a run, and
-    # the next nightly sweep pools whatever did finish anyway.
-    timeout-minutes: 60
+    # Five sampling runs, in WAVES of what the fleet can carry (prove-clean.mjs),
+    # each wave watched to completion. One run on main takes ~45 min (both native
+    # jobs run every journey there), so at capacity 1 that is 5 waves × ~53 min
+    # ≈ 265 min, plus up to 40 min of fleet-full waits (MAX_WAITS) — ~305 worst
+    # case. 330 stays under the 360-min hosted-runner cap. At 60, any second wave
+    # died mid-watch with no summary (run 45282750098, 2026-11-24).
+    timeout-minutes: 330
     steps:
       - name: Resolve PAT from pool
         env:
