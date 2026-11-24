@@ -59,6 +59,10 @@ on:
         description: 'Plan the change with scripts/ci/native/scope.sh: run the native iOS / Android jobs for the platforms it touches, and skip the web/backend checks and e2e (reported as success) when every changed file is under apps/mobile/ or is markdown. Only PR CI passes true; the deploy gate keeps the default (false), so none of this runs there and every web suite runs as before.'
         type: boolean
         default: false
+      rerun:
+        description: 'PR CI only, from erp-ci-pr.yml (scripts/ci/rerun.mjs): run only what the previous run did not pass. JSON {of, e2e, ios, android, test}; a missing key means passed, skip it; scope means plan as usual; all means run in full; a list means only those. Empty means a normal run; the deploy gate never passes it. Gates, lint and typecheck always run in full.'
+        type: string
+        default: ''
     outputs:
       # The four check verdicts keep the names (and meaning) they had as
       # separate jobs, so erp-ci-pr.yml and erp-deploy-reusable.yml read them
@@ -92,6 +96,15 @@ on:
       android_runs:
         description: 'JSON array of the fanned-out Android shard batch runs ([{repo, batch, run_id, conclusion}]).'
         value: ${{ jobs.native-android.outputs.runs }}
+      ios_shards:
+        description: 'the native plan''s iOS shards ([{shard, of, tests}]), for the report''s rerun list (scripts/ci/rerun.mjs).'
+        value: ${{ jobs.native-plan.outputs.ios_shards }}
+      android_shards:
+        description: 'the native plan''s Android shards ([{shard, of, tests}]), for the report''s rerun list (scripts/ci/rerun.mjs).'
+        value: ${{ jobs.native-plan.outputs.android_shards }}
+      test_members:
+        description: 'the packages each Vitest shard ran ({"test:i/N": [package, …]}), for the report''s rerun list (scripts/ci/rerun.mjs).'
+        value: ${{ jobs.checks.outputs.test_members }}
       native:
         description: 'Native mobile verdict: success when every platform job the plan asked for passed and the rest were skipped (and always when run_native is false); failure otherwise. Empty (⇒ red) if the verdict job itself died.'
         value: ${{ !inputs.run_native && 'success' || jobs.native.outputs.result }}
@@ -165,6 +178,7 @@ jobs:
       typecheck: ${{ steps.verdict.outputs.typecheck }}
       test: ${{ steps.verdict.outputs.test }}
       runs: ${{ steps.collect.outputs.runs }}
+      test_members: ${{ steps.plan.outputs.test_members }}
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
       # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
@@ -320,6 +334,7 @@ jobs:
           LINT_SHARDS: ${{ inputs.lint_shards }}
           TYPECHECK_SHARDS: ${{ inputs.typecheck_shards }}
           TEST_SHARDS: ${{ inputs.test_shards }}
+          RERUN: ${{ inputs.rerun }}
         run: |
           set -euo pipefail
           if [ ! -f scripts/ci/checks/plan.mjs ]; then
@@ -329,6 +344,28 @@ jobs:
           UNITS="$(node scripts/ci/checks/plan.mjs units \
             "gates=$GATES_SHARDS" "lint=$LINT_SHARDS" \
             "typecheck=$TYPECHECK_SHARDS" "test=$TEST_SHARDS")"
+          # A failed-only run (inputs.rerun, scripts/ci/rerun.mjs): only the Vitest shards holding the
+          # packages that failed last time or whose tests changed; gates, lint and typecheck run in full.
+          SKIP_TEST=false
+          if [ -n "${RERUN:-}" ] && [ -f scripts/ci/rerun.mjs ]; then
+            OUT="$(RERUN="$RERUN" node scripts/ci/rerun.mjs checks-units "$UNITS" || true)"
+            NEW="$(printf '%s\n' "$OUT" | sed -n 's/^units=//p')"
+            [ -z "$NEW" ] || UNITS="$NEW"
+            if printf '%s\n' "$OUT" | grep -qx 'skip_test=true'; then SKIP_TEST=true; fi
+          fi
+          echo "skip_test=$SKIP_TEST" >> "$GITHUB_OUTPUT"
+          # The packages each dispatched Vitest token runs: the report records a red shard by its
+          # packages (scripts/ci/rerun.mjs), since a token names other packages once main moves.
+          # Best-effort: `{}` on any failure.
+          MEMBERS='{}'
+          for t in $UNITS; do
+            case "$t" in test:*) ;; *) continue ;; esac
+            if PKGS="$(node scripts/ci/checks/plan.mjs members test "${t#test:}" 2>/dev/null)"; then
+              MEMBERS="$(printf '%s\n' "$PKGS" | jq -Rn --argjson m "$MEMBERS" --arg t "$t" \
+                '$m + {($t): [inputs | select(length > 0)]}' 2>/dev/null || printf '%s' "$MEMBERS")"
+            fi
+          done
+          echo "test_members=$(printf '%s' "$MEMBERS" | jq -c . 2>/dev/null || echo '{}')" >> "$GITHUB_OUTPUT"
           echo "units=$UNITS" >> "$GITHUB_OUTPUT"
           echo "▶ check units: $UNITS" >&2
 
@@ -405,6 +442,7 @@ jobs:
           R_TYPECHECK: ${{ steps.collect.outputs.result_typecheck }}
           R_TEST: ${{ steps.collect.outputs.result_test }}
           WEB: ${{ steps.native.outputs.web }}
+          SKIP_TEST: ${{ steps.plan.outputs.skip_test }}
         run: |
           set -euo pipefail
           # Anything but a literal `success` is red — including an empty value
@@ -414,6 +452,8 @@ jobs:
             var="R_$(printf '%s' "$s" | tr '[:lower:]' '[:upper:]')"
             v="${!var:-}"
             [ "${WEB:-}" = false ] && v=success
+            # A failed-only run whose Vitest passed last time dispatched no Vitest shard.
+            if [ "$s" = test ] && [ "${SKIP_TEST:-}" = true ]; then v=success; fi
             [ "$v" = success ] || v=failure
             echo "$s=$v" >> "$GITHUB_OUTPUT"
             echo "▶ $s: $v" >&2
@@ -591,6 +631,7 @@ jobs:
           # The checks job's web=false rule, applied here too: a PR whose every
           # changed file is under apps/mobile/ or is markdown has no web surface to test.
           NATIVE: ${{ inputs.run_native && startsWith(inputs.checkout_ref, 'refs/pull/') }}
+          RERUN: ${{ inputs.rerun }}
         run: |
           set -euo pipefail
           MODE=full
@@ -601,6 +642,15 @@ jobs:
             DECISION="$(E2E_PLAN_BASE=HEAD^1 bash scripts/ci/e2e/plan.sh)"
             MODE="${DECISION%% *}"
             TARGETS="${DECISION#"$MODE"}"; TARGETS="${TARGETS# }"
+          fi
+          # A failed-only run (inputs.rerun, scripts/ci/rerun.mjs): the specs that failed or flaked last
+          # time plus the specs this push changed; e2e that passed is skipped. `keep` = plan as above.
+          if [ -n "${RERUN:-}" ] && [ -f scripts/ci/rerun.mjs ]; then
+            DECISION="$(RERUN="$RERUN" node scripts/ci/rerun.mjs e2e || echo keep)"
+            if [ "$DECISION" != keep ]; then
+              MODE="${DECISION%% *}"
+              TARGETS="${DECISION#"$MODE"}"; TARGETS="${TARGETS# }"
+            fi
           fi
           if [ "$NATIVE" = "true" ] && [ -f scripts/ci/native/scope.sh ] &&
             NATIVE_SCOPE_BASE=HEAD^1 GITHUB_OUTPUT='' bash scripts/ci/native/scope.sh | grep -qx 'web=false'; then
@@ -1505,6 +1555,7 @@ jobs:
         id: plan
         env:
           ON_PR: ${{ startsWith(inputs.checkout_ref, 'refs/pull/') }}
+          RERUN: ${{ inputs.rerun }}
         run: |
           set -euo pipefail
           # Fail safe toward today's CI: without the script, plan the web CI and no native job.
@@ -1514,7 +1565,21 @@ jobs:
             exit 0
           fi
           if [ "$ON_PR" = true ]; then
-            NATIVE_SCOPE_BASE=HEAD^1 bash scripts/ci/native/scope.sh
+            # A failed-only run (the `rerun` input, scripts/ci/rerun.mjs native): a platform that passed
+            # last time is skipped, the others run only the classes that failed or changed.
+            SCOPE="$(NATIVE_SCOPE_BASE=HEAD^1 GITHUB_OUTPUT='' bash scripts/ci/native/scope.sh)"
+            if [ -n "${RERUN:-}" ] && [ -f scripts/ci/rerun.mjs ]; then
+              for p in ios android; do
+                D="$(RERUN="$RERUN" node scripts/ci/rerun.mjs native "$p" || echo keep)"
+                case "$D" in
+                  keep) ;;
+                  skip) SCOPE="$(printf '%s\n' "$SCOPE" | sed "s/^$p=true\$/$p=false/")" ;;
+                  *) if [ "$p" = ios ]; then export NATIVE_JOURNEYS_RERUN_IOS="$D"; else export NATIVE_JOURNEYS_RERUN_ANDROID="$D"; fi ;;
+                esac
+              done
+            fi
+            printf '%s\n' "$SCOPE"
+            printf '%s\n' "$SCOPE" >> "$GITHUB_OUTPUT"
             NATIVE_SCOPE_BASE=HEAD^1 bash scripts/ci/native/journeys.sh
           else
             printf 'ios=true\nandroid=true\ncontract=false\nweb=true\nbash_tests=\n' >> "$GITHUB_OUTPUT"

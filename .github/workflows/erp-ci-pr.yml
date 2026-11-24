@@ -49,6 +49,9 @@ jobs:
   source-pr:
     name: Source PR
     runs-on: ubuntu-latest
+    outputs:
+      # A failed-only run's plan (scripts/ci/rerun.mjs), handed to erp-ci-checks.yml as `rerun`.
+      rerun: ${{ steps.rerun.outputs.rerun }}
     steps:
       # PAT pool: pick whichever pooled account still has REST quota. ONE account's
       # 5,000/hr used to cover the whole agent fleet, every fleet CI status post, the
@@ -194,6 +197,62 @@ jobs:
             echo "::warning::could not re-point the pending $STATUS_CONTEXT status at this run — the dispatcher's pending status stands"
           fi
 
+      # FAILED-ONLY: a push after a failed run reruns only what that run did not pass, plus the tests
+      # the push changed (scripts/ci/rerun.mjs plan, from the run log's last row and the compare to
+      # its head). Every step is continue-on-error: any failure leaves `rerun` empty, a full run.
+      # main's scripts, never the PR's: the plan decides what the PR's own run tests.
+      - name: Pick the rerun script ref
+        id: rerun_ref
+        if: github.event.client_payload.head_sha && github.event.client_payload.pr_number
+        continue-on-error: true
+        env:
+          PAT: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          # The commit, not the ref name: actions/checkout skips its hash-algorithm REST call for a sha.
+          SHA=$(git ls-remote "https://x-access-token:${PAT}@github.com/${PRIVATE_REPO}.git" refs/heads/main | cut -f1)
+          echo "ref=${SHA:-main}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the rerun script
+        if: github.event.client_payload.head_sha && github.event.client_payload.pr_number
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ env.CHECKOUT_PAT || env.RESOLVED_PAT }}
+          ref: ${{ steps.rerun_ref.outputs.ref }}
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
+      - name: Plan a failed-only rerun
+        id: rerun
+        if: github.event.client_payload.head_sha && github.event.client_payload.pr_number
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PR: ${{ github.event.client_payload.pr_number }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          STATUS_CONTEXT: ${{ github.event.client_payload.status_context || 'CI' }}
+        run: |
+          set -uo pipefail
+          [ -f scripts/ci/rerun.mjs ] || { echo "· no scripts/ci/rerun.mjs — a full run"; exit 0; }
+          BODY=''
+          CID=$(gh api "repos/$PRIVATE_REPO/issues/$PR/comments" --paginate \
+            --jq '[.[] | select(.body|startswith("<!-- ci-report -->"))][0].id' 2>/dev/null | grep -v '^null$' | head -1)
+          if [ -n "${CID:-}" ]; then
+            BODY=$(gh api "repos/$PRIVATE_REPO/issues/comments/$CID" --jq .body 2>/dev/null || true)
+          fi
+          PREV=$(printf '%s' "$BODY" | node scripts/ci/rerun.mjs prev-head)
+          BRANCH=$(gh api "repos/$PRIVATE_REPO/pulls/$PR" --jq .head.ref 2>/dev/null || true)
+          CMP="$RUNNER_TEMP/rerun-compare.json"
+          echo '{}' > "$CMP"
+          if [ -n "$PREV" ]; then
+            gh api "repos/$PRIVATE_REPO/compare/$PREV...$HEAD_SHA" \
+              --jq '{status, files: [.files[] | {filename, status}]}' > "$CMP" 2>/dev/null || echo '{}' > "$CMP"
+          fi
+          printf '%s' "$BODY" | node scripts/ci/rerun.mjs plan --head "$HEAD_SHA" \
+            --context "$STATUS_CONTEXT" --branch "$BRANCH" --compare "$CMP" | tee -a "$GITHUB_OUTPUT"
+
       # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
       # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
       - name: GitHub calls (NT / PAT)
@@ -212,6 +271,10 @@ jobs:
   # A manual workflow_dispatch with NO number checks out erp-namthuan `main`
   # instead, so the full CI graph can be smoke-tested without opening a PR.
   checks:
+    # After source-pr, which plans a failed-only run; `!cancelled()` so a failed source-pr still runs
+    # CI, in full.
+    needs: source-pr
+    if: ${{ !cancelled() }}
     uses: ./.github/workflows/erp-ci-checks.yml
     with:
       checkout_ref: ${{ (github.event.client_payload.pr_number || inputs.pr_number) && format('refs/pull/{0}/merge', github.event.client_payload.pr_number || inputs.pr_number) || 'main' }}
@@ -259,6 +322,13 @@ jobs:
       # the flake spec-by-spec (see #3722 for the measured profile and the
       # "assert the precondition" pattern that fixed the first one), NOT to
       # re-narrow the scope — re-narrowing restores the exact hole this closes.
+      #
+      # Exception (2026-11-24, the owner's call, #10592–#10595): a push after a FAILED run
+      # reruns only what failed or flaked plus the tests it changed (scripts/ci/rerun.mjs,
+      # planned in source-pr, passed as `rerun` below), and a green failed-only run merges.
+      # The first run and every push after a clean run stay full. The backstop is the daily
+      # full run on main (race calendar `native-journeys` slot), the daily police patrol
+      # (erp-police.yml patrol-noise) and the production deploy gate.
       e2e_changed_only: false
       # The two narrow exceptions to the above: a PR whose every changed file is
       # under apps/mobile/, or is markdown (no build, typecheck or e2e reads it),
@@ -267,6 +337,7 @@ jobs:
       # iOS / Android jobs for the platforms it touches. One file anywhere else
       # and the full graph runs as above. See scripts/ci/native/scope.sh.
       run_native: true
+      rerun: ${{ needs.source-pr.outputs.rerun }}
     secrets:
       PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
       FLEET_APP_ID: ${{ secrets.FLEET_APP_ID }}
@@ -463,7 +534,7 @@ jobs:
   # PAT, which the Statuses API accepts with Statuses:R/W.
   report:
     name: Report CI
-    needs: [checks]
+    needs: [source-pr, checks]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
@@ -648,6 +719,12 @@ jobs:
           CHECK_RUNS: ${{ needs.checks.outputs.check_runs }}
           IOS_RUNS: ${{ needs.checks.outputs.ios_runs }}
           ANDROID_RUNS: ${{ needs.checks.outputs.android_runs }}
+          # What the next push reruns (scripts/ci/rerun.mjs via report.mjs): the native shard plans,
+          # the packages of each Vitest shard, and this run's own failed-only plan.
+          IOS_SHARDS: ${{ needs.checks.outputs.ios_shards }}
+          ANDROID_SHARDS: ${{ needs.checks.outputs.android_shards }}
+          TEST_MEMBERS: ${{ needs.checks.outputs.test_members }}
+          RERUN: ${{ needs.source-pr.outputs.rerun }}
           # Which categories CI itself calls red. The digest uses this to tell
           # "this job passed" apart from "this job failed and I could not parse
           # why" — an unparsed red job must announce itself, not read as silence.
@@ -910,6 +987,11 @@ jobs:
           R_E2E: ${{ needs.checks.outputs.e2e }}
           R_NATIVE: ${{ needs.checks.outputs.native }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # The rerun list's inputs, as in the noise step (scripts/ci/rerun.mjs).
+          IOS_SHARDS: ${{ needs.checks.outputs.ios_shards }}
+          ANDROID_SHARDS: ${{ needs.checks.outputs.android_shards }}
+          TEST_MEMBERS: ${{ needs.checks.outputs.test_members }}
+          RERUN: ${{ needs.source-pr.outputs.rerun }}
           # The ERP fleet hub (scripts/agent/board/lib/hub.mjs): the parts clear there.
           ERP_HUB_ENV: ${{ vars.ERP_HUB_ENV }}
           ERP_HUB_CLIENT_ID_STAGING: ${{ secrets.ERP_HUB_CLIENT_ID_STAGING }}
@@ -1141,7 +1223,8 @@ jobs:
             COMBINED=$(printf '%s' "$PREV" | node scripts/ci/run-log.mjs \
               --report "$LOGDIR/report2/data.json" \
               --report-body "$RUNNER_TEMP/ci-report-body.md" \
-              --run-url "$RUN_URL" --head-sha "${HEAD_SHA:-${CURRENT_HEAD:-}}" 2>/dev/null || true)
+              --run-url "$RUN_URL" --head-sha "${HEAD_SHA:-${CURRENT_HEAD:-}}" \
+              --rerun "${RERUN:-}" 2>/dev/null || true)
           fi
           if [ -z "$COMBINED" ]; then
             echo "::warning::run-log render failed — posting the report without the history table"
