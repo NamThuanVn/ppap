@@ -298,6 +298,8 @@ jobs:
       # The same key as the shards' (their "Simulator seed key" step), on the same image and Xcode. The runtime is the
       # plain iOS-<n> one simulator.sh boots: some runners also list a device-specific 27.2 (iOS-27-2-iPhone19-4,
       # build 24B91016s), and picking the last of two equal versions split one image's key in two (#10568's run).
+      # The key carries a hash of the two scripts that shape the seed, so a run on a stale merge ref keys its seed under
+      # its own scripts: a hand-bumped v4 got a seed made by #10591's pre-#10590 ref (2026-11-24).
       - name: Simulator seed key
         id: simkey
         run: |
@@ -306,7 +308,8 @@ jobs:
           XCODE="$(xcodebuild -version | awk '/Build version/ { print $3 }')"
           RUNTIME="$(xcrun simctl list runtimes -j | jq -r '[.runtimes[] | select(.platform == "iOS" and .isAvailable and (.identifier | test("SimRuntime\\.iOS-[0-9-]+$")))]
             | sort_by(.version | split(".") | map(tonumber)) | last | .buildversion // "none"')"
-          echo "key=ios-sim-seed-v4-$(sw_vers -buildVersion)-$XCODE-$RUNTIME" >> "$GITHUB_OUTPUT"
+          SCRIPTS="$(cat scripts/ci/native/quiet-simulator.sh scripts/ci/native/simulator-seed.sh | shasum | cut -c1-8)"
+          echo "key=ios-sim-seed-$SCRIPTS-$(sw_vers -buildVersion)-$XCODE-$RUNTIME" >> "$GITHUB_OUTPUT"
 
       - name: In this repo's cache?
         id: simseed
@@ -562,14 +565,15 @@ jobs:
       # booted from the copy it is up and quieted in ~30 s. Keyed on what the data belongs to — the macOS
       # build, the Xcode and the newest iOS runtime — so it is remade once per runner image, per fleet repo
       # (~1 GB). A miss makes it (one fresh boot, settled at most 240 s) and saves it after the journeys.
-      # v2: the seed carries launchd's disabled list; v3 and v4: more quieted daemons (#10583).
+      # Keyed also on a hash of quiet-simulator.sh + simulator-seed.sh (see the ios-seed job), replacing the v2–v4 hand bumps.
       - name: Simulator seed key
         id: simkey
         run: |
           set -euo pipefail
           RUNTIME="$(xcrun simctl list runtimes -j | jq -r '[.runtimes[] | select(.platform == "iOS" and .isAvailable and (.identifier | test("SimRuntime\\.iOS-[0-9-]+$")))]
             | sort_by(.version | split(".") | map(tonumber)) | last | .buildversion // "none"')"
-          echo "key=ios-sim-seed-v4-$(sw_vers -buildVersion)-${{ steps.toolchain.outputs.xcode }}-$RUNTIME" >> "$GITHUB_OUTPUT"
+          SCRIPTS="$(cat scripts/ci/native/quiet-simulator.sh scripts/ci/native/simulator-seed.sh | shasum | cut -c1-8)"
+          echo "key=ios-sim-seed-$SCRIPTS-$(sw_vers -buildVersion)-${{ steps.toolchain.outputs.xcode }}-$RUNTIME" >> "$GITHUB_OUTPUT"
 
       - name: Restore the settled Simulator
         id: simseed
@@ -716,6 +720,8 @@ jobs:
             .wrangler/state/next.log
           retention-days: 7
           if-no-files-found: ignore
+          # xcresult blobs are zstd and screenshots PNG already: deflating 190 MB on a runner at load 300+ took 8 min (#10728's run).
+          compression-level: 0
 
       # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
       # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
