@@ -246,12 +246,17 @@ jobs:
           BRANCH=$(gh api "repos/$PRIVATE_REPO/pulls/$PR" --jq .head.ref 2>/dev/null || true)
           CMP="$RUNNER_TEMP/rerun-compare.json"
           echo '{}' > "$CMP"
+          # The PR's own files: a merge from main brings main's files into the compare (rerun.mjs pushFiles).
+          PRF="$RUNNER_TEMP/rerun-pr-files.json"
+          echo 'null' > "$PRF"
           if [ -n "$PREV" ]; then
             gh api "repos/$PRIVATE_REPO/compare/$PREV...$HEAD_SHA" \
               --jq '{status, files: [.files[] | {filename, status}]}' > "$CMP" 2>/dev/null || echo '{}' > "$CMP"
+            gh api "repos/$PRIVATE_REPO/pulls/$PR/files?per_page=100" --paginate \
+              --jq '.[] | {filename, status}' 2>/dev/null | jq -s . > "$PRF.tmp" && mv "$PRF.tmp" "$PRF" || echo 'null' > "$PRF"
           fi
           printf '%s' "$BODY" | node scripts/ci/rerun.mjs plan --head "$HEAD_SHA" \
-            --context "$STATUS_CONTEXT" --branch "$BRANCH" --compare "$CMP" | tee -a "$GITHUB_OUTPUT"
+            --context "$STATUS_CONTEXT" --branch "$BRANCH" --compare "$CMP" --pr-files "$PRF" | tee -a "$GITHUB_OUTPUT"
 
       # The job's GitHub calls per token as ONE greppable log line (scripts/ci/ppap/fleet-token.sh
       # calls-report) — ranks which jobs burn the NT App's 5,000/h. App mode only; never fails.
