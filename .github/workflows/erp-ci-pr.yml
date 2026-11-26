@@ -1104,16 +1104,26 @@ jobs:
           # requires the `auto-merge` label — see the decision tree below.)
           READY_LINE=""
           if [ "$MERGED" != "true" ] && [ "$DRAFT" = "true" ] && [ "$STATE" = "success" ] && [ "$NOISE_CLEAN" = "true" ]; then
-            PR_NODE_ID=$(jq -r '.node_id' /tmp/pr.json 2>/dev/null)
-            if [ -n "$PR_NODE_ID" ] && [ "$PR_NODE_ID" != "null" ] \
-               && ghw api graphql -f query='mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}' \
-                    -f id="$PR_NODE_ID" >/dev/null 2>&1; then
+            if [ -f scripts/ci/ppap/mark-ready.sh ]; then
+              READY_OUT=$(bash scripts/ci/ppap/mark-ready.sh /tmp/pr.json "$REPO")
+            else
+              # ABSENT script → this job checked out a PR ref that predates it: one attempt, as before.
+              READY_OUT="draft one attempt failed (no retry: PR predates scripts/ci/ppap/mark-ready.sh)"
+              PR_NODE_ID=$(jq -r '.node_id' /tmp/pr.json 2>/dev/null)
+              if [ -n "$PR_NODE_ID" ] && [ "$PR_NODE_ID" != "null" ] \
+                 && ghw api graphql -f query='mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}' \
+                      -f id="$PR_NODE_ID" >/dev/null; then
+                READY_OUT="ready"
+              fi
+            fi
+            read -r READY_KIND READY_DETAIL <<< "$READY_OUT"
+            if [ "$READY_KIND" = "ready" ]; then
               DRAFT=false
               READY_LINE="✅ **Marked ready for review** — green + noise-clean."
               echo "✓ marked draft PR #$PR_NUMBER ready for review (green + noise-clean)"
             else
-              READY_LINE="⚠️ Could not mark ready for review (PAT missing PR write?)."
-              echo "::warning::could not mark PR #$PR_NUMBER ready for review"
+              READY_LINE="⚠️ Could not mark ready for review — ${READY_DETAIL:-unknown error}."
+              echo "::warning::could not mark PR #$PR_NUMBER ready for review — ${READY_DETAIL:-unknown error}"
             fi
           fi
 
@@ -1133,6 +1143,8 @@ jobs:
             MERGE_LINE="⚠️ Labeled \`auto-merge\` and green+clean, but **has conflicts** — resolve before it can merge."
           elif [ "$MERGE_BAR_OK" != "true" ]; then
             MERGE_LINE="⏸️ Labeled \`auto-merge\` and this run is green + clean, but the **sampling bar is not met** — ${MERGE_BAR_WHY:-not proven}. Not merged."
+          elif [ "$DRAFT" = "true" ]; then
+            MERGE_LINE="⏸️ Labeled \`auto-merge\` and green + clean, but **still a draft** (mark-ready failed) — not merged. Mark it ready for review and merge it, or re-run this job."
           else
             # Eligible: green + noise-clean + labeled + mergeable (true/null). The PR
             # was already flipped ready by the auto-ready block above; squash-merge it.
